@@ -296,14 +296,26 @@ def get_current_vix():
 
 def get_current_vix():
     try:
-        client = StockHistoricalDataClient(API_KEY, API_SECRET)
-        request_params = StockLatestQuoteRequest(symbol_or_symbols=["VIX"])
-        quotes = client.get_stock_latest_quote(request_params)
-        vix_price = quotes["VIX"].ask_price or quotes["VIX"].bid_price
-        return float(vix_price)
+        request_params = StockBarsRequest(
+            symbol_or_symbols="^VIX",
+            timeframe=TimeFrame.Day,
+            start=datetime.utcnow() - timedelta(days=5),
+            end=datetime.utcnow()
+        )
+
+        bars = data_client.get_stock_bars(request_params).df
+        bars = bars[bars['symbol'] == "^VIX"]
+
+        if not bars.empty:
+            vix_value = bars['close'].iloc[-1]
+            print(f"📊 VIX fetched from Alpaca: {vix_value}")
+            return vix_value
+        else:
+            print("⚠️ No VIX data found.")
+            return 0
     except Exception as e:
-        print(f"⚠️ Failed to fetch VIX: {e}")
-        raise
+        print(f"❌ Failed to get VIX: {e}")
+        return 0
 
 def get_max_equity():
     if os.path.exists(MAX_EQUITY_FILE):
@@ -421,6 +433,12 @@ def get_rsi_value(symbol, interval='15m', period=14):
         return None
 
 def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3):
+    if should_block_trading_due_to_equity():
+        msg = "🛑 Webhook blocked: Equity protection triggered."
+        print(msg)
+        send_telegram_alert(msg)
+        return False
+    
     print("⚙️ Starting trade submission process for:", symbol)
 
     qty = calculate_position_size(entry, stop_loss)
