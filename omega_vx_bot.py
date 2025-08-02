@@ -322,6 +322,7 @@ def get_equity_slope():
         return 0
 
 def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3):
+    
     print("🚨 FORCING TRADE EXECUTION FOR TESTING")
     send_telegram_alert("🚨 FORCING TRADE EXECUTION FOR TESTING")
     return True
