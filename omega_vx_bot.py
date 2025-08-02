@@ -225,19 +225,10 @@ def webhook():
         take_profit = float(data.get("take_profit"))
         use_trailing = bool(data.get("use_trailing", False))
 
-        # Check market mood first
-        if is_market_mood_negative():
-            print("🚫 Market mood is negative (high VIX). Skipping trade.")
-            send_telegram_alert("🚫 Trade blocked — market mood is negative.")
-            return jsonify({'status': 'blocked_by_market_mood'}), 200
+        # 🚨 TEMPORARY TEST OVERRIDE — skip mood + cooldown
+        print("🧪 Test mode: skipping mood & cooldown filters")
 
-        # Check cooldown
-        if is_cooldown_active():
-            print("⏸️ Trade skipped — cooldown active.")
-            send_telegram_alert("⏸️ Trade skipped — cooldown active.")
-            return jsonify({"status": "cooldown_active"}), 200
-
-        # Try to submit the trade
+        # Submit the test trade
         success = submit_order_with_retries(
             symbol=symbol,
             entry=entry,
@@ -378,7 +369,6 @@ def get_equity_slope():
         return 0
 
 def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3):
-    
     print("🚨 FORCING TRADE EXECUTION FOR TESTING")
     send_telegram_alert("🚨 FORCING TRADE EXECUTION FOR TESTING")
     return True
