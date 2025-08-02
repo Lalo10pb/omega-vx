@@ -1,0 +1,55 @@
+Traceback (most recent call last):
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/urllib3/connection.py", line 174, in _new_conn
+    conn = connection.create_connection(
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/urllib3/util/connection.py", line 72, in create_connection
+    for res in socket.getaddrinfo(host, port, family, socket.SOCK_STREAM):
+  File "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 953, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+socket.gaierror: [Errno 8] nodename nor servname provided, or not known
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 716, in urlopen
+    httplib_response = self._make_request(
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 404, in _make_request
+    self._validate_conn(conn)
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 1061, in _validate_conn
+    conn.connect()
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/urllib3/connection.py", line 363, in connect
+    self.sock = conn = self._new_conn()
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/urllib3/connection.py", line 186, in _new_conn
+    raise NewConnectionError(
+urllib3.exceptions.NewConnectionError: <urllib3.connection.HTTPSConnection object at 0x104a08310>: Failed to establish a new connection: [Errno 8] nodename nor servname provided, or not known
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/requests/adapters.py", line 667, in send
+    resp = conn.urlopen(
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/urllib3/connectionpool.py", line 802, in urlopen
+    retries = retries.increment(
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/urllib3/util/retry.py", line 594, in increment
+    raise MaxRetryError(_pool, url, error or ResponseError(cause))
+urllib3.exceptions.MaxRetryError: HTTPSConnectionPool(host='paper-api.alpaca.markets', port=443): Max retries exceeded with url: /v2/account (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x104a08310>: Failed to establish a new connection: [Errno 8] nodename nor servname provided, or not known'))
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/eduardoperezbrito/omega-vx/portfolio_snapshot.py", line 17, in <module>
+    account = api.get_account()
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/alpaca_trade_api/rest.py", line 280, in get_account
+    resp = self.get('/account')
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/alpaca_trade_api/rest.py", line 254, in get
+    return self._request('GET', path, data)
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/alpaca_trade_api/rest.py", line 222, in _request
+    return self._one_request(method, url, opts, retry)
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/alpaca_trade_api/rest.py", line 241, in _one_request
+    resp = self._session.request(method, url, **opts)
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/requests/sessions.py", line 589, in request
+    resp = self.send(prep, **send_kwargs)
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/requests/sessions.py", line 703, in send
+    r = adapter.send(request, **kwargs)
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/requests/adapters.py", line 700, in send
+    raise ConnectionError(e, request=request)
+requests.exceptions.ConnectionError: HTTPSConnectionPool(host='paper-api.alpaca.markets', port=443): Max retries exceeded with url: /v2/account (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x104a08310>: Failed to establish a new connection: [Errno 8] nodename nor servname provided, or not known'))

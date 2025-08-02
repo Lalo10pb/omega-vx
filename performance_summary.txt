@@ -1,0 +1,9 @@
+🔍 TRADE PERFORMANCE ANALYSIS
+📅 Report generated: 2025-07-31 09:21:42
+📊 Total trades: 15
+✅ Executed trades: 2
+❌ Skipped trades: 10
+🏆 Wins (RR ≥ 1.5): 2
+💥 Losses (RR < 1.5): 0
+🎯 Win rate: 100.00%
+📈 Avg Risk/Reward: 5.25
