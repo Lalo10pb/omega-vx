@@ -438,7 +438,9 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
         print(msg)
         send_telegram_alert(msg)
         return False
-    
+    else:
+        print("✅ Equity check passed — trading allowed.")
+
     print("⚙️ Starting trade submission process for:", symbol)
 
     qty = calculate_position_size(entry, stop_loss)
@@ -448,21 +450,29 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
         print(msg)
         send_telegram_alert(msg)
         return False
+    else:
+        print(f"✅ Position size OK: {qty}")
 
     if not is_multi_timeframe_confirmed(symbol):
         print("⛔ Trade skipped — multi-timeframe trend mismatch.")
         send_telegram_alert("⛔ Trade skipped — 15m and 1h trends don't align.")
         return False
+    else:
+        print("✅ Multi-timeframe trend confirmed.")
 
     if is_ai_mood_bad():
         print("🚫 Trade skipped due to AI mood filter.")
         send_telegram_alert("🧠 Trade skipped — AI mood filter detected high risk.")
         return False
+    else:
+        print("✅ AI mood is good.")
 
     if not is_within_trading_hours():
         print("🕑 Trade skipped — outside allowed trading hours.")
         send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
         return False
+    else:
+        print("✅ Within allowed trading hours.")
 
     for attempt in range(1, max_retries + 1):
         try:
