@@ -11,8 +11,8 @@ import pandas as pd
 from datetime import datetime
 import smtplib
 from email.message import EmailMessage
-import yfinance as yf
-
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -123,15 +123,13 @@ def is_within_trading_hours(start_hour=14, end_hour=18, end_minute=30):
 
 def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
     try:
-        bars = get_bars(symbol, interval, lookback)
-        if bars is None or len(bars) < lookback:
-         return None
-        # Convert interval to Alpaca's TimeFrame
+        # 🕒 Set correct timeframe for Alpaca
         tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
 
         end = datetime.utcnow()
         start = end - timedelta(days=2)
 
+        # 📈 Fetch historical bars from Alpaca
         request_params = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
@@ -141,19 +139,27 @@ def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
 
         bars = data_client.get_stock_bars(request_params).df
 
-        if bars.empty or len(bars) < lookback:
-            print(f"⚠️ No data returned for {symbol} — bars empty or insufficient.")
+        if bars.empty or symbol not in bars.index.get_level_values(0):
+            print(f"⚠️ No data returned for {symbol}.")
             return None
 
-        bars = bars[bars['symbol'] == symbol]  # Only this symbol
+        # 🧼 Filter and reset index
+        bars = bars.loc[symbol].reset_index()
 
+        if len(bars) < lookback + 1:
+            print(f"⚠️ Not enough data to compute Heikin Ashi for {symbol}.")
+            return None
+
+        # 🔥 Calculate Heikin Ashi candles
         ha_candles = []
         for i in range(1, lookback + 1):
-            o = (bars['open'].iloc[-i] + bars['close'].iloc[-(i + 1)]) / 2
-            h = max(bars['high'].iloc[-i], o, bars['close'].iloc[-i])
-            l = min(bars['low'].iloc[-i], o, bars['close'].iloc[-i])
-            c = (bars['open'].iloc[-i] + bars['high'].iloc[-i] + bars['low'].iloc[-i] + bars['close'].iloc[-i]) / 4
-            ha_candles.append({'open': o, 'close': c})
+            prev_close = bars['close'].iloc[-(i + 1)]
+            curr_open = bars['open'].iloc[-i]
+            ha_open = (curr_open + prev_close) / 2
+            ha_close = (bars['open'].iloc[-i] + bars['high'].iloc[-i] +
+                        bars['low'].iloc[-i] + bars['close'].iloc[-i]) / 4
+
+            ha_candles.append({'open': ha_open, 'close': ha_close})
 
         last = ha_candles[-1]
         if last['close'] > last['open']:
@@ -273,25 +279,31 @@ def calculate_trade_qty(entry_price, stop_loss_price):
 
 def get_current_vix():
     try:
-        vix = yf.Ticker("^VIX")
-        data = vix.history(period="1d")
-        if not data.empty:
-            return data['Close'].iloc[-1]
+        client = StockHistoricalDataClient(API_KEY, API_SECRET)
+        request = StockLatestQuoteRequest(symbol_or_symbols=["VIXY"])  # fallback ETF if ^VIX is not supported
+        response = client.get_stock_latest_quote(request)
+        quote = response["VIXY"]
+
+        vix_price = quote.ask_price or quote.bid_price
+        if vix_price:
+            return float(vix_price)
         else:
-            print("⚠️ No VIX data found.")
+            print("⚠️ No VIXY quote data available.")
             return 0
     except Exception as e:
-        print(f"❌ Failed to get VIX: {e}")
+        print(f"❌ Failed to get VIXY data: {e}")
         return 0
 
-def is_market_mood_negative():
+def get_current_vix():
     try:
-        vix = get_current_vix()
-        print(f"📊 Current VIX: {vix}")
-        return vix > 20  # adjust threshold as needed
+        client = StockHistoricalDataClient(API_KEY, API_SECRET)
+        request_params = StockLatestQuoteRequest(symbol_or_symbols=["VIX"])
+        quotes = client.get_stock_latest_quote(request_params)
+        vix_price = quotes["VIX"].ask_price or quotes["VIX"].bid_price
+        return float(vix_price)
     except Exception as e:
-        print(f"⚠️ Market mood check failed: {e}")
-        return False
+        print(f"⚠️ Failed to fetch VIX: {e}")
+        raise
 
 def get_max_equity():
     if os.path.exists(MAX_EQUITY_FILE):
@@ -366,6 +378,47 @@ def get_equity_slope():
     except Exception as e:
         print(f"❌ Failed to analyze equity slope: {e}")
         return 0
+
+def get_rsi_value(symbol, interval='15m', period=14):
+    try:
+        # Convert interval to Alpaca's TimeFrame
+        tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
+
+        end = datetime.utcnow()
+        start = end - timedelta(days=5)  # Enough data for RSI
+
+        bars_request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=start,
+            end=end
+        )
+
+        bars = data_client.get_stock_bars(bars_request).df
+
+        if bars.empty or len(bars) < period:
+            print(f"⚠️ Not enough data to calculate RSI for {symbol}")
+            return None
+
+        bars = bars[bars['symbol'] == symbol]
+
+        delta = bars['close'].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+
+        avg_gain = gain.rolling(window=period).mean()
+        avg_loss = loss.rolling(window=period).mean()
+
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+
+        latest_rsi = round(rsi.iloc[-1], 2)
+        print(f"📈 RSI ({interval}) for {symbol}: {latest_rsi}")
+        return latest_rsi
+
+    except Exception as e:
+        print(f"❌ Failed to calculate RSI for {symbol}: {e}")
+        return None
 
 def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3):
     print("⚙️ Starting trade submission process for:", symbol)
