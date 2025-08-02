@@ -225,10 +225,9 @@ def webhook():
         take_profit = float(data.get("take_profit"))
         use_trailing = bool(data.get("use_trailing", False))
 
-        # 🚨 TEMPORARY TEST OVERRIDE — skip mood + cooldown
-        print("🧪 Test mode: skipping mood & cooldown filters")
+        print("🧪 Test mode: skipping all filters")
+        send_telegram_alert("🧪 Test webhook — all filters skipped")
 
-        # Submit the test trade
         success = submit_order_with_retries(
             symbol=symbol,
             entry=entry,
