@@ -13,6 +13,11 @@ import smtplib
 from email.message import EmailMessage
 import yfinance as yf
 
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from datetime import datetime, timedelta
+
 load_dotenv()
 
 # ✅ Define log directory
@@ -39,6 +44,8 @@ app = Flask(__name__)
 
 from datetime import datetime
 from datetime import datetime, time as dt_time
+
+data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
 
 def auto_adjust_risk_percent():
     try:
@@ -81,27 +88,71 @@ def auto_adjust_risk_percent():
         print(f"❌ AI Auto-Tune failed: {e}")
 auto_adjust_risk_percent()
 
+def get_bars(symbol, interval='15m', lookback=10):
+    try:
+        # Set up time range
+        end = datetime.now()
+        start = end - timedelta(minutes=15 * (lookback + 1))
+
+        # Convert to Alpaca timeframe
+        tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
+
+        request_params = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=start,
+            end=end
+        )
+
+        bars = data_client.get_stock_bars(request_params).df
+
+        if bars.empty:
+            print(f"⚠️ No Alpaca data returned for {symbol}")
+            return None
+
+        return bars
+    except Exception as e:
+        print(f"❌ Alpaca data fetch failed for {symbol}: {e}")
+        return None
+
 def is_within_trading_hours(start_hour=14, end_hour=18, end_minute=30):
     now_utc = datetime.utcnow().time()
     start = dt_time(hour=start_hour, minute=0)
     end = dt_time(hour=end_hour, minute=end_minute)
     return start <= now_utc <= end
+
 def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
     try:
-        bars = yf.download(tickers=symbol, interval=interval, period="1d", progress=False, threads=False)
+        bars = get_bars(symbol, interval, lookback)
+        if bars is None or len(bars) < lookback:
+         return None
+        # Convert interval to Alpaca's TimeFrame
+        tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
+
+        end = datetime.utcnow()
+        start = end - timedelta(days=2)
+
+        request_params = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=start,
+            end=end
+        )
+
+        bars = data_client.get_stock_bars(request_params).df
+
         if bars.empty or len(bars) < lookback:
             print(f"⚠️ No data returned for {symbol} — bars empty or insufficient.")
             return None
-    except Exception as e:
-        print(f"❌ Failed to download data for {symbol}: {e}")
-        return None
+
+        bars = bars[bars['symbol'] == symbol]  # Only this symbol
 
         ha_candles = []
         for i in range(1, lookback + 1):
-            o = (bars['Open'][-i] + bars['Close'][-(i + 1)]) / 2
-            h = max(bars['High'][-i], o, bars['Close'][-i])
-            l = min(bars['Low'][-i], o, bars['Close'][-i])
-            c = (bars['Open'][-i] + bars['High'][-i] + bars['Low'][-i] + bars['Close'][-i]) / 4
+            o = (bars['open'].iloc[-i] + bars['close'].iloc[-(i + 1)]) / 2
+            h = max(bars['high'].iloc[-i], o, bars['close'].iloc[-i])
+            l = min(bars['low'].iloc[-i], o, bars['close'].iloc[-i])
+            c = (bars['open'].iloc[-i] + bars['high'].iloc[-i] + bars['low'].iloc[-i] + bars['close'].iloc[-i]) / 4
             ha_candles.append({'open': o, 'close': c})
 
         last = ha_candles[-1]
@@ -111,6 +162,7 @@ def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
             return 'bearish'
         else:
             return 'neutral'
+
     except Exception as e:
         print(f"❌ Failed to get Heikin Ashi trend for {symbol} on {interval}: {e}")
         return None
