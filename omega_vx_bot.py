@@ -368,12 +368,10 @@ def get_equity_slope():
         return 0
 
 def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3):
-    print("🚨 FORCING TRADE EXECUTION FOR TESTING")
-    send_telegram_alert("🚨 FORCING TRADE EXECUTION FOR TESTING")
-    return True
-    
-    # 📏 Calculate position size based on risk
+    print("⚙️ Starting trade submission process for:", symbol)
+
     qty = calculate_position_size(entry, stop_loss)
+    print(f"📏 Calculated quantity: {qty}")
     if qty <= 0:
         msg = f"❌ Trade skipped: Invalid position size ({qty}) for {symbol} at ${entry} with SL ${stop_loss}"
         print(msg)
@@ -385,7 +383,6 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
         send_telegram_alert("⛔ Trade skipped — 15m and 1h trends don't align.")
         return False
 
-    # 🧠 AI Mood Filter check (optional)
     if is_ai_mood_bad():
         print("🚫 Trade skipped due to AI mood filter.")
         send_telegram_alert("🧠 Trade skipped — AI mood filter detected high risk.")
@@ -396,9 +393,10 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
         send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
         return False
 
-    # 🚀 Submit the order with retry logic
     for attempt in range(1, max_retries + 1):
         try:
+            print(f"🚀 Attempting order for {symbol} (try {attempt})")
+
             if use_trailing:
                 api.submit_order(
                     symbol=symbol,
@@ -426,29 +424,26 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
 
             print(f"✅ Order placed for {symbol} (attempt {attempt})")
 
-            # 🧠 GPT trade explanation
             explanation = generate_trade_explanation(
                 symbol=symbol,
                 entry=entry,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                rsi=None,  # Optional
+                rsi=None,
                 trend="uptrend" if use_trailing else "neutral",
-                ha_candle="bullish"  # Optional
+                ha_candle="bullish"
             )
 
-            # 📲 Telegram alert
             send_telegram_alert(f"🚀 Trade executed:\n{explanation}")
-            return True
             log_equity_curve()
-        
+            return True
+
         except Exception as e:
             print(f"⚠️ Attempt {attempt} failed for {symbol}: {e}")
 
     print(f"❌ Order failed for {symbol} after {max_retries} attempts")
     send_telegram_alert(f"❌ Order failed for {symbol} after {max_retries} attempts")
     return False
-
 def log_portfolio_snapshot():
     try:
         account = api.get_account()
