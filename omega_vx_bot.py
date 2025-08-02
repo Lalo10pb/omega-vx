@@ -88,9 +88,13 @@ def is_within_trading_hours(start_hour=14, end_hour=18, end_minute=30):
     return start <= now_utc <= end
 def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
     try:
-        bars = yf.download(tickers=symbol, interval=interval, period="1d", progress=False)
+        bars = yf.download(tickers=symbol, interval=interval, period="1d", progress=False, threads=False)
         if bars.empty or len(bars) < lookback:
+            print(f"⚠️ No data returned for {symbol} — bars empty or insufficient.")
             return None
+    except Exception as e:
+        print(f"❌ Failed to download data for {symbol}: {e}")
+        return None
 
         ha_candles = []
         for i in range(1, lookback + 1):
