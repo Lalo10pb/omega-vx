@@ -242,7 +242,7 @@ def webhook():
         print(f"🔄 Calling submit_order_with_retries for {symbol}", flush=True)
 
         try:
-            success = submit_order_with_retries(
+                success = submit_order_with_retries(
                 symbol=symbol,
                 entry=entry,
                 stop_loss=stop_loss,
@@ -450,7 +450,7 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     
     print('🔍 Checking equity guard...')
     if should_block_trading_due_to_equity():
-        print('🛑 Reason: Blocked due to equity drop')
+        print('🛑 BLOCKED: Equity drop filter triggered.')
         msg = "🛑 Webhook blocked: Equity protection triggered."
         print(msg)
         send_telegram_alert(msg)
@@ -545,7 +545,11 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
             return True
 
         except Exception as e:
-            print(f"⚠️ Attempt {attempt} failed for {symbol}: {e}")
+           print("🚨 ERROR while submitting the order to Alpaca API")
+           print(f"📉 Symbol: {symbol}")
+           print(f"📊 Entry: {entry}, Stop Loss: {stop_loss}, Take Profit: {take_profit}")
+           print(f"🔁 Retry attempt: {attempt}")
+           print(f"🧨 Error message: {str(e)}")
 
     print(f"❌ Order failed for {symbol} after {max_retries} attempts")
     send_telegram_alert(f"❌ Order failed for {symbol} after {max_retries} attempts")
