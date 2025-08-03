@@ -453,8 +453,14 @@ def get_rsi_value(symbol, interval='15m', period=14):
 def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3):
     print("📌 About to calculate quantity...")
     qty = calculate_trade_qty(entry, stop_loss)
+    if qty == 0:
+       print("❌ Qty is 0 — skipping order.")
+       send_telegram_alert("❌ Trade aborted — calculated qty was 0.")
+       return False
+    
     print(f"📌 Quantity calculated: {qty}")
     print('🔍 Checking equity guard...')
+    
     if should_block_trading_due_to_equity():
         print('🛑 BLOCKED: Equity drop filter triggered.')
         msg = "🛑 Webhook blocked: Equity protection triggered."
