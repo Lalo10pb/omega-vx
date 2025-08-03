@@ -228,6 +228,11 @@ def webhook():
         data = request.get_json()
         print(f"📥 Webhook received: {data}")
 
+        if data is None:
+            print("❌ No JSON data received. Raw body:")
+            print(request.data)
+            return jsonify({"status": "error", "message": "No JSON data received"}), 400
+
         symbol = data.get("symbol")
         entry = float(data.get("entry"))
         stop_loss = float(data.get("stop_loss"))
