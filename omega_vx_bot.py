@@ -226,11 +226,11 @@ def calculate_position_size(entry_price, stop_loss):
 def webhook():
     try:
         data = request.get_json()
-        print(f"📥 Webhook received: {data}")
+        print(f"📥 Webhook received: {data}", flush=True)
 
         if data is None:
-            print("❌ No JSON data received. Raw body:")
-            print(request.data)
+            print("❌ No JSON data received. Raw body:", flush=True)
+            print(request.data, flush=True)
             return jsonify({"status": "error", "message": "No JSON data received"}), 400
 
         symbol = data.get("symbol")
@@ -239,22 +239,27 @@ def webhook():
         take_profit = float(data.get("take_profit"))
         use_trailing = bool(data.get("use_trailing", False))
 
-        print(f"🔄 Calling submit_order_with_retries for {symbol}")
+        print(f"🔄 Calling submit_order_with_retries for {symbol}", flush=True)
 
-        success = submit_order_with_retries(
-            symbol=symbol,
-            entry=entry,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
-            use_trailing=use_trailing
-        )
+        try:
+            success = submit_order_with_retries(
+                symbol=symbol,
+                entry=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                use_trailing=use_trailing
+            )
+        except Exception as trade_error:
+            print(f"💥 Exception during submit_order_with_retries: {trade_error}", flush=True)
+            send_telegram_alert(f"💥 submit_order_with_retries error: {trade_error}")
+            return jsonify({"status": "error", "message": str(trade_error)}), 500
 
-        print(f"✅ Trade result: {'Success' if success else 'Failed'}")
+        print(f"✅ Trade result: {'Success' if success else 'Failed'}", flush=True)
 
         return jsonify({"status": "success" if success else "failed"}), 200
 
     except Exception as e:
-        print(f"❌ Exception in webhook: {e}")
+        print(f"❌ Exception in webhook: {e}", flush=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route("/ping", methods=["GET"])
