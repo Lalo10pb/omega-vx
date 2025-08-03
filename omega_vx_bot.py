@@ -535,10 +535,9 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 rsi=None,
-                trend="uptrend" if use_trailing else "neutral",
-                ha_candle="bullish"
+                trend="uptrend" if use_trailing else "neutral"
             )
-
+            
             send_telegram_alert(f"🚀 Trade executed:\n{explanation}")
             log_equity_curve()
             return True
@@ -573,28 +572,16 @@ def log_portfolio_snapshot():
         send_telegram_alert(f"⚠️ Snapshot failed: {e}")
 
 
-# ✅ GPT Trade Explanation
-def generate_trade_explanation(symbol, entry, stop_loss, take_profit, rsi=None, trend=None, ha_candle=None):
+# ✅ GPT Trade Explanation (Heikin Ashi disabled)
+def generate_trade_explanation(symbol, entry, stop_loss, take_profit, rsi=None, trend=None):
     explanation = f"🧠 Trade rationale for {symbol}:\n"
     explanation += f"• Entry at ${entry:.2f}, Stop Loss at ${stop_loss:.2f}, Take Profit at ${take_profit:.2f}\n"
     if rsi is not None:
         explanation += f"• RSI filter passed: {rsi:.2f}\n"
     if trend is not None:
         explanation += f"• Trend confirmed: {trend}\n"
-    if ha_candle == "bullish":
-        explanation += "• Heikin Ashi shows bullish momentum.\n"
-    elif ha_candle == "bearish":
-        explanation += "• Heikin Ashi indicates weakness.\n"
     explanation += "✅ All filters passed — trade executed confidently."
-    return explanation    
-
-    tags = {
-        "rsi": "enabled" if rsi_enabled else "disabled",
-        "ema": "uptrend" if ema_trend == "up" else "flat",
-        "mtf": trend_15m + "+" + trend_1h,
-        "ha": heikin_ashi_trend,
-        "result": "win" or "loss"  # later filled after TP or SL
-    }
+    return explanation
 
 def send_weekly_summary():
     try:
