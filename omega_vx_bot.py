@@ -17,7 +17,8 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from datetime import datetime, timedelta
-
+import functools
+print = functools.partial(print, flush=True)
 load_dotenv()
 
 # ✅ Define log directory
@@ -223,16 +224,19 @@ def calculate_position_size(entry_price, stop_loss):
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    print("📡 Webhook endpoint triggered", flush=True)  # 👈 Add this line
+
     try:
         data = request.get_json()
+        print(f"📥 Webhook received: {data}", flush=True)
+
         symbol = data.get("symbol")
         entry = float(data.get("entry"))
         stop_loss = float(data.get("stop_loss"))
         take_profit = float(data.get("take_profit"))
         use_trailing = bool(data.get("use_trailing", False))
 
-        print("🧪 Test mode: skipping all filters")
-        send_telegram_alert("🧪 Test webhook — all filters skipped")
+        print(f"🔄 Calling submit_order_with_retries for {symbol}", flush=True)
 
         success = submit_order_with_retries(
             symbol=symbol,
@@ -242,40 +246,13 @@ def webhook():
             use_trailing=use_trailing
         )
 
+        print(f"✅ Trade result: {'Success' if success else 'Failed'}", flush=True)
+
         return jsonify({"status": "success" if success else "failed"}), 200
 
     except Exception as e:
-        print(f"❌ Exception in webhook: {e}")
+        print(f"❌ Exception in webhook: {e}", flush=True)
         return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route("/ping", methods=["GET"])
-def ping():
-    return "pong", 200
-
-MAX_EQUITY_FILE = os.path.join(LOG_DIR, "max_equity.txt")
-SNAPSHOT_LOG_PATH = os.path.join(LOG_DIR, "last_snapshot.txt")
-PORTFOLIO_LOG_PATH = os.path.join(LOG_DIR, "portfolio_log.csv")
-TRADE_LOG_PATH = os.path.join(LOG_DIR, "trade_log.csv")
-def calculate_trade_qty(entry_price, stop_loss_price):
-    """
-    Calculate the number of shares to buy based on max risk per trade and account equity.
-    """
-    try:
-        account = api.get_account()
-        equity = float(account.equity)
-        max_risk_amount = equity * (MAX_RISK_PER_TRADE_PERCENT / 100)
-        risk_per_share = abs(entry_price - stop_loss_price)
-
-        if risk_per_share == 0:
-            return 0
-
-        qty = int(max(max_risk_amount / risk_per_share, MIN_TRADE_QTY))
-        return qty
-
-    except Exception as e:
-        print("⚠️ Error calculating trade quantity:", e)
-        send_telegram_alert(f"⚠️ Risk-based quantity error: {e}")
-        return 0
 
 def get_current_vix():
     try:
@@ -433,6 +410,15 @@ def get_rsi_value(symbol, interval='15m', period=14):
         return None
 
 def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3):
+    print("✅ Reached: begin submit_order_with_retries", flush=True)
+
+    if should_block_trading_due_to_equity():
+        print("🛑 Blocked due to equity", flush=True)
+        msg = "🛑 Webhook blocked: Equity protection triggered."
+        send_telegram_alert(msg)
+        return False
+    else:
+        print("✅ Equity check passed — trading allowed.", flush=True)
     if should_block_trading_due_to_equity():
         msg = "🛑 Webhook blocked: Equity protection triggered."
         print(msg)
@@ -525,6 +511,7 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     print(f"❌ Order failed for {symbol} after {max_retries} attempts")
     send_telegram_alert(f"❌ Order failed for {symbol} after {max_retries} attempts")
     return False
+    
 def log_portfolio_snapshot():
     try:
         account = api.get_account()

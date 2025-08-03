@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: omega-vx
+    env: python
+    plan: starter
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python omega_vx_bot.py
+    envVars:
+      - key: APCA_API_KEY_ID
+        value: your_key_here
+      - key: APCA_API_SECRET_KEY
+        value: your_secret_here
+      - key: APCA_API_BASE_URL
+        value: https://paper-api.alpaca.markets
+      - key: TELEGRAM_BOT_TOKEN
+        value: your_token_here
+      - key: TELEGRAM_CHAT_ID
+        value: your_chat_id_here
