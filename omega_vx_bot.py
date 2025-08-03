@@ -461,6 +461,7 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     print("⚙️ Starting trade submission process for:", symbol)
 
     qty = calculate_position_size(entry, stop_loss)
+    print(f"🧮 Qty returned by calculate_position_size: {qty}") 
     print(f"📏 Calculated quantity: {qty}")
     
     if qty <= 0:
