@@ -489,14 +489,13 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     # Skipping multi-timeframe trend check (already done)
     # Skipping AI mood check (already passed in your test)
 
-    print("🕑 ⏩ Skipping trading hour check (TEST MODE ENABLED)")
-    # if not is_within_trading_hours():
-    #     print('🕑 Reason: Outside trading hours')
-    #     print("🕑 Trade skipped — outside allowed trading hours.")
-    #     send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
-    #     return False
-    # else:
-    #     print("✅ Within allowed trading hours.")
+    if not is_within_trading_hours():
+        print('🕑 Reason: Outside trading hours')
+        print("🕑 Trade skipped — outside allowed trading hours.")
+        send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
+        return False
+    else:
+        print("✅ Within allowed trading hours.")
 
     for attempt in range(1, max_retries + 1):
         try:
