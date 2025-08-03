@@ -224,11 +224,9 @@ def calculate_position_size(entry_price, stop_loss):
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    print("📡 Webhook endpoint triggered", flush=True)  # 👈 Add this line
-
     try:
         data = request.get_json()
-        print(f"📥 Webhook received: {data}", flush=True)
+        print(f"📥 Webhook received: {data}")
 
         symbol = data.get("symbol")
         entry = float(data.get("entry"))
@@ -236,7 +234,7 @@ def webhook():
         take_profit = float(data.get("take_profit"))
         use_trailing = bool(data.get("use_trailing", False))
 
-        print(f"🔄 Calling submit_order_with_retries for {symbol}", flush=True)
+        print(f"🔄 Calling submit_order_with_retries for {symbol}")
 
         success = submit_order_with_retries(
             symbol=symbol,
@@ -246,13 +244,42 @@ def webhook():
             use_trailing=use_trailing
         )
 
-        print(f"✅ Trade result: {'Success' if success else 'Failed'}", flush=True)
+        print(f"✅ Trade result: {'Success' if success else 'Failed'}")
 
         return jsonify({"status": "success" if success else "failed"}), 200
 
     except Exception as e:
-        print(f"❌ Exception in webhook: {e}", flush=True)
+        print(f"❌ Exception in webhook: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    return "pong", 200
+
+MAX_EQUITY_FILE = os.path.join(LOG_DIR, "max_equity.txt")
+SNAPSHOT_LOG_PATH = os.path.join(LOG_DIR, "last_snapshot.txt")
+PORTFOLIO_LOG_PATH = os.path.join(LOG_DIR, "portfolio_log.csv")
+TRADE_LOG_PATH = os.path.join(LOG_DIR, "trade_log.csv")
+def calculate_trade_qty(entry_price, stop_loss_price):
+    """
+    Calculate the number of shares to buy based on max risk per trade and account equity.
+    """
+    try:
+        account = api.get_account()
+        equity = float(account.equity)
+        max_risk_amount = equity * (MAX_RISK_PER_TRADE_PERCENT / 100)
+        risk_per_share = abs(entry_price - stop_loss_price)
+
+        if risk_per_share == 0:
+            return 0
+
+        qty = int(max(max_risk_amount / risk_per_share, MIN_TRADE_QTY))
+        return qty
+
+    except Exception as e:
+        print("⚠️ Error calculating trade quantity:", e)
+        send_telegram_alert(f"⚠️ Risk-based quantity error: {e}")
+        return 0
 
 def get_current_vix():
     try:
@@ -410,16 +437,10 @@ def get_rsi_value(symbol, interval='15m', period=14):
         return None
 
 def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3):
-    print("✅ Reached: begin submit_order_with_retries", flush=True)
-
+    
+    print('🔍 Checking equity guard...')
     if should_block_trading_due_to_equity():
-        print("🛑 Blocked due to equity", flush=True)
-        msg = "🛑 Webhook blocked: Equity protection triggered."
-        send_telegram_alert(msg)
-        return False
-    else:
-        print("✅ Equity check passed — trading allowed.", flush=True)
-    if should_block_trading_due_to_equity():
+        print('🛑 Reason: Blocked due to equity drop')
         msg = "🛑 Webhook blocked: Equity protection triggered."
         print(msg)
         send_telegram_alert(msg)
@@ -431,7 +452,9 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
 
     qty = calculate_position_size(entry, stop_loss)
     print(f"📏 Calculated quantity: {qty}")
+    
     if qty <= 0:
+        print(f'❌ Reason: Invalid quantity ({qty})')
         msg = f"❌ Trade skipped: Invalid position size ({qty}) for {symbol} at ${entry} with SL ${stop_loss}"
         print(msg)
         send_telegram_alert(msg)
@@ -439,21 +462,27 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     else:
         print(f"✅ Position size OK: {qty}")
 
+    
     if not is_multi_timeframe_confirmed(symbol):
+        print('⛔ Reason: Multi-timeframe trend mismatch')
         print("⛔ Trade skipped — multi-timeframe trend mismatch.")
         send_telegram_alert("⛔ Trade skipped — 15m and 1h trends don't align.")
         return False
     else:
         print("✅ Multi-timeframe trend confirmed.")
 
+    
     if is_ai_mood_bad():
+        print('🚫 Reason: Bad AI mood')
         print("🚫 Trade skipped due to AI mood filter.")
         send_telegram_alert("🧠 Trade skipped — AI mood filter detected high risk.")
         return False
     else:
         print("✅ AI mood is good.")
 
+    
     if not is_within_trading_hours():
+        print('🕑 Reason: Outside trading hours')
         print("🕑 Trade skipped — outside allowed trading hours.")
         send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
         return False
