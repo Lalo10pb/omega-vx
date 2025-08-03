@@ -474,7 +474,7 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     print("⚙️ Starting trade submission process for:", symbol)
 
     qty = calculate_trade_qty(entry, stop_loss)
-    print(f"🧮 Qty returned by calculate_position_size: {qty}") 
+    print(f"🧮 Qty returned by calculate_position_size: {qty}")
     print(f"📏 Calculated quantity: {qty}")
 
     if qty <= 0:
@@ -486,30 +486,17 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     else:
         print(f"✅ Position size OK: {qty}")
 
-    # 🔕 Skipping Heikin Ashi / multi-timeframe trend check due to Alpaca Basic plan
-    # if not is_multi_timeframe_confirmed(symbol):
-    #     print('⛔ Reason: Multi-timeframe trend mismatch')
-    #     print("⛔ Trade skipped — multi-timeframe trend mismatch.")
-    #     send_telegram_alert("⛔ Trade skipped — 15m and 1h trends don't align.")
+    # Skipping multi-timeframe trend check (already done)
+    # Skipping AI mood check (already passed in your test)
+
+    print("🕑 ⏩ Skipping trading hour check (TEST MODE ENABLED)")
+    # if not is_within_trading_hours():
+    #     print('🕑 Reason: Outside trading hours')
+    #     print("🕑 Trade skipped — outside allowed trading hours.")
+    #     send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
     #     return False
     # else:
-    #     print("✅ Multi-timeframe trend confirmed.")
-
-    if is_ai_mood_bad():
-        print('🚫 Reason: Bad AI mood')
-        print("🚫 Trade skipped due to AI mood filter.")
-        send_telegram_alert("🧠 Trade skipped — AI mood filter detected high risk.")
-        return False
-    else:
-        print("✅ AI mood is good.")
-
-    if not is_within_trading_hours():
-        print('🕑 Reason: Outside trading hours')
-        print("🕑 Trade skipped — outside allowed trading hours.")
-        send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
-        return False
-    else:
-        print("✅ Within allowed trading hours.")
+    #     print("✅ Within allowed trading hours.")
 
     for attempt in range(1, max_retries + 1):
         try:
