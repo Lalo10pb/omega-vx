@@ -278,23 +278,24 @@ def calculate_trade_qty(entry_price, stop_loss_price):
         max_risk_amount = equity * (MAX_RISK_PER_TRADE_PERCENT / 100)
         risk_per_share = abs(entry_price - stop_loss_price)
 
-        print(f"📊 Account equity: ${equity}")
-        print(f"📉 Risk % per trade: {MAX_RISK_PER_TRADE_PERCENT}%")
-        print(f"💰 Max risk per trade: ${max_risk_amount}")
-        print(f"⚖️ Risk per share: ${risk_per_share}")
+        print(f"🧮 DEBUG:")
+        print(f"  • Account equity: {equity}")
+        print(f"  • Max risk per trade: {MAX_RISK_PER_TRADE_PERCENT}% → {max_risk_amount}")
+        print(f"  • Risk per share: {risk_per_share}")
 
         if risk_per_share == 0:
             print("⚠️ Risk per share is 0 — invalid stop loss?")
             return 0
 
         qty = int(max(max_risk_amount / risk_per_share, MIN_TRADE_QTY))
-        print(f"🧮 Final calculated qty: {qty}")
+        print(f"  • Final calculated qty: {qty}")
         return qty
 
     except Exception as e:
         print("⚠️ Error calculating trade quantity:", e)
         send_telegram_alert(f"⚠️ Risk-based quantity error: {e}")
         return 0
+
 def get_current_vix():
     try:
         client = StockHistoricalDataClient(API_KEY, API_SECRET)
