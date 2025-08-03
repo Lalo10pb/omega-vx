@@ -455,13 +455,13 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     print("📌 About to calculate quantity...")
     qty = calculate_trade_qty(entry, stop_loss)
     if qty == 0:
-       print("❌ Qty is 0 — skipping order.")
-       send_telegram_alert("❌ Trade aborted — calculated qty was 0.")
-       return False
-    
+        print("❌ Qty is 0 — skipping order.")
+        send_telegram_alert("❌ Trade aborted — calculated qty was 0.")
+        return False
+
     print(f"📌 Quantity calculated: {qty}")
     print('🔍 Checking equity guard...')
-    
+
     if should_block_trading_due_to_equity():
         print('🛑 BLOCKED: Equity drop filter triggered.')
         msg = "🛑 Webhook blocked: Equity protection triggered."
@@ -476,7 +476,7 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     qty = calculate_trade_qty(entry, stop_loss)
     print(f"🧮 Qty returned by calculate_position_size: {qty}") 
     print(f"📏 Calculated quantity: {qty}")
-    
+
     if qty <= 0:
         print(f'❌ Reason: Invalid quantity ({qty})')
         msg = f"❌ Trade skipped: Invalid position size ({qty}) for {symbol} at ${entry} with SL ${stop_loss}"
@@ -486,16 +486,15 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     else:
         print(f"✅ Position size OK: {qty}")
 
-    
-    if not is_multi_timeframe_confirmed(symbol):
-        print('⛔ Reason: Multi-timeframe trend mismatch')
-        print("⛔ Trade skipped — multi-timeframe trend mismatch.")
-        send_telegram_alert("⛔ Trade skipped — 15m and 1h trends don't align.")
-        return False
-    else:
-        print("✅ Multi-timeframe trend confirmed.")
+    # 🔕 Skipping Heikin Ashi / multi-timeframe trend check due to Alpaca Basic plan
+    # if not is_multi_timeframe_confirmed(symbol):
+    #     print('⛔ Reason: Multi-timeframe trend mismatch')
+    #     print("⛔ Trade skipped — multi-timeframe trend mismatch.")
+    #     send_telegram_alert("⛔ Trade skipped — 15m and 1h trends don't align.")
+    #     return False
+    # else:
+    #     print("✅ Multi-timeframe trend confirmed.")
 
-    
     if is_ai_mood_bad():
         print('🚫 Reason: Bad AI mood')
         print("🚫 Trade skipped due to AI mood filter.")
@@ -504,7 +503,6 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     else:
         print("✅ AI mood is good.")
 
-    
     if not is_within_trading_hours():
         print('🕑 Reason: Outside trading hours')
         print("🕑 Trade skipped — outside allowed trading hours.")
@@ -559,16 +557,16 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
             return True
 
         except Exception as e:
-           print("🚨 ERROR while submitting the order to Alpaca API")
-           print(f"📉 Symbol: {symbol}")
-           print(f"📊 Entry: {entry}, Stop Loss: {stop_loss}, Take Profit: {take_profit}")
-           print(f"🔁 Retry attempt: {attempt}")
-           print(f"🧨 Error message: {str(e)}")
+            print("🚨 ERROR while submitting the order to Alpaca API")
+            print(f"📉 Symbol: {symbol}")
+            print(f"📊 Entry: {entry}, Stop Loss: {stop_loss}, Take Profit: {take_profit}")
+            print(f"🔁 Retry attempt: {attempt}")
+            print(f"🧨 Error message: {str(e)}")
 
     print(f"❌ Order failed for {symbol} after {max_retries} attempts")
     send_telegram_alert(f"❌ Order failed for {symbol} after {max_retries} attempts")
     return False
-    
+
 def log_portfolio_snapshot():
     try:
         account = api.get_account()
