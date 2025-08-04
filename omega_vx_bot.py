@@ -22,6 +22,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from datetime import datetime, timedelta
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 import functools
 print = functools.partial(print, flush=True)
 load_dotenv()
@@ -45,7 +46,7 @@ BASE_URL = os.getenv("APCA_API_BASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
 app = Flask(__name__)
 
 from datetime import datetime
@@ -205,7 +206,7 @@ def log_equity_curve():
 
 def get_account_equity():
     try:
-        account = api.get_account()  # ✅ not 'alpaca'
+        account = trading_client.get_account()  # ✅ from alpaca-py
         return float(account.equity)
     except Exception as e:
         print(f"❌ Failed to fetch account equity: {e}")
@@ -278,7 +279,7 @@ TRADE_LOG_PATH = os.path.join(LOG_DIR, "trade_log.csv")
 
 def calculate_trade_qty(entry_price, stop_loss_price):
     try:
-        account = api.get_account()
+        account = trading_client.get_account()  # ✅ Updated
         equity = float(account.equity)
         max_risk_amount = equity * (MAX_RISK_PER_TRADE_PERCENT / 100)
         risk_per_share = abs(entry_price - stop_loss_price)
@@ -355,7 +356,7 @@ def update_max_equity(current_equity):
 
 def should_block_trading_due_to_equity():
     try:
-        account = api.get_account()
+        account = trading_client.get_account()  # ✅ Updated
         equity = float(account.equity)
         update_max_equity(equity)
         max_equity = get_max_equity()
@@ -478,25 +479,8 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
 
     print("⚙️ Starting trade submission process for:", symbol)
 
-    qty = calculate_trade_qty(entry, stop_loss)
-    print(f"🧮 Qty returned by calculate_position_size: {qty}")
-    print(f"📏 Calculated quantity: {qty}")
-
-    if qty <= 0:
-        print(f'❌ Reason: Invalid quantity ({qty})')
-        msg = f"❌ Trade skipped: Invalid position size ({qty}) for {symbol} at ${entry} with SL ${stop_loss}"
-        print(msg)
-        send_telegram_alert(msg)
-        return False
-    else:
-        print(f"✅ Position size OK: {qty}")
-
-    # Skipping multi-timeframe trend check (already done)
-    # Skipping AI mood check (already passed in your test)
-
     if not is_within_trading_hours():
         print('🕑 Reason: Outside trading hours')
-        print("🕑 Trade skipped — outside allowed trading hours.")
         send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
         return False
     else:
@@ -506,31 +490,20 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
         try:
             print(f"🚀 Attempting order for {symbol} (try {attempt})")
 
-            if use_trailing:
-                api.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side='buy',
-                    type='limit',
-                    time_in_force='gtc',
-                    limit_price=entry,
-                    order_class='bracket',
-                    stop_loss={'stop_price': stop_loss, 'trail_percent': 1.0},
-                    take_profit={'limit_price': take_profit}
-                )
-            else:
-                api.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side='buy',
-                    type='limit',
-                    time_in_force='gtc',
-                    limit_price=entry,
-                    order_class='bracket',
-                    stop_loss={'stop_price': stop_loss},
-                    take_profit={'limit_price': take_profit}
-                )
+            order_request = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.GTC,
+                order_class='bracket',
+                stop_loss=StopLossRequest(
+                    stop_price=stop_loss,
+                    trail_percent=1.0 if use_trailing else None
+                ),
+                take_profit=TakeProfitRequest(limit_price=take_profit)
+            )
 
+            trading_client.submit_order(order_request)
             print(f"✅ Order placed for {symbol} (attempt {attempt})")
 
             explanation = generate_trade_explanation(
@@ -541,7 +514,7 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
                 rsi=None,
                 trend="uptrend" if use_trailing else "neutral"
             )
-            
+
             send_telegram_alert(f"🚀 Trade executed:\n{explanation}")
             log_equity_curve()
             return True
@@ -559,22 +532,23 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
 
 def log_portfolio_snapshot():
     try:
-        account = api.get_account()
+        account = trading_client.get_account()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         row = [timestamp, account.equity, account.cash, account.portfolio_value]
+
         file_exists = os.path.exists(PORTFOLIO_LOG_PATH)
         with open(PORTFOLIO_LOG_PATH, mode='a', newline='') as file:
             writer = csv.writer(file)
             if not file_exists:
                 writer.writerow(["timestamp", "equity", "cash", "portfolio_value"])
             writer.writerow(row)
+
         print("✅ Daily snapshot logged:", row)
         send_telegram_alert(f"📸 Snapshot logged: Equity ${account.equity}, Cash ${account.cash}")
-    
+
     except Exception as e:
         print("⚠️ Failed to log portfolio snapshot:", e)
         send_telegram_alert(f"⚠️ Snapshot failed: {e}")
-
 
 # ✅ GPT Trade Explanation (Heikin Ashi disabled)
 def generate_trade_explanation(symbol, entry, stop_loss, take_profit, rsi=None, trend=None):
@@ -632,13 +606,14 @@ def start_position_watchdog(interval_minutes=5, loss_threshold=-0.03):
     def watchdog():
         while True:
             try:
-                positions = api.list_positions()
+                positions = trading_client.get_all_positions()  # ✅ alpaca-py method
+
                 for pos in positions:
                     unrealized_plpc = float(pos.unrealized_plpc)
                     symbol = pos.symbol
 
                     if unrealized_plpc <= loss_threshold:
-                        msg = f"⚠️ {symbol} is down {unrealized_plpc*100:.2f}% — check position!"
+                        msg = f"⚠️ {symbol} is down {unrealized_plpc * 100:.2f}% — check position!"
                         print(msg)
                         send_telegram_alert(msg)
 
@@ -647,7 +622,7 @@ def start_position_watchdog(interval_minutes=5, loss_threshold=-0.03):
             except Exception as e:
                 print("🚨 Position Watchdog Error:", e)
                 send_telegram_alert(f"🚨 Watchdog error: {e}")
-                time.sleep(60)  # wait 1 min before retry
+                time.sleep(60)
 
     thread = threading.Thread(target=watchdog, daemon=True)
     thread.start()
@@ -676,7 +651,7 @@ def is_ai_mood_bad():
         loss_streak = sum(recent["status"].str.contains("loss|error|skipped", case=False))
         win_streak = sum(recent["status"].str.contains("executed", case=False))
 
-        account = api.get_account()
+        account = trading_client.get_account()  # ✅ New SDK method
         equity = float(account.equity)
         max_equity = get_max_equity()
 
@@ -720,6 +695,7 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
 
     context_recent_outcome = "unknown"
     context_equity_change = "unknown"
+
     try:
         if os.path.isfile(TRADE_LOG_PATH):
             recent_df = pd.read_csv(TRADE_LOG_PATH)
@@ -729,7 +705,7 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
 
                 if "equity" in recent_df.columns:
                     prev_equity = float(recent_df.iloc[-1].get("equity", 0))
-                    account = api.get_account()
+                    account = trading_client.get_account()  # ✅ Updated
                     current_equity = float(account.equity)
                     context_equity_change = "gain" if current_equity > prev_equity else "loss"
     except Exception as e:
@@ -768,7 +744,7 @@ def run_position_watchdog():
     def check_positions():
         while True:
             try:
-                positions = api.list_positions()
+                positions = trading_client.get_all_positions()
                 for position in positions:
                     symbol = position.symbol
                     qty = int(float(position.qty))
@@ -784,13 +760,14 @@ def run_position_watchdog():
                         print(msg)
                         send_telegram_alert(msg)
 
-                        api.submit_order(
+                        # ✅ Correct way to submit market order with alpaca-py
+                        market_order = MarketOrderRequest(
                             symbol=symbol,
                             qty=qty,
-                            side='sell',
-                            type='market',
-                            time_in_force='gtc'
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC
                         )
+                        trading_client.submit_order(order_data=market_order)
 
                         send_telegram_alert(f"✅ {symbol} closed at market due to -3% drop.")
                         print(f"✅ {symbol} closed at market.")
@@ -802,16 +779,16 @@ def run_position_watchdog():
                 send_telegram_alert(f"⚠️ Watchdog error: {e}")
                 time.sleep(60)
 
-    # Start watchdog in background
     threading.Thread(target=check_positions, daemon=True).start()
 
+
+# ✅ Entry point
 if __name__ == '__main__':
     today = datetime.now().strftime("%Y-%m-%d")
     if not os.path.exists(SNAPSHOT_LOG_PATH) or open(SNAPSHOT_LOG_PATH).read().strip() != today:
         log_portfolio_snapshot()
         with open(SNAPSHOT_LOG_PATH, "w") as f:
             f.write(today)
-    run_position_watchdog()  # Step 18 - Background exit monitor
+    run_position_watchdog()
     log_equity_curve()
     app.run(host='0.0.0.0', port=5050)
-   
