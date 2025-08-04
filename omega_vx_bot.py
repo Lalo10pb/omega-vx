@@ -3,7 +3,12 @@ import numpy as np
 import csv
 import os
 from dotenv import load_dotenv 
-import alpaca_trade_api as tradeapi
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 import threading
 import time
 import requests
@@ -40,7 +45,7 @@ BASE_URL = os.getenv("APCA_API_BASE_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL)
+trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
 app = Flask(__name__)
 
 from datetime import datetime
