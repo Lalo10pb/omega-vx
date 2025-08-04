@@ -759,13 +759,54 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
     else:
         df.to_csv(TRADE_LOG_PATH, mode='a', header=False, index=False)
 
+def run_position_watchdog():
+    def check_positions():
+        while True:
+            try:
+                positions = api.list_positions()
+                for position in positions:
+                    symbol = position.symbol
+                    qty = int(float(position.qty))
+                    entry_price = float(position.avg_entry_price)
+                    current_price = float(position.current_price)
+                    unrealized_plpc = float(position.unrealized_plpc)
+
+                    percent_change = unrealized_plpc * 100
+                    print(f"🐶 [{symbol}] Checking: {percent_change:.2f}% P/L")
+
+                    if percent_change <= -3.0:
+                        msg = f"🔻 Auto-exit triggered for {symbol}: unrealized P/L = {percent_change:.2f}%"
+                        print(msg)
+                        send_telegram_alert(msg)
+
+                        api.submit_order(
+                            symbol=symbol,
+                            qty=qty,
+                            side='sell',
+                            type='market',
+                            time_in_force='gtc'
+                        )
+
+                        send_telegram_alert(f"✅ {symbol} closed at market due to -3% drop.")
+                        print(f"✅ {symbol} closed at market.")
+
+                time.sleep(60)
+
+            except Exception as e:
+                print(f"⚠️ Watchdog error: {e}")
+                send_telegram_alert(f"⚠️ Watchdog error: {e}")
+                time.sleep(60)
+
+    # Start watchdog in background
+    threading.Thread(target=check_positions, daemon=True).start()
+
 if __name__ == '__main__':
     today = datetime.now().strftime("%Y-%m-%d")
     if not os.path.exists(SNAPSHOT_LOG_PATH) or open(SNAPSHOT_LOG_PATH).read().strip() != today:
         log_portfolio_snapshot()
         with open(SNAPSHOT_LOG_PATH, "w") as f:
             f.write(today)
-
-    start_position_watchdog()
-    app.run(host='0.0.0.0', port=5050)
+    run_position_watchdog()  # Step 18 - Background exit monitor
     log_equity_curve()
+    app.run(host='0.0.0.0', port=5050)
+   
