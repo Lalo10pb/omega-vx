@@ -30,9 +30,13 @@ load_dotenv()
 # ✅ Define log directory
 LOG_DIR = os.path.expanduser("~/omega-vx/logs")
 os.makedirs(LOG_DIR, exist_ok=True)
+CRASH_LOG_FILE = os.path.join(LOG_DIR, "last_boot.txt")
+
 
 DAILY_RISK_LIMIT = -10  # 💥 Stop trading after $10 loss
 LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
+
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN")
 
 LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
 TRADE_COOLDOWN_SECONDS = 300  # 5 minutes
@@ -53,6 +57,31 @@ from datetime import datetime
 from datetime import datetime, time as dt_time
 
 data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+
+def handle_restart_notification():
+    now = datetime.now()
+    try:
+        if os.path.exists(CRASH_LOG_FILE):
+            with open(CRASH_LOG_FILE, 'r') as f:
+                last_boot = f.read().strip()
+                if last_boot:
+                    last_time = datetime.strptime(last_boot, "%Y-%m-%d %H:%M:%S")
+                    diff = (now - last_time).total_seconds() / 60
+                    msg = f"♻️ OMEGA-VX restarted — last boot was {diff:.1f} minutes ago."
+                    print(msg)
+                    send_telegram_alert(msg)
+        else:
+            print("🆕 First boot — no prior crash log found.")
+
+    except Exception as e:
+        print(f"⚠️ Crash log check failed: {e}")
+
+    # ✅ Update the file with the current boot time
+    try:
+        with open(CRASH_LOG_FILE, 'w') as f:
+            f.write(now.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception as e:
+        print(f"⚠️ Failed to write crash log: {e}")
 
 def auto_adjust_risk_percent():
     try:
@@ -234,11 +263,13 @@ def webhook():
         data = request.get_json()
         print(f"📥 Webhook received: {data}", flush=True)
 
-        if data is None:
-            print("❌ No JSON data received. Raw body:", flush=True)
-            print(request.data, flush=True)
-            return jsonify({"status": "error", "message": "No JSON data received"}), 400
+        # 🔐 Step 1: Validate the secret token
+        if not data or 'token' not in data or data['token'] != WEBHOOK_SECRET_TOKEN:
+            print("🚫 Unauthorized webhook attempt blocked.", flush=True)
+            send_telegram_alert("🚫 Unauthorized webhook attempt blocked.")
+            return jsonify({"status": "unauthorized"}), 403
 
+        # 🔄 Step 2: Extract and process trade data
         symbol = data.get("symbol")
         entry = float(data.get("entry"))
         stop_loss = float(data.get("stop_loss"))
@@ -248,7 +279,7 @@ def webhook():
         print(f"🔄 Calling submit_order_with_retries for {symbol}", flush=True)
 
         try:
-                success = submit_order_with_retries(
+            success = submit_order_with_retries(
                 symbol=symbol,
                 entry=entry,
                 stop_loss=stop_loss,
@@ -261,7 +292,6 @@ def webhook():
             return jsonify({"status": "error", "message": str(trade_error)}), 500
 
         print(f"✅ Trade result: {'Success' if success else 'Failed'}", flush=True)
-
         return jsonify({"status": "success" if success else "failed"}), 200
 
     except Exception as e:
@@ -789,6 +819,9 @@ if __name__ == '__main__':
         log_portfolio_snapshot()
         with open(SNAPSHOT_LOG_PATH, "w") as f:
             f.write(today)
+
+    handle_restart_notification()  # 🧠 Step 20 – Notify if bot restarted unexpectedly
+
     run_position_watchdog()
     log_equity_curve()
     app.run(host='0.0.0.0', port=5050)
