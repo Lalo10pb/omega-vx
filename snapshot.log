@@ -53,3 +53,8 @@ Traceback (most recent call last):
   File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/requests/adapters.py", line 700, in send
     raise ConnectionError(e, request=request)
 requests.exceptions.ConnectionError: HTTPSConnectionPool(host='paper-api.alpaca.markets', port=443): Max retries exceeded with url: /v2/account (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x104a08310>: Failed to establish a new connection: [Errno 8] nodename nor servname provided, or not known'))
+✅ Portfolio snapshot logged:
+🕒 Time: 2025-08-05 16:08:58
+💼 Equity: $99995.85
+💵 Cash: $99995.85
+📈 Portfolio Value: $99995.85

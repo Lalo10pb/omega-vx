@@ -24,6 +24,8 @@ from alpaca.data.timeframe import TimeFrame
 from datetime import datetime, timedelta
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 import functools
+import subprocess
+import sys
 print = functools.partial(print, flush=True)
 load_dotenv()
 
@@ -57,6 +59,26 @@ from datetime import datetime
 from datetime import datetime, time as dt_time
 
 data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+
+# 🔐 Path to your credentials JSON file
+GOOGLE_CREDENTIALS_FILE = "google_credentials.json"
+
+def get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist"):
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
+        client = gspread.authorize(creds)
+        
+        sheet = client.open(sheet_name).worksheet(tab_name)
+        symbols = sheet.col_values(1)  # Get column A
+        return [s.strip().upper() for s in symbols if s.strip()]
+    
+    except Exception as e:
+        print(f"❌ Failed to fetch watchlist: {e}")
+        return []
 
 def handle_restart_notification():
     now = datetime.now()
@@ -263,13 +285,13 @@ def webhook():
         data = request.get_json()
         print(f"📥 Webhook received: {data}", flush=True)
 
-        # 🔐 Step 1: Validate the secret token
-        if not data or 'token' not in data or data['token'] != WEBHOOK_SECRET_TOKEN:
+        # 🔐 Validate the secret from HEADER
+        if request.headers.get("X-OMEGA-SECRET") != WEBHOOK_SECRET_TOKEN:
             print("🚫 Unauthorized webhook attempt blocked.", flush=True)
             send_telegram_alert("🚫 Unauthorized webhook attempt blocked.")
             return jsonify({"status": "unauthorized"}), 403
 
-        # 🔄 Step 2: Extract and process trade data
+        # 🔄 Extract and process trade data
         symbol = data.get("symbol")
         entry = float(data.get("entry"))
         stop_loss = float(data.get("stop_loss"))
@@ -632,30 +654,54 @@ def send_weekly_summary():
         print(f"⚠️ Weekly summary failed: {e}")
         send_telegram_alert(f"⚠️ Weekly summary failed: {e}")
 
-def start_position_watchdog(interval_minutes=5, loss_threshold=-0.03):
-    def watchdog():
+def start_auto_sell_monitor():
+    def monitor():
         while True:
             try:
-                positions = trading_client.get_all_positions()  # ✅ alpaca-py method
+                positions = trading_client.get_all_positions()
+                for position in positions:
+                    symbol = position.symbol
+                    qty = float(position.qty)
+                    side = position.side
+                    entry_price = float(position.avg_entry_price)
+                    current_price = float(position.current_price)
+                    unrealized_pl = float(position.unrealized_pl)
+                    percent_change = float(position.unrealized_plpc) * 100
 
-                for pos in positions:
-                    unrealized_plpc = float(pos.unrealized_plpc)
-                    symbol = pos.symbol
+                    # Optional: Log each scan
+                    print(f"📊 {symbol}: Qty={qty} Entry=${entry_price:.2f} Now=${current_price:.2f} PnL={percent_change:.2f}%")
 
-                    if unrealized_plpc <= loss_threshold:
-                        msg = f"⚠️ {symbol} is down {unrealized_plpc * 100:.2f}% — check position!"
-                        print(msg)
-                        send_telegram_alert(msg)
+                    # Example exit conditions
+                    hit_trailing = percent_change <= -2.0  # trailing loss
+                    hit_take_profit = percent_change >= 5.0
+                    hit_stop_loss = percent_change <= -3.5
 
-                time.sleep(interval_minutes * 60)
+                    if hit_trailing or hit_take_profit or hit_stop_loss:
+                        reason = "❗"
+                        if hit_take_profit:
+                            reason += "Take Profit Hit"
+                        elif hit_trailing:
+                            reason += "Trailing Stop Hit"
+                        elif hit_stop_loss:
+                            reason += "Hard Stop Hit"
 
-            except Exception as e:
-                print("🚨 Position Watchdog Error:", e)
-                send_telegram_alert(f"🚨 Watchdog error: {e}")
-                time.sleep(60)
+                        print(f"💥 {symbol} closing position — {reason}")
 
-    thread = threading.Thread(target=watchdog, daemon=True)
-    thread.start()
+                        try:
+                            close_order = trading_client.close_position(symbol)
+                            print(f"✅ Position closed for {symbol}")
+                            send_telegram_alert(f"💥 {symbol} auto-closed: {reason}")
+                        except Exception as e:
+                            print(f"❌ Failed to close {symbol}: {e}")
+                            send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
+
+            except Exception as monitor_error:
+                print(f"❌ Position monitor error: {monitor_error}")
+
+            time.sleep(30)  # Scan every 30 seconds
+
+    t = threading.Thread(target=monitor, daemon=True)
+    t.start()
 
 def is_cooldown_active():
     if not os.path.exists(LAST_TRADE_FILE):
@@ -811,6 +857,18 @@ def run_position_watchdog():
 
     threading.Thread(target=check_positions, daemon=True).start()
 
+def handle_critical_error(e):
+    crash_message = f"🧨 OMEGA-VX crashed: {e}"
+    print(crash_message)
+    send_telegram_alert(crash_message)
+
+    with open(CRASH_LOG_FILE, 'a') as f:
+        f.write(f"{datetime.now()} - {e}\n")
+
+    print("♻️ Restarting OMEGA-VX...")
+    time.sleep(3)  # slight pause
+    subprocess.Popen([sys.executable] + sys.argv)
+    sys.exit(1)
 
 # ✅ Entry point
 if __name__ == '__main__':
@@ -824,4 +882,8 @@ if __name__ == '__main__':
 
     run_position_watchdog()
     log_equity_curve()
-    app.run(host='0.0.0.0', port=5050)
+try:
+    app.run(host="0.0.0.0", port=5050)
+except Exception as e:
+    handle_critical_error(e)
+    start_auto_sell_monitor()
