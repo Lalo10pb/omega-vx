@@ -6,10 +6,9 @@ from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
 
-
 # 🌐 Google Sheets access
 SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-CREDS_FILE = "google_credentials.json"  # Replace if you used a different filename
+CREDS_FILE = "google_credentials.json"
 
 # 📄 Sheet config
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
@@ -57,14 +56,16 @@ def scan_symbol(symbol):
             print(f"❌ Failed to send webhook: {e}")
     else:
         print(f"🚫 No signal for {symbol} (did not match mock condition)")
+
 def main():
     print(f"\n📆 Starting scan at {datetime.now()}")
     try:
         symbols = load_symbols()
-        print(f"📊 Loaded symbols: {symbols}")  # ← ADD THIS LINE
+        print(f"📊 Loaded symbols: {symbols}")
         for sym in symbols:
             scan_symbol(sym)
     except Exception as e:
         print(f"❌ Scanner failed: {e}")
+
 if __name__ == "__main__":
     main()
