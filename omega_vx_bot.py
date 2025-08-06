@@ -26,6 +26,12 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
 import functools
 import subprocess
 import sys
+import os
+
+# ✅ Required for Google Sheets
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # Already in your .env
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+CREDS_FILE = "google_credentials.json"  # Your service account JSON file
 print = functools.partial(print, flush=True)
 load_dotenv()
 
@@ -517,6 +523,20 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
         send_telegram_alert("❌ Trade aborted — calculated qty was 0.")
         return False
 
+    # ✅ START OF PATCH
+    account = trading_client.get_account()
+    buying_power = float(account.buying_power)
+
+    estimated_cost = entry * qty
+    if estimated_cost > buying_power:
+        qty = int(buying_power // entry)
+        print(f"⚠️ Adjusted qty due to buying power: {qty}")
+        if qty == 0:
+            print("❌ Not enough buying power for even 1 share.")
+            send_telegram_alert("❌ Trade aborted — not enough buying power.")
+            return False
+    # ✅ END OF PATCH
+
     print(f"📌 Quantity calculated: {qty}")
     print('🔍 Checking equity guard...')
 
@@ -552,7 +572,9 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
                     stop_price=stop_loss,
                     trail_percent=1.0 if use_trailing else None
                 ),
-                take_profit=TakeProfitRequest(limit_price=take_profit)
+                take_profit=TakeProfitRequest(
+                    limit_price=max(round(take_profit, 2), round(entry + 0.01, 2))
+                )
             )
 
             trading_client.submit_order(order_request)
@@ -586,8 +608,13 @@ def log_portfolio_snapshot():
     try:
         account = trading_client.get_account()
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        row = [timestamp, account.equity, account.cash, account.portfolio_value]
+        equity = float(account.equity)
+        cash = float(account.cash)
+        portfolio_value = float(account.portfolio_value)
 
+        row = [timestamp, equity, cash, portfolio_value]
+
+        # ✅ Log to local CSV file
         file_exists = os.path.exists(PORTFOLIO_LOG_PATH)
         with open(PORTFOLIO_LOG_PATH, mode='a', newline='') as file:
             writer = csv.writer(file)
@@ -595,23 +622,31 @@ def log_portfolio_snapshot():
                 writer.writerow(["timestamp", "equity", "cash", "portfolio_value"])
             writer.writerow(row)
 
-        print("✅ Daily snapshot logged:", row)
-        send_telegram_alert(f"📸 Snapshot logged: Equity ${account.equity}, Cash ${account.cash}")
+        print("✅ Daily snapshot logged (CSV):", row)
+        send_telegram_alert(f"📸 Snapshot logged: Equity ${equity:.2f}, Cash ${cash:.2f}")
+
+        # ✅ Also log to Google Sheet
+        try:
+            scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+            creds = ServiceAccountCredentials.from_json_keyfile_name('google_credentials.json', scope)
+            client = gspread.authorize(creds)
+
+            sheet_id = os.getenv("GOOGLE_SHEET_ID")
+            sheet_name = os.getenv("PORTFOLIO_SHEET_NAME", "Portfolio Log")  # Default fallback
+
+            if not sheet_id or not sheet_name:
+                raise ValueError("Missing GOOGLE_SHEET_ID or PORTFOLIO_SHEET_NAME environment variable.")
+
+            sheet = client.open_by_key(sheet_id).worksheet(sheet_name)
+            sheet.append_row(row)
+            print("✅ Snapshot logged to Google Sheet.")
+
+        except Exception as gs_error:
+            print("⚠️ Failed to log snapshot to Google Sheet:", gs_error)
 
     except Exception as e:
         print("⚠️ Failed to log portfolio snapshot:", e)
         send_telegram_alert(f"⚠️ Snapshot failed: {e}")
-
-# ✅ GPT Trade Explanation (Heikin Ashi disabled)
-def generate_trade_explanation(symbol, entry, stop_loss, take_profit, rsi=None, trend=None):
-    explanation = f"🧠 Trade rationale for {symbol}:\n"
-    explanation += f"• Entry at ${entry:.2f}, Stop Loss at ${stop_loss:.2f}, Take Profit at ${take_profit:.2f}\n"
-    if rsi is not None:
-        explanation += f"• RSI filter passed: {rsi:.2f}\n"
-    if trend is not None:
-        explanation += f"• Trend confirmed: {trend}\n"
-    explanation += "✅ All filters passed — trade executed confidently."
-    return explanation
 
 def send_weekly_summary():
     try:
@@ -780,7 +815,7 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
 
                 if "equity" in recent_df.columns:
                     prev_equity = float(recent_df.iloc[-1].get("equity", 0))
-                    account = trading_client.get_account()  # ✅ Updated
+                    account = trading_client.get_account()
                     current_equity = float(account.equity)
                     context_equity_change = "gain" if current_equity > prev_equity else "loss"
     except Exception as e:
@@ -789,7 +824,6 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
     # 🕰 Timestamp
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    # ✅ Save to cooldown file ONLY if status was executed
     if status == "executed":
         with open(LAST_TRADE_FILE, 'w') as f:
             f.write(timestamp_str)
@@ -815,6 +849,28 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
     else:
         df.to_csv(TRADE_LOG_PATH, mode='a', header=False, index=False)
 
+    # ✅ Google Sheet Logging
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name('google_credentials.json', scope)
+        client = gspread.authorize(creds)
+
+        sheet_id = os.getenv("GOOGLE_SHEET_ID")
+        sheet_name = os.getenv("SHEET_NAME")
+
+        if not sheet_id or not sheet_name:
+            raise ValueError("Missing GOOGLE_SHEET_ID or SHEET_NAME environment variable.")
+
+        sheet = client.open_by_key(sheet_id).worksheet(sheet_name)
+
+        sheet.append_row([
+            timestamp_str, symbol, qty, entry, stop_loss, take_profit,
+            status, explanation, context_time, context_recent_outcome, context_equity_change
+        ])
+        print("✅ Trade logged to Google Sheet.")
+
+    except Exception as e:
+        print("⚠️ Failed to log trade to Google Sheet:", e)
 def run_position_watchdog():
     def check_positions():
         while True:
