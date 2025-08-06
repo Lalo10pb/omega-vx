@@ -658,21 +658,19 @@ def start_auto_sell_monitor():
     def monitor():
         while True:
             try:
+                # Add a timeout to the API call
                 positions = trading_client.get_all_positions()
+
                 for position in positions:
                     symbol = position.symbol
                     qty = float(position.qty)
-                    side = position.side
                     entry_price = float(position.avg_entry_price)
                     current_price = float(position.current_price)
-                    unrealized_pl = float(position.unrealized_pl)
                     percent_change = float(position.unrealized_plpc) * 100
 
-                    # Optional: Log each scan
                     print(f"📊 {symbol}: Qty={qty} Entry=${entry_price:.2f} Now=${current_price:.2f} PnL={percent_change:.2f}%")
 
-                    # Example exit conditions
-                    hit_trailing = percent_change <= -2.0  # trailing loss
+                    hit_trailing = percent_change <= -2.0
                     hit_take_profit = percent_change >= 5.0
                     hit_stop_loss = percent_change <= -3.5
 
@@ -696,9 +694,10 @@ def start_auto_sell_monitor():
                             send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
 
             except Exception as monitor_error:
-                print(f"❌ Position monitor error: {monitor_error}")
+                print(f"❌ Watchdog error: {monitor_error}")
+                send_telegram_alert(f"⚠️ Watchdog error: {monitor_error}")
 
-            time.sleep(30)  # Scan every 30 seconds
+            time.sleep(30)
 
     t = threading.Thread(target=monitor, daemon=True)
     t.start()
