@@ -882,8 +882,9 @@ if __name__ == '__main__':
 
     run_position_watchdog()
     log_equity_curve()
+    start_auto_sell_monitor()
 try:
     app.run(host="0.0.0.0", port=5050)
 except Exception as e:
     handle_critical_error(e)
-    start_auto_sell_monitor()
+  
