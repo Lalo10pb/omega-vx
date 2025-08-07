@@ -1,76 +1,68 @@
+# === Flask and Webhook Handling ===
 from flask import Flask, request, jsonify
-import numpy as np
-import csv
+
+# === Core Packages ===
 import os
-from dotenv import load_dotenv 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
-import threading
+import csv
 import time
-import requests
-import pandas as pd
-from datetime import datetime
-import smtplib
-from email.message import EmailMessage
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from datetime import datetime, timedelta
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
-import functools
+import threading
 import subprocess
 import sys
-import os
+import functools
+from datetime import datetime, timedelta, time as dt_time
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
 
-# ✅ Required for Google Sheets
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # Already in your .env
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-CREDS_FILE = "google_credentials.json"  # Your service account JSON file
-print = functools.partial(print, flush=True)
-load_dotenv()
+# === Alpaca Trading and Data ===
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
+from alpaca.data.timeframe import TimeFrame
 
-# ✅ Define log directory
-LOG_DIR = os.path.expanduser("~/omega-vx/logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-CRASH_LOG_FILE = os.path.join(LOG_DIR, "last_boot.txt")
+# === Email Reporting ===
+import smtplib
+from email.message import EmailMessage
 
-
-DAILY_RISK_LIMIT = -10  # 💥 Stop trading after $10 loss
-LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
-
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN")
-
-LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
-TRADE_COOLDOWN_SECONDS = 300  # 5 minutes
-MAX_RISK_PER_TRADE_PERCENT = 1.0  # Risk 1% of total equity per trade
-MIN_TRADE_QTY = 1  # Never trade less than 1 share
-
-# ✅ Load environment variables
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("APCA_API_BASE_URL")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
-app = Flask(__name__)
-
-from datetime import datetime
-from datetime import datetime, time as dt_time
-
-data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
-
+# === Google Sheets ===
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# 🔐 Path to your credentials JSON file
+# === Load .env and Set Environment Vars ===
+load_dotenv()
+
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = os.getenv("APCA_API_BASE_URL")
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_FILE = "google_credentials.json"
+SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+
+# === Trading Configuration ===
+DAILY_RISK_LIMIT = -10  # 💥 Stop trading after $10 loss
+TRADE_COOLDOWN_SECONDS = 300  # ⏱️ 5 minutes cooldown
+MAX_RISK_PER_TRADE_PERCENT = 1.0
+MIN_TRADE_QTY = 1
+
+# === Logging ===
+print = functools.partial(print, flush=True)
+LOG_DIR = os.path.expanduser("~/omega-vx/logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+CRASH_LOG_FILE = os.path.join(LOG_DIR, "last_boot.txt")
+LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
+LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
+
+# === Alpaca Clients ===
+trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
+data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+
+# === Flask App ===
+app = Flask(__name__)
 
 def get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist"):
     try:
@@ -179,10 +171,10 @@ def get_bars(symbol, interval='15m', lookback=10):
         print(f"❌ Alpaca data fetch failed for {symbol}: {e}")
         return None
 
-def is_within_trading_hours(start_hour=14, end_hour=18, end_minute=30):
+def is_within_trading_hours(start_hour=13, start_minute=30, end_hour=20):
     now_utc = datetime.utcnow().time()
-    start = dt_time(hour=start_hour, minute=0)
-    end = dt_time(hour=end_hour, minute=end_minute)
+    start = dt_time(hour=start_hour, minute=start_minute)
+    end = dt_time(hour=end_hour, minute=0)
     return start <= now_utc <= end
 
 def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
