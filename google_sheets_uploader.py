@@ -1,21 +1,20 @@
 import gspread
 import pandas as pd
 from google.oauth2.service_account import Credentials
+import os
 
-# ✅ Define spreadsheet and worksheet names
-SPREADSHEET_NAME = "OMEGA-VX LOGS"
-TRADE_SHEET = "Trade Log"
-PORTFOLIO_SHEET = "Portfolio Log"
+# ✅ Load spreadsheet and worksheet names from environment
+SPREADSHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+TRADE_SHEET = os.getenv("TRADE_SHEET_NAME")
+PORTFOLIO_SHEET = os.getenv("PORTFOLIO_SHEET_NAME")
 
-# ✅ Path to your service account key
-SERVICE_ACCOUNT_FILE = 'omega-vx-service-account.json'
+# ✅ Path to secret file in Render
+SERVICE_ACCOUNT_FILE = "/etc/secrets/omega-vx-service-account.json"
 
 # ✅ Authenticate and connect to Google Sheets
-scope = ["https://www.googleapis.com/auth/spreadsheets",
-         "https://www.googleapis.com/auth/drive"]
+scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
 gc = gspread.authorize(creds)
-SPREADSHEET_ID = "1Mi41KWJO6oJxTSJUEfiVslPIM_DEsX39-77_2d5ugMw"
 sheet = gc.open_by_key(SPREADSHEET_ID)
 
 # ✅ Upload trade log
