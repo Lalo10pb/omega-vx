@@ -80,79 +80,6 @@ _CLOSE_COOLDOWN_SEC = 20  # consider 60–120 during market hours
 
 # === Dev flags ===
 FORCE_WEBHOOK_TEST = str(os.getenv("FORCE_WEBHOOK_TEST", "0")).strip().lower() in ("1", "true", "yes")
-def cancel_open_orders_for(symbol: str):
-    try:
-        req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-        open_orders = trading_client.get_orders(filter=req)
-        for o in open_orders:
-            if o.symbol == symbol:
-                try:
-                    trading_client.cancel_order_by_id(o.id)
-                except Exception as e:
-                    print(f"⚠️ cancel failed {symbol} {o.id}: {e}", flush=True)
-    except Exception as e:
-        print(f"⚠️ cancel list failed for {symbol}: {e}", flush=True)
-
-def safe_close_position(symbol: str, qty: int) -> bool:
-    try:
-        cancel_open_orders_for(symbol)
-        # tiny pause lets pending_cancel settle a bit
-        time.sleep(1.0)
-        market_order = MarketOrderRequest(
-            symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY
-        )
-        trading_client.submit_order(order_data=market_order)
-        return True
-    except Exception as e:
-        print(f"❌ safe_close_position failed {symbol}: {e}", flush=True)
-        return False
-
-def is_within_trading_hours(start_hour=14, end_hour=20, end_minute=0):
-    if FORCE_WEBHOOK_TEST:
-        return True
-    from datetime import datetime, time as dt_time
-    now_utc = datetime.utcnow().time()
-    start = dt_time(hour=start_hour, minute=0)
-    end = dt_time(hour=end_hour, minute=end_minute)
-    return start <= now_utc <= end
-
-from alpaca.trading.requests import GetOrdersRequest
-from alpaca.trading.enums import QueryOrderStatus
-
-# Cancel all open orders for one symbol
-def cancel_open_orders(symbol: str):
-    try:
-        req = GetOrdersRequest(
-            status=QueryOrderStatus.OPEN,
-            symbols=[symbol]
-        )
-        open_orders = trading_client.get_orders(filter=req)
-        for o in open_orders:
-            try:
-                trading_client.cancel_order_by_id(o.id)
-                print(f"🧹 Canceled open order {o.id} for {symbol}")
-            except Exception as ce:
-                print(f"⚠️ Failed to cancel order {o.id} for {symbol}: {ce}")
-    except Exception as e:
-        print(f"⚠️ Could not fetch/cancel open orders for {symbol}: {e}")
-
-# Safe close (cancel open orders, then one market sell)
-def safe_close_position(symbol: str, qty: int):
-    try:
-        cancel_open_orders(symbol)
-
-        market_order = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.GTC
-        )
-        trading_client.submit_order(order_data=market_order)
-        print(f"✅ Submitted market close for {symbol} x{qty}")
-        return True
-    except Exception as e:
-        print(f"❌ safe_close_position failed for {symbol}: {e}")
-        return False
 
 # 🧠 Generate AI-based trade explanation
 def generate_trade_explanation(symbol, entry, stop_loss, take_profit, rsi=None, trend=None, ha_candle=None):
@@ -186,20 +113,6 @@ def generate_trade_explanation(symbol, entry, stop_loss, take_profit, rsi=None, 
 
     return explanation
 
-
-def _get_available_qty(symbol: str) -> float:
-    """Return qty_available for an open position, or 0 if none."""
-    try:
-        positions = trading_client.get_all_positions()
-        for p in positions:
-            if p.symbol.upper() == symbol.upper():
-                # alpaca-py returns strings for qty fields
-                return float(getattr(p, "qty_available", getattr(p, "qty", "0")))
-        return 0.0
-    except Exception as e:
-        print(f"⚠️ Could not fetch positions: {e}")
-        return 0.0
-
 def send_telegram_alert(message: str):
     import requests  # keep local to guarantee availability
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -215,33 +128,6 @@ def send_telegram_alert(message: str):
             print(f"⚠️ Telegram send failed: {r.status_code} {r.text}")
     except Exception as e:
         print(f"❌ Telegram alert error: {e}")
-
-def close_position_if_needed(symbol: str, reason: str) -> bool:
-    """Safely close a position if qty is available. Returns True if we issued a close."""
-    # debounce: avoid spamming close orders for the same symbol
-    now = monotonic()
-    last = _last_close_attempt.get(symbol)
-    if last is not None and (now - last) < _CLOSE_COOLDOWN_SEC:
-        print(f"⏳ Skipping close for {symbol} (cooldown {int(_CLOSE_COOLDOWN_SEC - (now - last))}s).")
-        return False
-
-    qty_available = _get_available_qty(symbol)
-    if qty_available <= 0:
-        print(f"⚠️ No available qty for {symbol}, skipping close.")
-        return False
-
-    print(f"💥 {symbol} closing position — {reason} (qty_available={qty_available})")
-    try:
-        # One-line close uses market order for full remaining qty
-        trading_client.close_position(symbol)
-        _last_close_attempt[symbol] = now
-        print(f"✅ {symbol} position close submitted.")
-        return True
-    except Exception as e:
-        _last_close_attempt[symbol] = now
-        print(f"❌ Failed to close {symbol}: {e}")
-        return False
-
 
 def get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist"):
     try:
@@ -351,6 +237,8 @@ def get_bars(symbol, interval='15m', lookback=10):
         return None
 
 def is_within_trading_hours(start_hour=13, start_minute=30, end_hour=20):
+    if FORCE_WEBHOOK_TEST:
+        return True
     now_utc = datetime.utcnow().time()
     start = dt_time(hour=start_hour, minute=start_minute)
     end = dt_time(hour=end_hour, minute=0)
@@ -527,10 +415,12 @@ def webhook():
             success = submit_order_with_retries(
                 symbol=symbol,
                 entry=entry,
-                stop_loss=stop_loss,
+                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                use_trailing=use_trailing
+                use_trailing=use_trailing,
+                dry_run=dry_run
             )
+            
         except Exception as trade_error:
             msg = f"💥 submit_order_with_retries error: {trade_error}"
             print(msg, flush=True)
@@ -587,23 +477,6 @@ def calculate_trade_qty(entry_price, stop_loss_price):
     except Exception as e:
         print("⚠️ Error calculating trade quantity:", e)
         send_telegram_alert(f"⚠️ Risk-based quantity error: {e}")
-        return 0
-
-def get_current_vix():
-    try:
-        client = StockHistoricalDataClient(API_KEY, API_SECRET)
-        request = StockLatestQuoteRequest(symbol_or_symbols=["VIXY"])  # fallback ETF if ^VIX is not supported
-        response = client.get_stock_latest_quote(request)
-        quote = response["VIXY"]
-
-        vix_price = quote.ask_price or quote.bid_price
-        if vix_price:
-            return float(vix_price)
-        else:
-            print("⚠️ No VIXY quote data available.")
-            return 0
-    except Exception as e:
-        print(f"❌ Failed to get VIXY data: {e}")
         return 0
 
 def get_current_vix():
@@ -681,13 +554,6 @@ def send_email(subject, body):
         print(f"❌ Email send failed: {e}")  
         send_telegram_alert(f"❌ Email failure: {e}")
 
-def send_telegram_alert(message):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        requests.post(url, data=data)
-    except Exception as e:
-        print("Failed to send Telegram alert:", e)
 
 def get_equity_slope():
     try:
@@ -744,9 +610,7 @@ def get_rsi_value(symbol, interval='15m', period=14):
         print(f"❌ Failed to calculate RSI for {symbol}: {e}")
         return None
 
-def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3):
-    print(f"[TEST MODE] Would place order for {symbol} at {entry}")
-    return True  # Simulate success without calling Alpaca
+def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3, dry_run=False):
     print("📌 About to calculate quantity...")
     qty = calculate_trade_qty(entry, stop_loss)
     if qty == 0:
@@ -754,10 +618,18 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
         send_telegram_alert("❌ Trade aborted — calculated qty was 0.")
         return False
 
-    # ✅ START OF PATCH
+    # ✅ DRY-RUN SHORT-CIRCUIT (no real orders sent)
+    if dry_run:
+        print(f"🧪 [DRY-RUN] Would place order for {symbol} | qty={qty} | entry={entry} | SL={stop_loss} | TP={take_profit} | trailing={use_trailing}")
+        try:
+            send_telegram_alert(f"🧪 [DRY-RUN] {symbol} qty={qty} @ {entry} (SL {stop_loss} / TP {take_profit}, trailing={use_trailing})")
+        except Exception:
+            pass
+        return False  # signal "no order placed" to the caller
+
+    # ✅ START OF PATCH (buying power guard)
     account = trading_client.get_account()
     buying_power = float(account.buying_power)
-
     estimated_cost = entry * qty
     if estimated_cost > buying_power:
         qty = int(buying_power // entry)
@@ -834,7 +706,6 @@ def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailin
     print(f"❌ Order failed for {symbol} after {max_retries} attempts")
     send_telegram_alert(f"❌ Order failed for {symbol} after {max_retries} attempts")
     return False
-
 def log_portfolio_snapshot():
     try:
         account = trading_client.get_account()

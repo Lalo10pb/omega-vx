@@ -2,3 +2,9 @@ google_credentials.json
 omega-vx-service-account.json
 .DS_Store
 *.zip
+.env
+google_credentials.json
+logs/
+__pycache__/
+*.log
+.venv/

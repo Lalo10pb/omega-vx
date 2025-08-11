@@ -23,12 +23,13 @@ from alpaca.data.requests import StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
 
 # 🌐 Google Sheets access
-SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+SCOPE = ["https://www.googleapis.com/auth/spreadsheets",
+         "https://www.googleapis.com/auth/drive"]
 CREDS_FILE = "google_credentials.json"
 
 # 📄 Sheet config
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-SHEET_NAME = os.getenv("SHEET_NAME")
+SHEET_NAME = os.getenv("WATCHLIST_SHEET_NAME", "watchlist").strip()
 
 # 🌐 Webhook to send alerts to OMEGA
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
