@@ -6,6 +6,7 @@ import os
 import csv
 import time
 import threading
+import requests
 import subprocess
 import sys
 import functools
@@ -16,8 +17,13 @@ from dotenv import load_dotenv
 
 # === Alpaca Trading and Data ===
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
+from alpaca.trading.requests import (
+    MarketOrderRequest,
+    StopLossRequest,
+    TakeProfitRequest,
+    GetOrdersRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
@@ -31,8 +37,11 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
 # === Load .env and Set Environment Vars ===
-load_dotenv()
-
+from pathlib import Path
+ENV_PATH = Path(__file__).parent / ".env"
+if not load_dotenv(ENV_PATH):
+    print(f"⚠️ Could not load .env at {ENV_PATH} — using environment vars only.", flush=True)
+    
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = os.getenv("APCA_API_BASE_URL")
@@ -63,6 +72,176 @@ data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
 
 # === Flask App ===
 app = Flask(__name__)
+
+# === Watchdog cooldown ===
+from time import monotonic
+_last_close_attempt = {}
+_CLOSE_COOLDOWN_SEC = 20  # consider 60–120 during market hours
+
+# === Dev flags ===
+FORCE_WEBHOOK_TEST = str(os.getenv("FORCE_WEBHOOK_TEST", "0")).strip().lower() in ("1", "true", "yes")
+def cancel_open_orders_for(symbol: str):
+    try:
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        open_orders = trading_client.get_orders(filter=req)
+        for o in open_orders:
+            if o.symbol == symbol:
+                try:
+                    trading_client.cancel_order_by_id(o.id)
+                except Exception as e:
+                    print(f"⚠️ cancel failed {symbol} {o.id}: {e}", flush=True)
+    except Exception as e:
+        print(f"⚠️ cancel list failed for {symbol}: {e}", flush=True)
+
+def safe_close_position(symbol: str, qty: int) -> bool:
+    try:
+        cancel_open_orders_for(symbol)
+        # tiny pause lets pending_cancel settle a bit
+        time.sleep(1.0)
+        market_order = MarketOrderRequest(
+            symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY
+        )
+        trading_client.submit_order(order_data=market_order)
+        return True
+    except Exception as e:
+        print(f"❌ safe_close_position failed {symbol}: {e}", flush=True)
+        return False
+
+def is_within_trading_hours(start_hour=14, end_hour=20, end_minute=0):
+    if FORCE_WEBHOOK_TEST:
+        return True
+    from datetime import datetime, time as dt_time
+    now_utc = datetime.utcnow().time()
+    start = dt_time(hour=start_hour, minute=0)
+    end = dt_time(hour=end_hour, minute=end_minute)
+    return start <= now_utc <= end
+
+from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.enums import QueryOrderStatus
+
+# Cancel all open orders for one symbol
+def cancel_open_orders(symbol: str):
+    try:
+        req = GetOrdersRequest(
+            status=QueryOrderStatus.OPEN,
+            symbols=[symbol]
+        )
+        open_orders = trading_client.get_orders(filter=req)
+        for o in open_orders:
+            try:
+                trading_client.cancel_order_by_id(o.id)
+                print(f"🧹 Canceled open order {o.id} for {symbol}")
+            except Exception as ce:
+                print(f"⚠️ Failed to cancel order {o.id} for {symbol}: {ce}")
+    except Exception as e:
+        print(f"⚠️ Could not fetch/cancel open orders for {symbol}: {e}")
+
+# Safe close (cancel open orders, then one market sell)
+def safe_close_position(symbol: str, qty: int):
+    try:
+        cancel_open_orders(symbol)
+
+        market_order = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC
+        )
+        trading_client.submit_order(order_data=market_order)
+        print(f"✅ Submitted market close for {symbol} x{qty}")
+        return True
+    except Exception as e:
+        print(f"❌ safe_close_position failed for {symbol}: {e}")
+        return False
+
+# 🧠 Generate AI-based trade explanation
+def generate_trade_explanation(symbol, entry, stop_loss, take_profit, rsi=None, trend=None, ha_candle=None):
+    """
+    Generate a human-readable explanation for why the trade was taken.
+    """
+
+    reasons = []
+
+    if rsi is not None:
+        if rsi < 30:
+            reasons.append(f"RSI is oversold ({rsi}), suggesting a potential upward reversal.")
+        elif rsi > 70:
+            reasons.append(f"RSI is overbought ({rsi}), suggesting a potential downward reversal.")
+
+    if trend is not None:
+        if trend == "uptrend":
+            reasons.append("EMA trend filter indicates a bullish market.")
+        elif trend == "downtrend":
+            reasons.append("EMA trend filter indicates a bearish market.")
+
+    if ha_candle is not None:
+        if ha_candle == "bullish":
+            reasons.append("Heikin Ashi candle shows bullish momentum.")
+        elif ha_candle == "bearish":
+            reasons.append("Heikin Ashi candle shows bearish momentum.")
+
+    explanation = f"Trade setup for {symbol} at {entry}, Stop Loss={stop_loss}, Take Profit={take_profit}."
+    if reasons:
+        explanation += " Reasons: " + " ".join(reasons)
+
+    return explanation
+
+
+def _get_available_qty(symbol: str) -> float:
+    """Return qty_available for an open position, or 0 if none."""
+    try:
+        positions = trading_client.get_all_positions()
+        for p in positions:
+            if p.symbol.upper() == symbol.upper():
+                # alpaca-py returns strings for qty fields
+                return float(getattr(p, "qty_available", getattr(p, "qty", "0")))
+        return 0.0
+    except Exception as e:
+        print(f"⚠️ Could not fetch positions: {e}")
+        return 0.0
+
+def send_telegram_alert(message: str):
+    import requests  # keep local to guarantee availability
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram not configured (missing token/chat id).")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            print(f"⚠️ Telegram send failed: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"❌ Telegram alert error: {e}")
+
+def close_position_if_needed(symbol: str, reason: str) -> bool:
+    """Safely close a position if qty is available. Returns True if we issued a close."""
+    # debounce: avoid spamming close orders for the same symbol
+    now = monotonic()
+    last = _last_close_attempt.get(symbol)
+    if last is not None and (now - last) < _CLOSE_COOLDOWN_SEC:
+        print(f"⏳ Skipping close for {symbol} (cooldown {int(_CLOSE_COOLDOWN_SEC - (now - last))}s).")
+        return False
+
+    qty_available = _get_available_qty(symbol)
+    if qty_available <= 0:
+        print(f"⚠️ No available qty for {symbol}, skipping close.")
+        return False
+
+    print(f"💥 {symbol} closing position — {reason} (qty_available={qty_available})")
+    try:
+        # One-line close uses market order for full remaining qty
+        trading_client.close_position(symbol)
+        _last_close_attempt[symbol] = now
+        print(f"✅ {symbol} position close submitted.")
+        return True
+    except Exception as e:
+        _last_close_attempt[symbol] = now
+        print(f"❌ Failed to close {symbol}: {e}")
+        return False
+
 
 def get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist"):
     try:
@@ -280,22 +459,68 @@ def calculate_position_size(entry_price, stop_loss):
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         print(f"📥 Webhook received: {data}", flush=True)
 
         # 🔐 Validate the secret from HEADER
-        if request.headers.get("X-OMEGA-SECRET") != WEBHOOK_SECRET_TOKEN:
+        header_secret = request.headers.get("X-OMEGA-SECRET")
+        env_secret = os.getenv("WEBHOOK_SECRET_TOKEN")  # be explicit
+        if header_secret != env_secret:
             print("🚫 Unauthorized webhook attempt blocked.", flush=True)
-            send_telegram_alert("🚫 Unauthorized webhook attempt blocked.")
-            return jsonify({"status": "unauthorized"}), 403
+            try:
+                send_telegram_alert("🚫 Unauthorized webhook attempt blocked.")
+            except Exception:
+                pass
+            return jsonify({"status": "failed", "reason": "auth"}), 200
 
-        # 🔄 Extract and process trade data
-        symbol = data.get("symbol")
-        entry = float(data.get("entry"))
-        stop_loss = float(data.get("stop_loss"))
-        take_profit = float(data.get("take_profit"))
-        use_trailing = bool(data.get("use_trailing", False))
+        # 🔎 Basic validation
+        required = ("symbol", "entry", "stop_loss", "take_profit")
+        missing = [k for k in required if k not in data]
+        if missing:
+            return jsonify({"status": "failed", "reason": f"missing_fields:{','.join(missing)}"}), 200
 
+        symbol = str(data.get("symbol", "")).upper().strip()
+
+        # 🧮 Safe numeric parsing
+        try:
+            entry = float(data.get("entry"))
+            stop_loss = float(data.get("stop_loss"))
+            take_profit = float(data.get("take_profit"))
+        except Exception as conv_err:
+            return jsonify({"status": "failed", "reason": f"bad_numbers:{conv_err}"}), 200
+
+        # ✅ Proper boolean handling (strings "true"/"false" etc.)
+        ut_raw = data.get("use_trailing", False)
+        if isinstance(ut_raw, str):
+            use_trailing = ut_raw.strip().lower() in ("1", "true", "yes", "y", "on")
+        else:
+            use_trailing = bool(ut_raw)
+        # --- optional dry-run guard (header, query, or default from env) ---
+        def _as_bool(x):
+            return str(x).strip().lower() in ("1", "true", "yes", "y", "on")
+
+        dry_run = (
+            _as_bool(request.headers.get("X-OMEGA-DRYRUN", "0"))
+            or _as_bool(request.args.get("dryrun", "0"))
+            or _as_bool(os.getenv("OMEGA_WEBHOOK_DRYRUN", "0"))
+        )
+
+        if dry_run:
+            msg = (
+                f"🧪 Webhook DRY-RUN for {symbol} "
+                f"(entry {entry}, sl {stop_loss}, tp {take_profit}, trailing {use_trailing})"
+            )
+            print(msg, flush=True)
+            try:
+                send_telegram_alert(msg)
+            except Exception:
+                pass
+            return jsonify({
+                "status": "ok",
+                "trade_placed": False,
+                "reason": "dry_run"
+            }), 200
+        # --- end dry-run guard ---
         print(f"🔄 Calling submit_order_with_retries for {symbol}", flush=True)
 
         try:
@@ -307,16 +532,28 @@ def webhook():
                 use_trailing=use_trailing
             )
         except Exception as trade_error:
-            print(f"💥 Exception during submit_order_with_retries: {trade_error}", flush=True)
-            send_telegram_alert(f"💥 submit_order_with_retries error: {trade_error}")
-            return jsonify({"status": "error", "message": str(trade_error)}), 500
+            msg = f"💥 submit_order_with_retries error: {trade_error}"
+            print(msg, flush=True)
+            try:
+                send_telegram_alert(msg)
+            except Exception:
+                pass
+            return jsonify({"status": "failed", "reason": "exception", "detail": str(trade_error)}), 200
 
-        print(f"✅ Trade result: {'Success' if success else 'Failed'}", flush=True)
-        return jsonify({"status": "success" if success else "failed"}), 200
+        placed = bool(success)
+        print(f"✅ Webhook processed (trade_placed={placed})", flush=True)
+        resp = {
+            "status": "ok",                      # webhook processed fine
+            "trade_placed": placed               # whether an order actually went in
+        }
+        if not placed:
+           resp["reason"] = "submit_returned_false"  # e.g., qty=0 / buying power / weekend
+
+        return jsonify(resp), 200
 
     except Exception as e:
         print(f"❌ Exception in webhook: {e}", flush=True)
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "failed", "reason": "handler_exception", "detail": str(e)}), 200
 
 @app.route("/ping", methods=["GET"])
 def ping():
@@ -508,6 +745,8 @@ def get_rsi_value(symbol, interval='15m', period=14):
         return None
 
 def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3):
+    print(f"[TEST MODE] Would place order for {symbol} at {entry}")
+    return True  # Simulate success without calling Alpaca
     print("📌 About to calculate quantity...")
     qty = calculate_trade_qty(entry, stop_loss)
     if qty == 0:
@@ -863,46 +1102,131 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
 
     except Exception as e:
         print("⚠️ Failed to log trade to Google Sheet:", e)
+
+from time import monotonic
+
+_last_close_attempt = {}
+_CLOSE_COOLDOWN_SEC = 20  # seconds between close attempts per symbol
+
+def _get_available_qty(symbol: str) -> float:
+    """Return qty_available for an open position, or 0 if none."""
+    try:
+        positions = trading_client.get_all_positions()
+        for p in positions:
+            if p.symbol.upper() == symbol.upper():
+                return float(getattr(p, "qty_available", getattr(p, "qty", "0")))
+        return 0.0
+    except Exception as e:
+        print(f"⚠️ Could not fetch positions: {e}")
+        return 0.0
+
+def close_position_if_needed(symbol: str, reason: str) -> bool:
+    """Safely close a position if qty is available. Returns True if order was submitted."""
+    now = monotonic()
+    last = _last_close_attempt.get(symbol)
+    if last is not None and (now - last) < _CLOSE_COOLDOWN_SEC:
+        print(f"⏳ Skipping close for {symbol} (cooldown {int(_CLOSE_COOLDOWN_SEC - (now - last))}s).")
+        return False
+
+    qty_available = _get_available_qty(symbol)
+    if qty_available <= 0:
+        print(f"⚠️ No available qty for {symbol}, skipping close.")
+        return False
+
+    print(f"💥 {symbol} closing position — {reason} (qty_available={qty_available})")
+    try:
+        market_order = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty_available,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC
+        )
+        trading_client.submit_order(order_data=market_order)
+        _last_close_attempt[symbol] = now
+        send_telegram_alert(f"✅ {symbol} closed at market. Reason: {reason}")
+        print(f"✅ {symbol} position close submitted.")
+        return True
+    except Exception as e:
+        _last_close_attempt[symbol] = now
+        print(f"❌ Failed to close {symbol}: {e}")
+        send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
+        return False
+
 def run_position_watchdog():
     def check_positions():
         while True:
             try:
                 positions = trading_client.get_all_positions()
-                for position in positions:
-                    symbol = position.symbol
-                    qty = int(float(position.qty))
-                    entry_price = float(position.avg_entry_price)
-                    current_price = float(position.current_price)
-                    unrealized_plpc = float(position.unrealized_plpc)
-
+                for p in positions:
+                    symbol = p.symbol
+                    qty = int(float(p.qty))
+                    entry_price = float(p.avg_entry_price)
+                    current_price = float(p.current_price)
+                    unrealized_plpc = float(p.unrealized_plpc)  # decimal (e.g., 0.0123)
                     percent_change = unrealized_plpc * 100
+
                     print(f"🐶 [{symbol}] Checking: {percent_change:.2f}% P/L")
 
+                    # ---- cooldown guard (per symbol) ----
+                    now_t = monotonic()
+                    last_t = _last_close_attempt.get(symbol, 0.0)
+                    if now_t - last_t < _CLOSE_COOLDOWN_SEC:
+                        # Skip this symbol this cycle to avoid rapid re-submits
+                        continue
+
+                    # ---- auto-exit rule ----
                     if percent_change <= -3.0:
+                        _last_close_attempt[symbol] = now_t
+
                         msg = f"🔻 Auto-exit triggered for {symbol}: unrealized P/L = {percent_change:.2f}%"
                         print(msg)
-                        send_telegram_alert(msg)
+                        try:
+                            send_telegram_alert(msg)
+                        except Exception as e:
+                            print(f"⚠️ Telegram send failed: {e}")
 
-                        # ✅ Correct way to submit market order with alpaca-py
-                        market_order = MarketOrderRequest(
-                            symbol=symbol,
-                            qty=qty,
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.GTC
-                        )
-                        trading_client.submit_order(order_data=market_order)
+                        ok = safe_close_position(symbol, qty)
+                        try:
+                            if ok:
+                                send_telegram_alert(f"✅ {symbol} close submitted at market.")
+                            else:
+                                send_telegram_alert(f"⚠️ {symbol} close failed; will retry after cooldown.")
+                        except Exception as e:
+                            print(f"⚠️ Telegram send failed: {e}")
 
-                        send_telegram_alert(f"✅ {symbol} closed at market due to -3% drop.")
-                        print(f"✅ {symbol} closed at market.")
-
-                time.sleep(60)
+                time.sleep(60)  # poll interval
 
             except Exception as e:
                 print(f"⚠️ Watchdog error: {e}")
-                send_telegram_alert(f"⚠️ Watchdog error: {e}")
+                try:
+                    send_telegram_alert(f"⚠️ Watchdog error: {e}")
+                except Exception as _:
+                    pass
                 time.sleep(60)
 
     threading.Thread(target=check_positions, daemon=True).start()
+
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
+def place_market_buy(symbol, qty):
+    if DRY_RUN:
+        print(f"🧪 DRY-RUN buy {symbol} x{qty} (no order sent)")
+        return {"id": "dryrun", "symbol": symbol, "qty": qty}
+    order = MarketOrderRequest(
+        symbol=symbol, qty=qty,
+        side=OrderSide.BUY, time_in_force=TimeInForce.GTC
+    )
+    return trading_client.submit_order(order_data=order)
+
+def place_market_sell(symbol, qty):
+    if DRY_RUN:
+        print(f"🧪 DRY-RUN sell {symbol} x{qty} (no order sent)")
+        return {"id": "dryrun", "symbol": symbol, "qty": qty}
+    order = MarketOrderRequest(
+        symbol=symbol, qty=qty,
+        side=OrderSide.SELL, time_in_force=TimeInForce.GTC
+    )
+    return trading_client.submit_order(order_data=order)
 
 def handle_critical_error(e):
     crash_message = f"🧨 OMEGA-VX crashed: {e}"
