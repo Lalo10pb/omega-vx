@@ -16,18 +16,17 @@ import pandas as pd
 from dotenv import load_dotenv
 
 # === Alpaca Trading and Data ===
-from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
-    StopLossRequest,
-    TakeProfitRequest,
     GetOrdersRequest,
+    LimitOrderRequest,   
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
-
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import LimitOrderRequest, StopOrderRequest
 # === Email Reporting ===
 import smtplib
 from email.message import EmailMessage
@@ -610,102 +609,145 @@ def get_rsi_value(symbol, interval='15m', period=14):
         print(f"❌ Failed to calculate RSI for {symbol}: {e}")
         return None
 
-def submit_order_with_retries(symbol, entry, stop_loss, take_profit, use_trailing, max_retries=3, dry_run=False):
+def submit_order_with_retries(
+    symbol, entry, stop_loss, take_profit, use_trailing,
+    max_retries=3, dry_run=False
+):
+    """
+    New flow:
+      1) Risk-based qty calc + buying power guard (live ask price + buffer)
+      2) Plain market BUY (no bracket)
+      3) Attach split reduce_only TP/SL with retries if qty_available=0
+    """
     print("📌 About to calculate quantity...")
     qty = calculate_trade_qty(entry, stop_loss)
     if qty == 0:
         print("❌ Qty is 0 — skipping order.")
-        send_telegram_alert("❌ Trade aborted — calculated qty was 0.")
-        return False
-
-    # ✅ DRY-RUN SHORT-CIRCUIT (no real orders sent)
-    if dry_run:
-        print(f"🧪 [DRY-RUN] Would place order for {symbol} | qty={qty} | entry={entry} | SL={stop_loss} | TP={take_profit} | trailing={use_trailing}")
         try:
-            send_telegram_alert(f"🧪 [DRY-RUN] {symbol} qty={qty} @ {entry} (SL {stop_loss} / TP {take_profit}, trailing={use_trailing})")
+            send_telegram_alert("❌ Trade aborted — calculated qty was 0.")
         except Exception:
             pass
-        return False  # signal "no order placed" to the caller
+        return False
 
-    # ✅ START OF PATCH (buying power guard)
-    account = trading_client.get_account()
-    buying_power = float(account.buying_power)
-    estimated_cost = entry * qty
-    if estimated_cost > buying_power:
-        qty = int(buying_power // entry)
-        print(f"⚠️ Adjusted qty due to buying power: {qty}")
-        if qty == 0:
-            print("❌ Not enough buying power for even 1 share.")
+    # DRY-RUN
+    if dry_run:
+        msg = (f"🧪 [DRY-RUN] Would BUY {symbol} qty={qty} @ {entry} "
+               f"(SL {stop_loss} / TP {take_profit}, trailing={use_trailing})")
+        print(msg)
+        try:
+            send_telegram_alert(msg)
+        except Exception:
+            pass
+        return False
+
+    # --- Buying power guard with live ask price ---
+    from alpaca.data.requests import StockLatestQuoteRequest
+    live_price = entry
+    try:
+        q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
+        live_price = float(q[symbol].ask_price or q[symbol].bid_price or entry)
+    except Exception as e:
+        print(f"⚠️ Could not fetch live quote for {symbol}: {e} — using entry={entry}")
+
+    try:
+        buying_power = float(trading_client.get_account().buying_power)
+    except Exception as e:
+        print(f"⚠️ Could not fetch buying power: {e}")
+        buying_power = float("inf")
+
+    SAFETY = 0.98  # 2% buffer to avoid edge rejections
+    if live_price <= 0:
+        live_price = max(entry, 0.01)
+
+    max_qty_by_bp = int((buying_power * SAFETY) // live_price)
+
+    if max_qty_by_bp <= 0:
+        print(f"❌ Not enough buying power for even 1 share at ~${live_price:.2f}.")
+        try:
             send_telegram_alert("❌ Trade aborted — not enough buying power.")
-            return False
-    # ✅ END OF PATCH
+        except Exception:
+            pass
+        return False
+
+    if qty > max_qty_by_bp:
+        print(f"⚠️ Reducing qty by BP cap: {qty} → {max_qty_by_bp} "
+              f"(BP ${buying_power:.2f}, live ~${live_price:.2f})")
+        qty = max_qty_by_bp
+
+    # Final shave if extremely close to BP limit
+    if qty * live_price > buying_power * SAFETY:
+        qty = max(1, int((buying_power * SAFETY) // live_price))
+        print(f"🛡️ Safety shave → qty={qty}")
 
     print(f"📌 Quantity calculated: {qty}")
-    print('🔍 Checking equity guard...')
-
+    print("🔍 Checking equity guard...")
     if should_block_trading_due_to_equity():
-        print('🛑 BLOCKED: Equity drop filter triggered.')
-        msg = "🛑 Webhook blocked: Equity protection triggered."
-        print(msg)
-        send_telegram_alert(msg)
+        print("🛑 BLOCKED: Equity drop filter triggered.")
+        try:
+            send_telegram_alert("🛑 Webhook blocked: Equity protection triggered.")
+        except Exception:
+            pass
         return False
-    else:
-        print("✅ Equity check passed — trading allowed.")
-
-    print("⚙️ Starting trade submission process for:", symbol)
+    print("✅ Equity check passed.")
 
     if not is_within_trading_hours():
-        print('🕑 Reason: Outside trading hours')
-        send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
-        return False
-    else:
-        print("✅ Within allowed trading hours.")
-
-    for attempt in range(1, max_retries + 1):
+        print("🕑 Outside trading hours.")
         try:
-            print(f"🚀 Attempting order for {symbol} (try {attempt})")
+            send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
+        except Exception:
+            pass
+        return False
+    print("✅ Within trading hours.")
 
-            order_request = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.GTC,
-                order_class='bracket',
-                stop_loss=StopLossRequest(
-                    stop_price=stop_loss,
-                    trail_percent=1.0 if use_trailing else None
-                ),
-                take_profit=TakeProfitRequest(
-                    limit_price=max(round(take_profit, 2), round(entry + 0.01, 2))
-                )
-            )
+    # ---- BUY leg (no bracket) ----
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    try:
+        print(f"🚀 Submitting BUY {symbol} x{qty} (market, GTC)")
+        trading_client.submit_order(MarketOrderRequest(
+            symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC
+        ))
+    except Exception as e:
+        print("🧨 BUY submit failed:", e)
+        try:
+            send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
+        except Exception:
+            pass
+        return False
 
-            trading_client.submit_order(order_request)
-            print(f"✅ Order placed for {symbol} (attempt {attempt})")
+    # ---- Attach split protection ----
+    for attempt in range(1, 7):  # up to ~60s total
+        print(f"🔐 Attach protection attempt {attempt}/6 …")
+        if place_split_protection(symbol, tp_price=take_profit, sl_price=stop_loss):
+            break
+        print("⏳ qty_available not free yet; retrying …")
+        time.sleep(10)
+    else:
+        print("⚠️ Could not attach protection after retries.")
+        try:
+            send_telegram_alert(f"⚠️ {symbol} BUY placed, but protection not attached (watchdog will still run).")
+        except Exception:
+            pass
+        return True  # BUY succeeded, protection pending
 
-            explanation = generate_trade_explanation(
-                symbol=symbol,
-                entry=entry,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                rsi=None,
-                trend="uptrend" if use_trailing else "neutral"
-            )
+    # ---- Notify + log ----
+    explanation = generate_trade_explanation(
+        symbol=symbol, entry=entry, stop_loss=stop_loss,
+        take_profit=take_profit, rsi=None,
+        trend="uptrend" if use_trailing else "neutral"
+    )
+    try:
+        send_telegram_alert(f"🚀 Trade executed:\n{explanation}")
+    except Exception:
+        pass
 
-            send_telegram_alert(f"🚀 Trade executed:\n{explanation}")
-            log_equity_curve()
-            return True
+    try:
+        log_equity_curve()
+    except Exception:
+        pass
 
-        except Exception as e:
-            print("🚨 ERROR while submitting the order to Alpaca API")
-            print(f"📉 Symbol: {symbol}")
-            print(f"📊 Entry: {entry}, Stop Loss: {stop_loss}, Take Profit: {take_profit}")
-            print(f"🔁 Retry attempt: {attempt}")
-            print(f"🧨 Error message: {str(e)}")
+    print(f"✅ Order + protection finished for {symbol}.")
+    return True
 
-    print(f"❌ Order failed for {symbol} after {max_retries} attempts")
-    send_telegram_alert(f"❌ Order failed for {symbol} after {max_retries} attempts")
-    return False
 def log_portfolio_snapshot():
     try:
         account = trading_client.get_account()
@@ -1022,6 +1064,117 @@ def close_position_if_needed(symbol: str, reason: str) -> bool:
         print(f"❌ Failed to close {symbol}: {e}")
         send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
         return False
+
+def place_split_protection(
+    symbol: str,
+    tp_price: float = None,
+    sl_price: float = None,
+    tp_pct: float = 0.03,
+    sl_pct: float = 0.02
+) -> bool:
+    """
+    Cancel all SELL orders on symbol, then attach reduce_only protection by splitting
+    qty_available into half TP (limit) and half SL (stop).
+    You can pass absolute prices (tp_price/sl_price) or let it compute from last price using tp_pct/sl_pct.
+    Returns True if at least one protection order was submitted.
+    """
+    from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest, StopOrderRequest
+    from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce
+
+    # 1) Cancel existing SELLs to avoid 'held_for_orders'
+    try:
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        for o in trading_client.get_orders(filter=req):
+            if str(o.side).lower().endswith("sell"):
+                try:
+                    trading_client.cancel_order_by_id(o.id)
+                except Exception as ce:
+                    print(f"⚠️ cancel failed {symbol} {o.id}: {ce}")
+    except Exception as e:
+        print(f"⚠️ list/cancel failed for {symbol}: {e}")
+
+    time.sleep(0.8)  # brief settle
+
+    # 2) Get qty_available + last price
+    qty_available, last_price = 0, None
+    try:
+        for p in trading_client.get_all_positions():
+            if p.symbol.upper() == symbol.upper():
+                qty_available = int(float(getattr(p, "qty_available", p.qty)))
+                last_price = float(p.current_price)
+                break
+    except Exception as e:
+        print(f"⚠️ positions fetch failed: {e}")
+        return False
+
+    if qty_available <= 0 or last_price is None:
+        print(f"⚠️ No qty_available for {symbol}; skipping protection.")
+        return False
+
+    # 3) Decide prices: prefer explicit absolute prices, else compute from last
+    if tp_price is None:
+        tp_price = round(last_price * (1 + tp_pct), 2)
+    if sl_price is None:
+        sl_price = round(last_price * (1 - sl_pct), 2)
+
+    # Split the shares (ensure integers and q_tp + q_sl == qty_available)
+    q_tp = qty_available // 2
+    q_sl = qty_available - q_tp
+    if q_tp == 0 and qty_available > 0:
+        q_tp, q_sl = qty_available, 0
+    if q_sl == 0 and qty_available > 1:
+        q_tp, q_sl = qty_available - 1, 1
+
+    print(f"🎯 {symbol} protection → TP {tp_price} × {q_tp} | SL {sl_price} × {q_sl}")
+
+    submitted_any = False
+
+    # 4) Submit TP (limit)
+    if q_tp > 0:
+        try:
+            trading_client.submit_order(LimitOrderRequest(
+                symbol=symbol, qty=q_tp, side=OrderSide.SELL,
+                limit_price=tp_price, time_in_force=TimeInForce.GTC, reduce_only=True
+            ))
+            submitted_any = True
+        except TypeError:
+            trading_client.submit_order(LimitOrderRequest(
+                symbol=symbol, qty=q_tp, side=OrderSide.SELL,
+                limit_price=tp_price, time_in_force=TimeInForce.GTC
+            ))
+            submitted_any = True
+        except Exception as e:
+            print(f"❌ TP submit failed: {e}")
+
+    time.sleep(0.3)
+
+    # 5) Submit SL (stop)
+    if q_sl > 0:
+        try:
+            trading_client.submit_order(StopOrderRequest(
+                symbol=symbol, qty=q_sl, side=OrderSide.SELL,
+                stop_price=sl_price, time_in_force=TimeInForce.GTC, reduce_only=True
+            ))
+            submitted_any = True
+        except TypeError:
+            trading_client.submit_order(StopOrderRequest(
+                symbol=symbol, qty=q_sl, side=OrderSide.SELL,
+                stop_price=sl_price, time_in_force=TimeInForce.GTC
+            ))
+            submitted_any = True
+        except Exception as e:
+            print(f"❌ SL submit failed: {e}")
+
+    if submitted_any:
+        try:
+            send_telegram_alert(f"🛡️ {symbol} protected: TP {tp_price} × {q_tp} | SL {sl_price} × {q_sl}")
+        except Exception:
+            pass
+        print(f"✅ Protection submitted on {symbol}.")
+    else:
+        print("⚠️ No protection orders could be submitted.")
+
+    return submitted_any
 
 def run_position_watchdog():
     def check_positions():
