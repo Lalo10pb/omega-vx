@@ -26,7 +26,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, StopOrderRequest
+
 # === Email Reporting ===
 import smtplib
 from email.message import EmailMessage
@@ -79,6 +79,72 @@ _CLOSE_COOLDOWN_SEC = 20  # consider 60–120 during market hours
 
 # === Dev flags ===
 FORCE_WEBHOOK_TEST = str(os.getenv("FORCE_WEBHOOK_TEST", "0")).strip().lower() in ("1", "true", "yes")
+
+# --- SAFE CLOSE HELPERS -------------------------------------------------------
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
+from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce
+
+def cancel_open_sells(symbol: str) -> int:
+    """Cancel all OPEN sell orders (limit/stop) for symbol to avoid wash-trade rejects."""
+    n = 0
+    try:
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        orders = trading_client.get_orders(filter=req)
+        for o in orders:
+            if str(o.side).lower().endswith("sell"):
+                try:
+                    trading_client.cancel_order_by_id(o.id)
+                    n += 1
+                except Exception as ce:
+                    print(f"⚠️ cancel failed {symbol} {o.id}: {ce}")
+    except Exception as e:
+        print(f"⚠️ list open sells failed for {symbol}: {e}")
+    return n
+
+def close_position_safely(symbol: str) -> bool:
+    """
+    Prevent “potential wash trade detected” by:
+      1) Cancel all open SELL orders for the symbol
+      2) Wait briefly for cancels to settle
+      3) Close position with a single market SELL (reduce‑only via close_position)
+    """
+    # 1) cancel TP/SL first
+    n = cancel_open_sells(symbol)
+    if n:
+        print(f"🧹 Canceled {n} open SELL orders for {symbol}.")
+    else:
+        print(f"🧹 No open SELL orders to cancel for {symbol}.")
+
+    # 2) let cancels settle
+    time.sleep(0.8)
+
+    # 3) close via API convenience (reduce‑only semantics)
+    try:
+        trading_client.close_position(symbol)  # Alpaca’s safe close
+        print(f"✅ Requested close for {symbol} (market).")
+        send_telegram_alert(f"✅ Closed {symbol} (safe close).")
+        return True
+    except Exception as e:
+        # Fallback: explicit market SELL sized to position
+        try:
+            pos = [p for p in trading_client.get_all_positions() if p.symbol.upper()==symbol.upper()]
+            if not pos:
+                print(f"ℹ️ No {symbol} position found; nothing to close.")
+                return True
+            qty = int(float(pos[0].qty))
+            if qty <= 0:
+                print(f"ℹ️ Non‑positive qty for {symbol}; nothing to close.")
+                return True
+            trading_client.submit_order(MarketOrderRequest(
+                symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY
+            ))
+            print(f"✅ Submitted market SELL {qty} {symbol} (fallback).")
+            send_telegram_alert(f"✅ Closed {symbol} with market SELL (fallback).")
+            return True
+        except Exception as e2:
+            print(f"❌ Safe close failed for {symbol}: {e} / fallback: {e2}")
+            send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
+            return False
 
 # 🧠 Generate AI-based trade explanation
 def generate_trade_explanation(symbol, entry, stop_loss, take_profit, rsi=None, trend=None, ha_candle=None):
@@ -1209,7 +1275,7 @@ def run_position_watchdog():
                         except Exception as e:
                             print(f"⚠️ Telegram send failed: {e}")
 
-                        ok = safe_close_position(symbol, qty)
+                        ok = ok = close_position_safely(symbol)
                         try:
                             if ok:
                                 send_telegram_alert(f"✅ {symbol} close submitted at market.")
@@ -1279,7 +1345,7 @@ if __name__ == '__main__':
     log_equity_curve()
     start_auto_sell_monitor()
 try:
-    app.run(host="0.0.0.0", port=5050)
+    app.run(host="0.0.0.0", port=5050, use_reloader=False)
 except Exception as e:
     handle_critical_error(e)
   
