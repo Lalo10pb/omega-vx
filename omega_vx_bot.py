@@ -680,19 +680,18 @@ def submit_order_with_retries(
     max_retries=3, dry_run=False
 ):
     """
-    New flow:
-      1) Risk-based qty calc + buying power guard (live ask price + buffer)
-      2) Plain market BUY (no bracket)
-      3) Attach split reduce_only TP/SL with retries if qty_available=0
+    Flow:
+      1) Risk-based qty calc + BP guard (live ask + 2% buffer)
+      2) Pre-cancel SELLs to avoid wash-trade
+      3) Plain market BUY (no bracket)
+      4) Attach split reduce_only TP/SL (with retries if qty_available=0)
     """
     print("📌 About to calculate quantity...")
     qty = calculate_trade_qty(entry, stop_loss)
     if qty == 0:
         print("❌ Qty is 0 — skipping order.")
-        try:
-            send_telegram_alert("❌ Trade aborted — calculated qty was 0.")
-        except Exception:
-            pass
+        try: send_telegram_alert("❌ Trade aborted — calculated qty was 0.")
+        except Exception: pass
         return False
 
     # DRY-RUN
@@ -700,10 +699,8 @@ def submit_order_with_retries(
         msg = (f"🧪 [DRY-RUN] Would BUY {symbol} qty={qty} @ {entry} "
                f"(SL {stop_loss} / TP {take_profit}, trailing={use_trailing})")
         print(msg)
-        try:
-            send_telegram_alert(msg)
-        except Exception:
-            pass
+        try: send_telegram_alert(msg)
+        except Exception: pass
         return False
 
     # --- Buying power guard with live ask price ---
@@ -721,18 +718,15 @@ def submit_order_with_retries(
         print(f"⚠️ Could not fetch buying power: {e}")
         buying_power = float("inf")
 
-    SAFETY = 0.98  # 2% buffer to avoid edge rejections
+    SAFETY = 0.98  # 2% buffer
     if live_price <= 0:
         live_price = max(entry, 0.01)
 
     max_qty_by_bp = int((buying_power * SAFETY) // live_price)
-
     if max_qty_by_bp <= 0:
         print(f"❌ Not enough buying power for even 1 share at ~${live_price:.2f}.")
-        try:
-            send_telegram_alert("❌ Trade aborted — not enough buying power.")
-        except Exception:
-            pass
+        try: send_telegram_alert("❌ Trade aborted — not enough buying power.")
+        except Exception: pass
         return False
 
     if qty > max_qty_by_bp:
@@ -740,7 +734,6 @@ def submit_order_with_retries(
               f"(BP ${buying_power:.2f}, live ~${live_price:.2f})")
         qty = max_qty_by_bp
 
-    # Final shave if extremely close to BP limit
     if qty * live_price > buying_power * SAFETY:
         qty = max(1, int((buying_power * SAFETY) // live_price))
         print(f"🛡️ Safety shave → qty={qty}")
@@ -749,21 +742,26 @@ def submit_order_with_retries(
     print("🔍 Checking equity guard...")
     if should_block_trading_due_to_equity():
         print("🛑 BLOCKED: Equity drop filter triggered.")
-        try:
-            send_telegram_alert("🛑 Webhook blocked: Equity protection triggered.")
-        except Exception:
-            pass
+        try: send_telegram_alert("🛑 Webhook blocked: Equity protection triggered.")
+        except Exception: pass
         return False
     print("✅ Equity check passed.")
 
     if not is_within_trading_hours():
         print("🕑 Outside trading hours.")
-        try:
-            send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
-        except Exception:
-            pass
+        try: send_telegram_alert("🕑 Trade skipped — outside allowed trading hours.")
+        except Exception: pass
         return False
     print("✅ Within trading hours.")
+
+    # --- NEW: Pre-cancel existing SELLs to avoid wash-trade rejects ---
+    try:
+        n = cancel_open_sells(symbol)
+        if n:
+            print(f"🧹 Pre-cancelled {n} open SELLs on {symbol} before BUY")
+        time.sleep(0.8)  # let exchange register cancels
+    except Exception as e:
+        print(f"⚠️ Pre-cancel error for {symbol}: {e}")
 
     # ---- BUY leg (no bracket) ----
     from alpaca.trading.enums import OrderSide, TimeInForce
@@ -774,42 +772,50 @@ def submit_order_with_retries(
         ))
     except Exception as e:
         print("🧨 BUY submit failed:", e)
-        try:
-            send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
-        except Exception:
-            pass
+        try: send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
+        except Exception: pass
         return False
+
+    # --- Sanity clamp TP/SL once (avoid nonsensical webhook values) ---
+    try:
+        q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
+        last_px = float(q[symbol].ask_price or q[symbol].bid_price or entry)
+    except Exception:
+        last_px = entry
+
+    abs_tp = float(take_profit)
+    abs_sl = float(stop_loss)
+    # If TP is at/below ~market, bump to +3%
+    if abs_tp <= last_px * 0.995:
+        abs_tp = round(last_px * 1.03, 2)
+    # If SL is at/above ~market, cut to -2%
+    if abs_sl >= last_px * 1.005:
+        abs_sl = round(last_px * 0.98, 2)
+    print(f"🧭 TP/SL sanity → last={last_px:.2f} | TP={abs_tp} | SL={abs_sl}")
 
     # ---- Attach split protection ----
     for attempt in range(1, 7):  # up to ~60s total
         print(f"🔐 Attach protection attempt {attempt}/6 …")
-        if place_split_protection(symbol, tp_price=take_profit, sl_price=stop_loss):
+        if place_split_protection(symbol, tp_price=abs_tp, sl_price=abs_sl):
             break
         print("⏳ qty_available not free yet; retrying …")
         time.sleep(10)
     else:
         print("⚠️ Could not attach protection after retries.")
-        try:
-            send_telegram_alert(f"⚠️ {symbol} BUY placed, but protection not attached (watchdog will still run).")
-        except Exception:
-            pass
+        try: send_telegram_alert(f"⚠️ {symbol} BUY placed, but protection not attached (watchdog will still run).")
+        except Exception: pass
         return True  # BUY succeeded, protection pending
 
     # ---- Notify + log ----
     explanation = generate_trade_explanation(
-        symbol=symbol, entry=entry, stop_loss=stop_loss,
-        take_profit=take_profit, rsi=None,
+        symbol=symbol, entry=entry, stop_loss=abs_sl,
+        take_profit=abs_tp, rsi=None,
         trend="uptrend" if use_trailing else "neutral"
     )
-    try:
-        send_telegram_alert(f"🚀 Trade executed:\n{explanation}")
-    except Exception:
-        pass
-
-    try:
-        log_equity_curve()
-    except Exception:
-        pass
+    try: send_telegram_alert(f"🚀 Trade executed:\n{explanation}")
+    except Exception: pass
+    try: log_equity_curve()
+    except Exception: pass
 
     print(f"✅ Order + protection finished for {symbol}.")
     return True
@@ -1332,20 +1338,28 @@ def handle_critical_error(e):
     sys.exit(1)
 
 # ✅ Entry point
-if __name__ == '__main__':
+if __name__ == "__main__":
+    # --- one‑time housekeeping (runs once, only when launched directly) ---
     today = datetime.now().strftime("%Y-%m-%d")
     if not os.path.exists(SNAPSHOT_LOG_PATH) or open(SNAPSHOT_LOG_PATH).read().strip() != today:
         log_portfolio_snapshot()
         with open(SNAPSHOT_LOG_PATH, "w") as f:
             f.write(today)
 
-    handle_restart_notification()  # 🧠 Step 20 – Notify if bot restarted unexpectedly
+    handle_restart_notification()  # notify if bot restarted unexpectedly
 
+    # --- start background services ONCE ---
     run_position_watchdog()
     log_equity_curve()
     start_auto_sell_monitor()
-try:
-    app.run(host="0.0.0.0", port=5050, use_reloader=False)
-except Exception as e:
-    handle_critical_error(e)
-  
+
+    # --- start Flask without the reloader (prevents port conflicts) ---
+    try:
+        app.run(
+            host="0.0.0.0",
+            port=int(os.getenv("PORT", "5050")),
+            debug=False,
+            use_reloader=False,
+        )
+    except Exception as e:
+        handle_critical_error(e)
