@@ -66,7 +66,7 @@ LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
 LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
 
 # === Alpaca Clients ===
-trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
+trading_client = TradingClient(API_KEY, API_SECRET, paper=False)
 data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
 
 # === Flask App ===
