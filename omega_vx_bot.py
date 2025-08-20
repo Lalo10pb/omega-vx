@@ -50,6 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_FILE = "google_credentials.json"
 SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+PAPER_MODE = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1", "true", "yes")
 
 # === Trading Configuration ===
 DAILY_RISK_LIMIT = -10  # 💥 Stop trading after $10 loss
@@ -66,7 +67,7 @@ LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
 LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
 
 # === Alpaca Clients ===
-trading_client = TradingClient(API_KEY, API_SECRET, paper=False)
+trading_client = TradingClient(API_KEY, API_SECRET, paper=PAPER_MODE)
 data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
 
 # === Flask App ===
