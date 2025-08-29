@@ -270,6 +270,10 @@ def send_telegram_alert(message: str):
     except Exception as e:
         print(f"❌ Telegram alert error: {e}")
 
+def _clean_env(s: str) -> str:
+    """Trim whitespace and surrounding quotes from environment variables."""
+    return str(s or "").strip().strip('"').strip("'")
+
 def get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist"):
     """
     Return a list of symbols from the first column of the watchlist tab.
@@ -279,17 +283,17 @@ def get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchl
         client = _get_gspread_client()
 
         ss = None
-        sheet_id = os.getenv("GOOGLE_SHEET_ID")
-        tab_override = os.getenv("WATCHLIST_SHEET_NAME")
+        sheet_id = _clean_env(os.getenv("GOOGLE_SHEET_ID"))
+        tab_override = _clean_env(os.getenv("WATCHLIST_SHEET_NAME"))
         if tab_override:
             tab_name = tab_override
 
         if sheet_id:
             try:
-                print(f"📄 Opening spreadsheet by ID: {sheet_id}")
+                print(f"📄 Opening spreadsheet by ID: {sheet_id!r}")
                 ss = client.open_by_key(sheet_id)
             except Exception as e_id:
-                print(f"⚠️ open_by_key failed for id {sheet_id}: {type(e_id).__name__}: {e_id}")
+                print(f"⚠️ open_by_key failed for id {sheet_id!r}: {type(e_id).__name__}: {e_id}")
 
         if ss is None:
             try:
@@ -1107,8 +1111,8 @@ def log_portfolio_snapshot():
         try:
             client = _get_gspread_client()
 
-            sheet_id = os.getenv("GOOGLE_SHEET_ID")
-            sheet_name = os.getenv("PORTFOLIO_SHEET_NAME", "Portfolio Log")  # Default fallback
+            sheet_id = _clean_env(os.getenv("GOOGLE_SHEET_ID"))
+            sheet_name = _clean_env(os.getenv("PORTFOLIO_SHEET_NAME") or "Portfolio Log")  # Default fallback
 
             if not sheet_id or not sheet_name:
                 raise ValueError("Missing GOOGLE_SHEET_ID or PORTFOLIO_SHEET_NAME environment variable.")
@@ -1329,8 +1333,8 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
     try:
         client = _get_gspread_client()
 
-        sheet_id = os.getenv("GOOGLE_SHEET_ID")
-        sheet_name = os.getenv("TRADE_SHEET_NAME", "Trade Log")
+        sheet_id = _clean_env(os.getenv("GOOGLE_SHEET_ID"))
+        sheet_name = _clean_env(os.getenv("TRADE_SHEET_NAME") or "Trade Log")
 
         if not sheet_id or not sheet_name:
             raise ValueError("Missing GOOGLE_SHEET_ID or TRADE_SHEET_NAME environment variable.")
