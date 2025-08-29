@@ -79,7 +79,14 @@ _last_close_attempt = {}
 _CLOSE_COOLDOWN_SEC = 20  # consider 60–120 during market hours
 
 # === Dev flags ===
+
 FORCE_WEBHOOK_TEST = str(os.getenv("FORCE_WEBHOOK_TEST", "0")).strip().lower() in ("1", "true", "yes")
+
+# --- Auto‑Scanner flags ---
+OMEGA_AUTOSCAN = str(os.getenv("OMEGA_AUTOSCAN", "0")).strip().lower() in ("1","true","yes","y","on")
+OMEGA_AUTOSCAN_DRYRUN = str(os.getenv("OMEGA_AUTOSCAN_DRYRUN", "0")).strip().lower() in ("1","true","yes","y","on")
+OMEGA_SCAN_INTERVAL_SEC = int(str(os.getenv("OMEGA_SCAN_INTERVAL_SEC", "120")).strip() or "120")
+OMEGA_MAX_OPEN_POSITIONS = int(str(os.getenv("OMEGA_MAX_OPEN_POSITIONS", "1")).strip() or "1")
 
 # --- SAFE CLOSE HELPERS -------------------------------------------------------
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
@@ -372,6 +379,124 @@ def is_multi_timeframe_confirmed(symbol):
         return True
     else:
         return False
+
+# === AUTOSCAN ENGINE =========================================================
+def _open_positions_count() -> int:
+    try:
+        return len(trading_client.get_all_positions())
+    except Exception as e:
+        print(f"⚠️ count positions failed: {e}")
+        return 0
+
+def _best_candidate_from_watchlist(symbols):
+    """
+    Score each symbol with a simple model:
+      +2 if 15m and 1h Heikin‑Ashi are both bullish
+      +1 if RSI(15m) is in a neutral (35–65) zone
+      −1 if RSI is very extreme (<25 or >75)
+    Returns best symbol or None if nothing scores positive.
+    """
+    ranked = []
+    for sym in symbols:
+        try:
+            s = sym.strip().upper()
+            if not s:
+                continue
+            mtf_bull = is_multi_timeframe_confirmed(s)
+            rsi = get_rsi_value(s, interval='15m')
+            score = 0
+            if mtf_bull:
+                score += 2
+            if rsi is not None:
+                if 35 <= rsi <= 65:
+                    score += 1
+                elif rsi < 25 or rsi > 75:
+                    score -= 1
+            ranked.append((score, s))
+            print(f"🧪 Score {s}: score={score} (mtf_bull={mtf_bull}, rsi={rsi})")
+        except Exception as e:
+            print(f"⚠️ scoring {sym} failed: {e}")
+            continue
+    ranked.sort(reverse=True)
+    return ranked[0][1] if ranked and ranked[0][0] > 0 else None
+
+def _compute_entry_tp_sl(symbol: str):
+    """
+    Pull live quote; compute a conservative TP/SL if not provided:
+    entry ~ last ask, SL at −2%, TP at +3%.
+    """
+    from alpaca.data.requests import StockLatestQuoteRequest
+    try:
+        q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
+        px = float(q[symbol].ask_price or q[symbol].bid_price)
+    except Exception as e:
+        print(f"⚠️ quote fetch failed for {symbol}: {e}")
+        return None
+    entry = round(px, 2)
+    sl    = round(entry * 0.98, 2)
+    tp    = round(entry * 1.03, 2)
+    return entry, sl, tp
+
+def autoscan_once():
+    # stop if too many positions
+    if _open_positions_count() >= OMEGA_MAX_OPEN_POSITIONS:
+        print(f"⛔ Position cap reached ({OMEGA_MAX_OPEN_POSITIONS}).")
+        return False
+
+    # read watchlist
+    watch = get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist")
+    if not watch:
+        print("⚠️ Watchlist empty or not reachable.")
+        return False
+
+    # pick a candidate
+    sym = _best_candidate_from_watchlist(watch)
+    if not sym:
+        print("ℹ️ No positive‑score candidate right now.")
+        return False
+
+    # compute prices
+    trio = _compute_entry_tp_sl(sym)
+    if not trio:
+        return False
+    entry, sl, tp = trio
+
+    # respect cooldown, hours, and equity guard
+    if is_cooldown_active():
+        print("⏳ Global cooldown active; skipping autoscan trade.")
+        return False
+    if not is_within_trading_hours():
+        print("🕑 Outside trading hours; autoscan skip.")
+        return False
+    if should_block_trading_due_to_equity():
+        print("🛑 Equity guard active; autoscan skip.")
+        return False
+
+    print(f"🤖 AUTOSCAN candidate {sym}: entry={entry} SL={sl} TP={tp}")
+    return submit_order_with_retries(
+        symbol=sym,
+        entry=entry,
+        stop_loss=sl,
+        take_profit=tp,
+        use_trailing=True,
+        dry_run=OMEGA_AUTOSCAN_DRYRUN
+    )
+
+def start_autoscan_thread():
+    if not OMEGA_AUTOSCAN:
+        print("🤖 Autoscan disabled (set OMEGA_AUTOSCAN=1 to enable).")
+        return
+    def _loop():
+        print(f"🤖 Autoscan running every {OMEGA_SCAN_INTERVAL_SEC}s "
+              f"(max open positions={OMEGA_MAX_OPEN_POSITIONS}, dryrun={OMEGA_AUTOSCAN_DRYRUN})")
+        while True:
+            try:
+                autoscan_once()
+            except Exception as e:
+                print(f"⚠️ autoscan loop error: {e}")
+            time.sleep(OMEGA_SCAN_INTERVAL_SEC)
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
 
 def log_equity_curve():
     try:
@@ -713,30 +838,51 @@ def submit_order_with_retries(
     except Exception as e:
         print(f"⚠️ Could not fetch live quote for {symbol}: {e} — using entry={entry}")
 
+    # ⚖️ Use an 'effective' buying power for cash accounts where bp may show 0
     try:
-        buying_power = float(trading_client.get_account().buying_power)
+        acct = trading_client.get_account()
+        bp = float(getattr(acct, "buying_power", 0) or 0)
+        nmbp = float(getattr(acct, "non_marginable_buying_power", 0) or 0)
+        regt = float(getattr(acct, "regt_buying_power", 0) or 0)
+        cash_avail = float(getattr(acct, "cash", 0) or 0)
+        multiplier = float(getattr(acct, "multiplier", 1) or 1)
+
+        # If margin account, prefer broker-reported BP; otherwise take the max available cash-like field.
+        if multiplier > 1:
+            effective_bp = bp
+        else:
+            effective_bp = max(cash_avail, nmbp, regt, bp)
+
+        print(
+            f"💵 BP snapshot → bp={bp:.2f} nmbp={nmbp:.2f} regt={regt:.2f} "
+            f"cash={cash_avail:.2f} mult={multiplier:.0f} → effective_bp={effective_bp:.2f}"
+        )
     except Exception as e:
-        print(f"⚠️ Could not fetch buying power: {e}")
-        buying_power = float("inf")
+        print(f"⚠️ Could not fetch account buying power fields: {e}")
+        effective_bp = 0.0
 
     SAFETY = 0.98  # 2% buffer
     if live_price <= 0:
         live_price = max(entry, 0.01)
 
-    max_qty_by_bp = int((buying_power * SAFETY) // live_price)
+    max_qty_by_bp = int((effective_bp * SAFETY) // live_price)
     if max_qty_by_bp <= 0:
-        print(f"❌ Not enough buying power for even 1 share at ~${live_price:.2f}.")
-        try: send_telegram_alert("❌ Trade aborted — not enough buying power.")
-        except Exception: pass
+        print(f"❌ Not enough usable buying power for even 1 share at ~${live_price:.2f} (effective_bp=${effective_bp:.2f}).")
+        try:
+            send_telegram_alert(f"❌ Trade aborted — usable buying power ${effective_bp:.2f} too low for {symbol}.")
+        except Exception:
+            pass
         return False
 
     if qty > max_qty_by_bp:
-        print(f"⚠️ Reducing qty by BP cap: {qty} → {max_qty_by_bp} "
-              f"(BP ${buying_power:.2f}, live ~${live_price:.2f})")
+        print(
+            f"⚠️ Reducing qty by BP cap: {qty} → {max_qty_by_bp} "
+            f"(effective_bp ${effective_bp:.2f}, live ~${live_price:.2f})"
+        )
         qty = max_qty_by_bp
 
-    if qty * live_price > buying_power * SAFETY:
-        qty = max(1, int((buying_power * SAFETY) // live_price))
+    if qty * live_price > effective_bp * SAFETY:
+        qty = max(1, int((effective_bp * SAFETY) // live_price))
         print(f"🛡️ Safety shave → qty={qty}")
 
     print(f"📌 Quantity calculated: {qty}")
@@ -1353,6 +1499,8 @@ if __name__ == "__main__":
     run_position_watchdog()
     log_equity_curve()
     start_auto_sell_monitor()
+    # start autoscan if enabled
+    start_autoscan_thread()
 
     # --- start Flask without the reloader (prevents port conflicts) ---
     try:
