@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, time as dt_time
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+import json
+import base64
 
 # === Alpaca Trading and Data ===
 from alpaca.trading.requests import (
@@ -51,6 +53,72 @@ SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_FILE = "google_credentials.json"
 SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 PAPER_MODE = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1", "true", "yes")
+
+# --- Google Sheets Helper for Flexible Auth ---
+def _get_gspread_client():
+    """
+    Return an authorized gspread client using one of:
+      1) Secret File on disk (supports Render Secret Files and custom GOOGLE_CREDS_PATH)
+      2) Env var GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON)
+      3) Env var GOOGLE_SERVICE_ACCOUNT_JSON_B64 (base64-encoded JSON)
+    """
+    try:
+        scope = [
+            "https://spreadsheets.google.com/feeds",
+            "https://www.googleapis.com/auth/drive",
+        ]
+
+        # 1) Preferred: a credentials file on disk
+        search_paths = []
+        # custom path override
+        env_path = os.getenv("GOOGLE_CREDS_PATH")
+        if env_path:
+            search_paths.append(env_path)
+        # Render Secret Files default mount
+        search_paths.append("/etc/secrets/google_credentials.json")
+        # repo-local fallback (if the file is committed or copied at build)
+        search_paths.append("google_credentials.json")
+
+        for path in search_paths:
+            if os.path.exists(path):
+                # Print minimal debug to help diagnose 404/403 issues
+                try:
+                    with open(path, "r") as f:
+                        _creds_preview = json.load(f)
+                    print(
+                        f"🔐 Using Google creds file at {path}; service_account={_creds_preview.get('client_email','?')}"
+                    )
+                except Exception:
+                    pass
+                creds = ServiceAccountCredentials.from_json_keyfile_name(path, scope)
+                return gspread.authorize(creds)
+
+        # 2) Raw JSON in env
+        raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if raw and raw.strip().startswith("{"):
+            info = json.loads(raw)
+            print(f"🔐 Using GOOGLE_SERVICE_ACCOUNT_JSON; service_account={info.get('client_email','?')}")
+            creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
+            return gspread.authorize(creds)
+
+        # 3) Base64 JSON in env
+        b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
+        if b64:
+            try:
+                decoded = base64.b64decode(b64).decode("utf-8")
+                info = json.loads(decoded)
+                print(f"🔐 Using GOOGLE_SERVICE_ACCOUNT_JSON_B64; service_account={info.get('client_email','?')}")
+                creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
+                return gspread.authorize(creds)
+            except Exception as e:
+                print(f"⚠️ Failed to decode GOOGLE_SERVICE_ACCOUNT_JSON_B64: {e}")
+
+        raise FileNotFoundError(
+            "No Google credentials found (checked GOOGLE_CREDS_PATH, /etc/secrets/google_credentials.json, google_credentials.json, GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SERVICE_ACCOUNT_JSON_B64)."
+        )
+    except Exception as e:
+        print(f"❌ Google auth error: {type(e).__name__}: {e}")
+        raise
 
 # === Trading Configuration ===
 DAILY_RISK_LIMIT = -10  # 💥 Stop trading after $10 loss
@@ -203,17 +271,64 @@ def send_telegram_alert(message: str):
         print(f"❌ Telegram alert error: {e}")
 
 def get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist"):
+    """
+    Return a list of symbols from the first column of the watchlist tab.
+    Prefers GOOGLE_SHEET_ID. Tab name can be overridden via WATCHLIST_SHEET_NAME.
+    """
     try:
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
-        client = gspread.authorize(creds)
-        
-        sheet = client.open(sheet_name).worksheet(tab_name)
-        symbols = sheet.col_values(1)  # Get column A
-        return [s.strip().upper() for s in symbols if s.strip()]
-    
+        client = _get_gspread_client()
+
+        ss = None
+        sheet_id = os.getenv("GOOGLE_SHEET_ID")
+        tab_override = os.getenv("WATCHLIST_SHEET_NAME")
+        if tab_override:
+            tab_name = tab_override
+
+        if sheet_id:
+            try:
+                print(f"📄 Opening spreadsheet by ID: {sheet_id}")
+                ss = client.open_by_key(sheet_id)
+            except Exception as e_id:
+                print(f"⚠️ open_by_key failed for id {sheet_id}: {type(e_id).__name__}: {e_id}")
+
+        if ss is None:
+            try:
+                print(f"📄 Falling back to open by title: {sheet_name}")
+                ss = client.open(sheet_name)
+            except Exception as e_title:
+                raise Exception(
+                    f"Spreadsheet not reachable. Tried id={sheet_id!r} and title={sheet_name!r}. Error: {type(e_title).__name__}: {e_title}"
+                )
+
+        try:
+            ws = ss.worksheet(tab_name)
+        except Exception as e_ws:
+            try:
+                tabs = [w.title for w in ss.worksheets()]
+            except Exception:
+                tabs = []
+            raise Exception(
+                f"Worksheet '{tab_name}' not found. Available tabs: {tabs}. Error: {type(e_ws).__name__}: {e_ws}"
+            )
+
+        symbols = ws.col_values(1)
+        out = []
+        for s in symbols:
+            s = (s or "").strip().upper()
+            if not s or s == "SYMBOL":
+                continue
+            out.append(s)
+
+        if not out:
+            print("⚠️ Watchlist tab reached but it is empty (after header filtering).")
+        else:
+            preview = ", ".join(out[:10]) + (" …" if len(out) > 10 else "")
+            print(f"✅ Watchlist loaded ({len(out)}): {preview}")
+
+        return out
+
     except Exception as e:
-        print(f"❌ Failed to fetch watchlist: {e}")
+        print(f"❌ Failed to fetch watchlist: {type(e).__name__}: {e}")
         return []
 
 def handle_restart_notification():
@@ -990,9 +1105,7 @@ def log_portfolio_snapshot():
 
         # ✅ Also log to Google Sheet
         try:
-            scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-            creds = ServiceAccountCredentials.from_json_keyfile_name('google_credentials.json', scope)
-            client = gspread.authorize(creds)
+            client = _get_gspread_client()
 
             sheet_id = os.getenv("GOOGLE_SHEET_ID")
             sheet_name = os.getenv("PORTFOLIO_SHEET_NAME", "Portfolio Log")  # Default fallback
@@ -1214,15 +1327,13 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
 
     # ✅ Google Sheet Logging
     try:
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('google_credentials.json', scope)
-        client = gspread.authorize(creds)
+        client = _get_gspread_client()
 
         sheet_id = os.getenv("GOOGLE_SHEET_ID")
-        sheet_name = os.getenv("SHEET_NAME")
+        sheet_name = os.getenv("TRADE_SHEET_NAME", "Trade Log")
 
         if not sheet_id or not sheet_name:
-            raise ValueError("Missing GOOGLE_SHEET_ID or SHEET_NAME environment variable.")
+            raise ValueError("Missing GOOGLE_SHEET_ID or TRADE_SHEET_NAME environment variable.")
 
         sheet = client.open_by_key(sheet_id).worksheet(sheet_name)
 
