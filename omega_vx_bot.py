@@ -28,7 +28,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
-
+from alpaca.data.enums import DataFeed
 # === Email Reporting ===
 import smtplib
 from email.message import EmailMessage
@@ -52,7 +52,16 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_FILE = "google_credentials.json"
 SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+
 PAPER_MODE = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1", "true", "yes")
+
+# --- Alpaca Data Feed selection (default IEX; fallback handled in code) ---
+_ALPACA_DATA_FEED_NAME = (os.getenv("ALPACA_DATA_FEED", "IEX") or "IEX").strip().upper()
+_DATA_FEED = DataFeed.SIP if _ALPACA_DATA_FEED_NAME == "SIP" else DataFeed.IEX
+try:
+    print(f"📡 Alpaca data feed: {_DATA_FEED.value}")
+except Exception:
+    pass
 
 # --- Google Sheets Helper for Flexible Auth ---
 def _get_gspread_client():
@@ -402,31 +411,43 @@ def auto_adjust_risk_percent():
 auto_adjust_risk_percent()
 
 def get_bars(symbol, interval='15m', lookback=10):
-    try:
-        # Set up time range
-        end = datetime.now()
-        start = end - timedelta(minutes=15 * (lookback + 1))
+    """
+    Fetch recent bars with the configured data feed, falling back to IEX if SIP is not allowed.
+    """
+    from alpaca.data.requests import StockBarsRequest
+    end = datetime.utcnow()
+    start = end - timedelta(minutes=15 * (lookback + 1))
+    tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
 
-        # Convert to Alpaca timeframe
-        tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
-
-        request_params = StockBarsRequest(
+    def _fetch(feed):
+        req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
             start=start,
-            end=end
+            end=end,
+            feed=feed,
         )
+        return data_client.get_stock_bars(req).df
 
-        bars = data_client.get_stock_bars(request_params).df
-
-        if bars.empty:
-            print(f"⚠️ No Alpaca data returned for {symbol}")
+    try:
+        bars = _fetch(_DATA_FEED)
+    except Exception as e:
+        # Permission errors show up as SIP not permitted — drop to IEX
+        if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
+            print("ℹ️ Falling back to IEX for bars due to feed permission.")
+            try:
+                bars = _fetch(DataFeed.IEX)
+            except Exception as e2:
+                print(f"❌ Alpaca data fetch failed for {symbol} (IEX fallback): {e2}")
+                return None
+        else:
+            print(f"❌ Alpaca data fetch failed for {symbol}: {e}")
             return None
 
-        return bars
-    except Exception as e:
-        print(f"❌ Alpaca data fetch failed for {symbol}: {e}")
+    if bars is None or bars.empty:
+        print(f"⚠️ No Alpaca data returned for {symbol}")
         return None
+    return bars
 
 def is_within_trading_hours(start_hour=13, start_minute=30, end_hour=20):
     if FORCE_WEBHOOK_TEST:
@@ -437,56 +458,77 @@ def is_within_trading_hours(start_hour=13, start_minute=30, end_hour=20):
     return start <= now_utc <= end
 
 def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
-    try:
-        # 🕒 Set correct timeframe for Alpaca
-        tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
+    """
+    Heikin‑Ashi using Alpaca bars with feed fallback (SIP→IEX).
+    """
+    from alpaca.data.requests import StockBarsRequest
+    tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
+    end = datetime.utcnow()
+    start = end - timedelta(days=2)
 
-        end = datetime.utcnow()
-        start = end - timedelta(days=2)
-
-        # 📈 Fetch historical bars from Alpaca
-        request_params = StockBarsRequest(
+    def _fetch(feed):
+        req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
             start=start,
-            end=end
+            end=end,
+            feed=feed,
         )
+        return data_client.get_stock_bars(req).df
 
-        bars = data_client.get_stock_bars(request_params).df
-
-        if bars.empty or symbol not in bars.index.get_level_values(0):
-            print(f"⚠️ No data returned for {symbol}.")
-            return None
-
-        # 🧼 Filter and reset index
-        bars = bars.loc[symbol].reset_index()
-
-        if len(bars) < lookback + 1:
-            print(f"⚠️ Not enough data to compute Heikin Ashi for {symbol}.")
-            return None
-
-        # 🔥 Calculate Heikin Ashi candles
-        ha_candles = []
-        for i in range(1, lookback + 1):
-            prev_close = bars['close'].iloc[-(i + 1)]
-            curr_open = bars['open'].iloc[-i]
-            ha_open = (curr_open + prev_close) / 2
-            ha_close = (bars['open'].iloc[-i] + bars['high'].iloc[-i] +
-                        bars['low'].iloc[-i] + bars['close'].iloc[-i]) / 4
-
-            ha_candles.append({'open': ha_open, 'close': ha_close})
-
-        last = ha_candles[-1]
-        if last['close'] > last['open']:
-            return 'bullish'
-        elif last['close'] < last['open']:
-            return 'bearish'
-        else:
-            return 'neutral'
-
+    try:
+        bars = _fetch(_DATA_FEED)
     except Exception as e:
-        print(f"❌ Failed to get Heikin Ashi trend for {symbol} on {interval}: {e}")
+        if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
+            print("ℹ️ Falling back to IEX for Heikin‑Ashi due to feed permission.")
+            try:
+                bars = _fetch(DataFeed.IEX)
+            except Exception as e2:
+                print(f"❌ Failed to get Heikin Ashi trend for {symbol} on {interval} (IEX fallback): {e2}")
+                return None
+        else:
+            print(f"❌ Failed to get Heikin Ashi trend for {symbol} on {interval}: {e}")
+            return None
+
+    if bars is None or bars.empty:
+        print(f"⚠️ No data returned for {symbol}.")
         return None
+
+    # Handle both MultiIndex (symbol, timestamp) and flat frames
+    try:
+        if 'symbol' in bars.columns:
+            bars = bars[bars['symbol'] == symbol]
+        else:
+            bars = bars.loc[symbol]
+        bars = bars.reset_index()
+    except Exception:
+        try:
+            bars = bars.reset_index()
+            bars = bars[bars['symbol'] == symbol]
+        except Exception:
+            print(f"⚠️ Unexpected bars shape for {symbol}")
+            return None
+
+    if len(bars) < lookback + 1:
+        print(f"⚠️ Not enough data to compute Heikin Ashi for {symbol}.")
+        return None
+
+    ha_candles = []
+    for i in range(1, lookback + 1):
+        prev_close = bars['close'].iloc[-(i + 1)]
+        curr_open = bars['open'].iloc[-i]
+        ha_open = (curr_open + prev_close) / 2
+        ha_close = (bars['open'].iloc[-i] + bars['high'].iloc[-i] +
+                    bars['low'].iloc[-i] + bars['close'].iloc[-i]) / 4
+        ha_candles.append({'open': ha_open, 'close': ha_close})
+
+    last = ha_candles[-1]
+    if last['close'] > last['open']:
+        return 'bullish'
+    elif last['close'] < last['open']:
+        return 'bearish'
+    else:
+        return 'neutral'
 
 def is_multi_timeframe_confirmed(symbol):
     trend_15m = get_heikin_ashi_trend(symbol, interval='15m')
@@ -546,11 +588,21 @@ def _compute_entry_tp_sl(symbol: str):
     """
     from alpaca.data.requests import StockLatestQuoteRequest
     try:
-        q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=_DATA_FEED)
+        q = data_client.get_stock_latest_quote(req)
         px = float(q[symbol].ask_price or q[symbol].bid_price)
     except Exception as e:
-        print(f"⚠️ quote fetch failed for {symbol}: {e}")
-        return None
+        if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
+            try:
+                req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
+                q = data_client.get_stock_latest_quote(req)
+                px = float(q[symbol].ask_price or q[symbol].bid_price)
+            except Exception as e2:
+                print(f"⚠️ quote fetch failed for {symbol} (IEX fallback): {e2}")
+                return None
+        else:
+            print(f"⚠️ quote fetch failed for {symbol}: {e}")
+            return None
     entry = round(px, 2)
     sl    = round(entry * 0.98, 2)
     tp    = round(entry * 1.03, 2)
@@ -791,25 +843,45 @@ def calculate_trade_qty(entry_price, stop_loss_price):
 
 def get_current_vix():
     try:
-        request_params = StockBarsRequest(
+        req = StockBarsRequest(
             symbol_or_symbols="^VIX",
             timeframe=TimeFrame.Day,
             start=datetime.utcnow() - timedelta(days=5),
-            end=datetime.utcnow()
+            end=datetime.utcnow(),
+            feed=_DATA_FEED,
         )
-
-        bars = data_client.get_stock_bars(request_params).df
-        bars = bars[bars['symbol'] == "^VIX"]
-
-        if not bars.empty:
-            vix_value = bars['close'].iloc[-1]
-            print(f"📊 VIX fetched from Alpaca: {vix_value}")
-            return vix_value
+        bars = data_client.get_stock_bars(req).df
+    except Exception as e:
+        if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
+            try:
+                req = StockBarsRequest(
+                    symbol_or_symbols="^VIX",
+                    timeframe=TimeFrame.Day,
+                    start=datetime.utcnow() - timedelta(days=5),
+                    end=datetime.utcnow(),
+                    feed=DataFeed.IEX,
+                )
+                bars = data_client.get_stock_bars(req).df
+            except Exception as e2:
+                print(f"❌ Failed to get VIX (IEX fallback): {e2}")
+                return 0
         else:
+            print(f"❌ Failed to get VIX: {e}")
+            return 0
+
+    try:
+        if 'symbol' in bars.columns:
+            sel = bars[bars['symbol'] == "^VIX"]
+        else:
+            sel = bars.loc["^VIX"]
+        if sel is None or len(sel) == 0:
             print("⚠️ No VIX data found.")
             return 0
-    except Exception as e:
-        print(f"❌ Failed to get VIX: {e}")
+        vix_value = float(sel['close'].iloc[-1])
+        print(f"📊 VIX fetched from Alpaca: {vix_value}")
+        return vix_value
+    except Exception:
+        print("⚠️ No VIX data found.")
         return 0
 
 def get_max_equity():
@@ -880,45 +952,70 @@ def get_equity_slope():
         return 0
 
 def get_rsi_value(symbol, interval='15m', period=14):
-    try:
-        # Convert interval to Alpaca's TimeFrame
-        tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
+    """
+    RSI from Alpaca bars with feed fallback. Returns the latest RSI or None.
+    """
+    tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
+    end = datetime.utcnow()
+    start = end - timedelta(days=5)
 
-        end = datetime.utcnow()
-        start = end - timedelta(days=5)  # Enough data for RSI
-
-        bars_request = StockBarsRequest(
+    def _fetch(feed):
+        req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
             start=start,
-            end=end
+            end=end,
+            feed=feed,
         )
+        return data_client.get_stock_bars(req).df
 
-        bars = data_client.get_stock_bars(bars_request).df
-
-        if bars.empty or len(bars) < period:
-            print(f"⚠️ Not enough data to calculate RSI for {symbol}")
+    try:
+        bars = _fetch(_DATA_FEED)
+    except Exception as e:
+        if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
+            print("ℹ️ Falling back to IEX for RSI due to feed permission.")
+            try:
+                bars = _fetch(DataFeed.IEX)
+            except Exception as e2:
+                print(f"❌ Failed to calculate RSI for {symbol} (IEX fallback): {e2}")
+                return None
+        else:
+            print(f"❌ Failed to calculate RSI for {symbol}: {e}")
             return None
 
-        bars = bars[bars['symbol'] == symbol]
-
-        delta = bars['close'].diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-
-        avg_gain = gain.rolling(window=period).mean()
-        avg_loss = loss.rolling(window=period).mean()
-
-        rs = avg_gain / avg_loss
-        rsi = 100 - (100 / (1 + rs))
-
-        latest_rsi = round(rsi.iloc[-1], 2)
-        print(f"📈 RSI ({interval}) for {symbol}: {latest_rsi}")
-        return latest_rsi
-
-    except Exception as e:
-        print(f"❌ Failed to calculate RSI for {symbol}: {e}")
+    if bars is None or bars.empty:
+        print(f"⚠️ Not enough data to calculate RSI for {symbol}")
         return None
+
+    # Normalize to a single‑symbol frame with columns open/high/low/close
+    try:
+        if 'symbol' in bars.columns:
+            bars = bars[bars['symbol'] == symbol]
+        else:
+            bars = bars.loc[symbol]
+    except Exception:
+        pass
+
+    if len(bars) < period + 1 or 'close' not in bars.columns:
+        print(f"⚠️ Not enough data to calculate RSI for {symbol}")
+        return None
+
+    delta = bars['close'].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean().replace(0, np.nan)
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    latest_rsi = float(rsi.iloc[-1])
+    if np.isnan(latest_rsi):
+        return None
+    latest_rsi = round(latest_rsi, 2)
+    print(f"📈 RSI ({interval}) for {symbol}: {latest_rsi}")
+    return latest_rsi
 
 def submit_order_with_retries(
     symbol, entry, stop_loss, take_profit, use_trailing,
@@ -952,10 +1049,19 @@ def submit_order_with_retries(
     from alpaca.data.requests import StockLatestQuoteRequest
     live_price = entry
     try:
-        q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=_DATA_FEED)
+        q = data_client.get_stock_latest_quote(req)
         live_price = float(q[symbol].ask_price or q[symbol].bid_price or entry)
     except Exception as e:
-        print(f"⚠️ Could not fetch live quote for {symbol}: {e} — using entry={entry}")
+        if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
+            try:
+                req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
+                q = data_client.get_stock_latest_quote(req)
+                live_price = float(q[symbol].ask_price or q[symbol].bid_price or entry)
+            except Exception as e2:
+                print(f"⚠️ Could not fetch live quote for {symbol} (IEX fallback): {e2} — using entry={entry}")
+        else:
+            print(f"⚠️ Could not fetch live quote for {symbol}: {e} — using entry={entry}")
 
     # ⚖️ Use an 'effective' buying power for cash accounts where bp may show 0
     try:
@@ -1044,10 +1150,19 @@ def submit_order_with_retries(
 
     # --- Sanity clamp TP/SL once (avoid nonsensical webhook values) ---
     try:
-        q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=_DATA_FEED)
+        q = data_client.get_stock_latest_quote(req)
         last_px = float(q[symbol].ask_price or q[symbol].bid_price or entry)
-    except Exception:
-        last_px = entry
+    except Exception as e:
+        if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
+            try:
+                req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
+                q = data_client.get_stock_latest_quote(req)
+                last_px = float(q[symbol].ask_price or q[symbol].bid_price or entry)
+            except Exception:
+                last_px = entry
+        else:
+            last_px = entry
 
     abs_tp = float(take_profit)
     abs_sl = float(stop_loss)
