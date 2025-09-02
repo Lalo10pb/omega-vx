@@ -288,3 +288,19 @@ Traceback (most recent call last):
   File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/alpaca_trade_api/rest.py", line 83, in raise_api_error
     raise APIError(error, http_error) from None
 alpaca_trade_api.rest.APIError: request is not authorized
+/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+Traceback (most recent call last):
+  File "/Users/eduardoperezbrito/omega-vx/portfolio_snapshot.py", line 17, in <module>
+    account = api.get_account()
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/alpaca_trade_api/rest.py", line 280, in get_account
+    resp = self.get('/account')
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/alpaca_trade_api/rest.py", line 254, in get
+    return self._request('GET', path, data)
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/alpaca_trade_api/rest.py", line 222, in _request
+    return self._one_request(method, url, opts, retry)
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/alpaca_trade_api/rest.py", line 248, in _one_request
+    raise_api_error(resp, http_error)
+  File "/Users/eduardoperezbrito/omega-vx/.venv/lib/python3.9/site-packages/alpaca_trade_api/rest.py", line 83, in raise_api_error
+    raise APIError(error, http_error) from None
+alpaca_trade_api.rest.APIError: request is not authorized
