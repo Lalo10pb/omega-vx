@@ -1325,6 +1325,12 @@ def start_auto_sell_monitor():
 
                     print(f"📊 {symbol}: Qty={qty} Entry=${entry_price:.2f} Now=${current_price:.2f} PnL={percent_change:.2f}%")
 
+                    # Cooldown guard (inserted)
+                    now_t = monotonic()
+                    last_t = _last_close_attempt.get(symbol, 0.0)
+                    if now_t - last_t < _CLOSE_COOLDOWN_SEC:
+                        continue
+
                     hit_trailing = percent_change <= -2.0
                     hit_take_profit = percent_change >= 5.0
                     hit_stop_loss = percent_change <= -3.5
@@ -1339,14 +1345,15 @@ def start_auto_sell_monitor():
                             reason += "Hard Stop Hit"
 
                         print(f"💥 {symbol} closing position — {reason}")
-
-                        try:
-                            close_order = trading_client.close_position(symbol)
+                        now_t = monotonic()
+                        ok = close_position_safely(symbol)  # cancels SELLs, then closes
+                        _last_close_attempt[symbol] = now_t  # start cooldown
+                        if ok:
                             print(f"✅ Position closed for {symbol}")
                             send_telegram_alert(f"💥 {symbol} auto-closed: {reason}")
-                        except Exception as e:
-                            print(f"❌ Failed to close {symbol}: {e}")
-                            send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
+                        else:
+                            print(f"⚠️ Safe close failed for {symbol}; will retry after cooldown.")
+                            send_telegram_alert(f"⚠️ Safe close failed for {symbol}; will retry after cooldown.")
 
             except Exception as monitor_error:
                 print(f"❌ Watchdog error: {monitor_error}")
