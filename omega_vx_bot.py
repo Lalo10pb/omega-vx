@@ -1208,8 +1208,16 @@ def submit_order_with_retries(
         time.sleep(10)
     else:
         print("⚠️ Could not attach protection after retries.")
-        try: send_telegram_alert(f"⚠️ {symbol} BUY placed, but protection not attached (watchdog will still run).")
-        except Exception: pass
+        try:
+            send_telegram_alert(f"⚠️ {symbol} BUY placed, but protection not attached (watchdog will still run).")
+        except Exception:
+            pass
+        # ---- protection failed but BUY succeeded ----
+        try:
+            log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed")
+            print("📝 Trade logged to CSV + Google Sheet (protection pending).")
+        except Exception as e:
+            print(f"⚠️ Trade log failed: {e}")
         return True  # BUY succeeded, protection pending
 
     # ---- Notify + log ----
@@ -1224,6 +1232,11 @@ def submit_order_with_retries(
     except Exception: pass
 
     print(f"✅ Order + protection finished for {symbol}.")
+    try:
+        log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed")
+        print("📝 Trade logged to CSV + Google Sheet.")
+    except Exception as e:
+        print(f"⚠️ Trade log failed: {e}")
     return True
 
 def log_portfolio_snapshot():
