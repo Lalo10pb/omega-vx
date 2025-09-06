@@ -169,6 +169,70 @@ OMEGA_MAX_OPEN_POSITIONS = int(str(os.getenv("OMEGA_MAX_OPEN_POSITIONS", "1")).s
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce
 
+# --- SAFE CLOSE FILL HELPERS ------------------------------------------------
+def _get_order_by_id(order_id: str):
+    try:
+        return trading_client.get_order_by_id(order_id)
+    except Exception as e:
+        print(f"⚠️ get_order_by_id failed {order_id}: {e}")
+        return None
+
+def poll_order_fill(order_id: str, timeout: int = 90, poll_secs: int = 2):
+    """
+    Poll an order until it has a filled quantity. Returns dict with
+    {'filled_qty': float, 'filled_avg_price': float|None}.
+    """
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        o = _get_order_by_id(order_id)
+        if o is not None:
+            status = str(getattr(o, "status", "")).lower()
+            filled_qty = float(getattr(o, "filled_qty", 0) or 0)
+            filled_avg_price = getattr(o, "filled_avg_price", None)
+            if status in ("filled", "partially_filled") and filled_qty > 0:
+                try:
+                    filled_avg_price = float(filled_avg_price)
+                except Exception:
+                    pass
+                return {"filled_qty": filled_qty, "filled_avg_price": filled_avg_price}
+        _t.sleep(poll_secs)
+    return {"filled_qty": 0.0, "filled_avg_price": None}
+
+def find_recent_sell_fill(symbol: str, lookback_sec: int = 240):
+    """
+    Find the most recent CLOSED SELL order for `symbol` within `lookback_sec`
+    and return its filled qty/avg price.
+    """
+    try:
+        since = datetime.now(timezone.utc) - timedelta(seconds=lookback_sec)
+        req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol])
+        orders = trading_client.get_orders(filter=req)
+        # newest first
+        orders = [o for o in orders if str(getattr(o, "side", "")).lower().endswith("sell")]
+        orders.sort(key=lambda o: getattr(o, "submitted_at", datetime.now(timezone.utc)), reverse=True)
+        for o in orders:
+            sub = getattr(o, "submitted_at", None)
+            try:
+                # normalize to aware UTC
+                if sub and sub.tzinfo is None:
+                    sub = sub.replace(tzinfo=timezone.utc)
+            except Exception:
+                sub = None
+            if sub and sub < since:
+                continue
+            fq = float(getattr(o, "filled_qty", 0) or 0)
+            favg = getattr(o, "filled_avg_price", None)
+            if fq > 0:
+                try:
+                    favg = float(favg)
+                except Exception:
+                    pass
+                return {"filled_qty": fq, "filled_avg_price": favg}
+    except Exception as e:
+        print(f"⚠️ find_recent_sell_fill error for {symbol}: {e}")
+    return {"filled_qty": 0.0, "filled_avg_price": None}
+
 def cancel_open_sells(symbol: str) -> int:
     """Cancel all OPEN sell orders (limit/stop) for symbol to avoid wash-trade rejects."""
     n = 0
@@ -193,6 +257,17 @@ def close_position_safely(symbol: str) -> bool:
       2) Wait briefly for cancels to settle
       3) Close position with a single market SELL (reduce‑only via close_position)
     """
+    # Capture pre-close position details
+    pre_qty = 0
+    pre_avg = None
+    try:
+        pos = [p for p in trading_client.get_all_positions() if p.symbol.upper() == symbol.upper()]
+        if pos:
+            pre_qty = int(float(pos[0].qty))
+            pre_avg = float(pos[0].avg_entry_price)
+    except Exception as _e:
+        pass
+
     # 1) cancel TP/SL first
     n = cancel_open_sells(symbol)
     if n:
@@ -208,6 +283,22 @@ def close_position_safely(symbol: str) -> bool:
         trading_client.close_position(symbol)  # Alpaca’s safe close
         print(f"✅ Requested close for {symbol} (market).")
         send_telegram_alert(f"✅ Closed {symbol} (safe close).")
+        # Try to find the resulting SELL fill and log realized P&L
+        try:
+            fill = find_recent_sell_fill(symbol, lookback_sec=240)
+            fqty = int(float(fill.get("filled_qty") or 0))
+            favg = fill.get("filled_avg_price")
+            realized = None
+            if pre_avg is not None and favg is not None and fqty > 0:
+                realized = (float(favg) - float(pre_avg)) * float(fqty)
+            try:
+                log_trade(symbol, fqty or pre_qty, pre_avg if pre_avg is not None else 0.0,
+                          None, None, status="closed", action="SELL",
+                          fill_price=favg, realized_pnl=realized)
+            except Exception as _le:
+                print(f"⚠️ Trade log (SELL) failed: {_le}")
+        except Exception as _fe:
+            print(f"⚠️ Could not backfill SELL fill for {symbol}: {_fe}")
         return True
     except Exception as e:
         # Fallback: explicit market SELL sized to position
@@ -220,11 +311,27 @@ def close_position_safely(symbol: str) -> bool:
             if qty <= 0:
                 print(f"ℹ️ Non‑positive qty for {symbol}; nothing to close.")
                 return True
-            trading_client.submit_order(MarketOrderRequest(
+            sell_order = trading_client.submit_order(MarketOrderRequest(
                 symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY
             ))
-            print(f"✅ Submitted market SELL {qty} {symbol} (fallback).")
+            info = {}
+            try:
+                info = poll_order_fill(sell_order.id, timeout=90, poll_secs=2)
+            except Exception as _:
+                info = {}
+            fqty = int(float(info.get("filled_qty") or qty or 0))
+            favg = info.get("filled_avg_price")
+            realized = None
+            if pre_avg is not None and favg is not None and fqty > 0:
+                realized = (float(favg) - float(pre_avg)) * float(fqty)
+            print(f"✅ Submitted market SELL {fqty} {symbol} (fallback).")
             send_telegram_alert(f"✅ Closed {symbol} with market SELL (fallback).")
+            try:
+                log_trade(symbol, fqty, pre_avg if pre_avg is not None else 0.0,
+                          None, None, status="closed", action="SELL",
+                          fill_price=favg, realized_pnl=realized)
+            except Exception as _le:
+                print(f"⚠️ Trade log (SELL) failed: {_le}")
             return True
         except Exception as e2:
             print(f"❌ Safe close failed for {symbol}: {e} / fallback: {e2}")
@@ -1164,9 +1271,15 @@ def submit_order_with_retries(
     from alpaca.trading.enums import OrderSide, TimeInForce
     try:
         print(f"🚀 Submitting BUY {symbol} x{qty} (market, GTC)")
-        trading_client.submit_order(MarketOrderRequest(
+        buy_order = trading_client.submit_order(MarketOrderRequest(
             symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC
         ))
+        buy_fill_price = None
+        try:
+            info = poll_order_fill(buy_order.id, timeout=90, poll_secs=2)
+            buy_fill_price = info.get("filled_avg_price")
+        except Exception as _:
+            buy_fill_price = None
     except Exception as e:
         print("🧨 BUY submit failed:", e)
         try: send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
@@ -1214,7 +1327,8 @@ def submit_order_with_retries(
             pass
         # ---- protection failed but BUY succeeded ----
         try:
-            log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed")
+            log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed",
+                      action="BUY", fill_price=buy_fill_price, realized_pnl=None)
             print("📝 Trade logged to CSV + Google Sheet (protection pending).")
         except Exception as e:
             print(f"⚠️ Trade log failed: {e}")
@@ -1233,7 +1347,8 @@ def submit_order_with_retries(
 
     print(f"✅ Order + protection finished for {symbol}.")
     try:
-        log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed")
+        log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed",
+                  action="BUY", fill_price=buy_fill_price, realized_pnl=None)
         print("📝 Trade logged to CSV + Google Sheet.")
     except Exception as e:
         print(f"⚠️ Trade log failed: {e}")
@@ -1423,7 +1538,7 @@ def is_ai_mood_bad():
         print("⚠️ AI Mood check failed:", e)
         return False
 
-def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
+def log_trade(symbol, qty, entry, stop_loss, take_profit, status, action=None, fill_price=None, realized_pnl=None):
     explanation = generate_trade_explanation(
         symbol=symbol,
         entry=entry,
@@ -1480,7 +1595,10 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
         "explanation": explanation,
         "context_time_of_day": context_time,
         "context_recent_outcome": context_recent_outcome,
-        "context_equity_change": context_equity_change
+        "context_equity_change": context_equity_change,
+        "action": action,
+        "fill_price": fill_price,
+        "realized_pnl": realized_pnl
     }
 
     df = pd.DataFrame([trade_data])
@@ -1503,7 +1621,8 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status):
 
         sheet.append_row([
             timestamp_str, symbol, qty, entry, stop_loss, take_profit,
-            status, explanation, context_time, context_recent_outcome, context_equity_change
+            status, explanation, context_time, context_recent_outcome, context_equity_change,
+            action, fill_price, realized_pnl
         ])
         print("✅ Trade logged to Google Sheet.")
 
