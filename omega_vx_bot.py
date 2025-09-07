@@ -1598,7 +1598,7 @@ def append_daily_performance_row(metrics: dict, sheet_id: str = None, tab_name: 
         except Exception:
             existing = []
         if not existing:
-            ws.update('A1', [header])
+            ws.update(values=[header], range_name='A1')
         row = [
             metrics.get('date'),
             f"{metrics.get('total_realized_pnl', 0.0):.2f}",
@@ -1648,7 +1648,7 @@ def update_google_performance_sheet(metrics: dict, sheet_id: str = None, tab_nam
             ws.clear()
         except Exception:
             pass
-        ws.update('A1', rows)
+        ws.update(values=rows, range_name='A1')
         print("✅ Performance sheet updated.")
     except Exception as e:
         print(f"⚠️ Failed to update performance sheet: {e}")
@@ -1695,7 +1695,7 @@ def push_open_positions_to_sheet():
         header = ["symbol","qty","avg_entry","current","pnl_pct","tp","sl","updated_at"]
         rows = [header]
         positions = trading_client.get_all_positions()
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         for p in positions:
             symbol = p.symbol
             qty = int(float(p.qty))
@@ -1708,7 +1708,7 @@ def push_open_positions_to_sheet():
             ws.clear()
         except Exception:
             pass
-        ws.update('A1', rows)
+        ws.update(values=rows, range_name='A1')
         print(f"✅ Open positions pushed ({len(rows)-1} rows).")
     except Exception as e:
         print(f"⚠️ Open positions push failed: {e}")
@@ -1738,7 +1738,7 @@ def start_eod_summary_scheduler():
         print(f"🕗 EOD summary scheduler active (UTC hour={EOD_SUMMARY_HOUR_UTC}, tab='{PERF_DAILY_TAB}')")
         while True:
             try:
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 should_run = now.hour == EOD_SUMMARY_HOUR_UTC
                 last_day = None
                 if os.path.exists(last_file):
