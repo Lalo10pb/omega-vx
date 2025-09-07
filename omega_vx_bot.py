@@ -56,12 +56,18 @@ SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/au
 
 PAPER_MODE = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1", "true", "yes")
 
+
 # --- Alpaca Data Feed selection (force IEX to avoid SIP permission errors) ---
 _DATA_FEED = DataFeed.IEX
 try:
     print("📡 Alpaca data feed: iex (forced)")
 except Exception:
     pass
+
+# --- Early env sanitizer (must be defined before any top-level uses) ---
+def _clean_env(s: str) -> str:
+    """Trim whitespace and surrounding quotes from environment variables."""
+    return str(s or "").strip().strip('"').strip("'")
 
 # --- Google Sheets Helper for Flexible Auth ---
 def _get_gspread_client():
@@ -400,10 +406,6 @@ def send_telegram_alert(message: str):
             print(f"⚠️ Telegram send failed: {r.status_code} {r.text}")
     except Exception as e:
         print(f"❌ Telegram alert error: {e}")
-
-def _clean_env(s: str) -> str:
-    """Trim whitespace and surrounding quotes from environment variables."""
-    return str(s or "").strip().strip('"').strip("'")
 
 def get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist"):
     """
