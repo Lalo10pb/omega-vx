@@ -1068,12 +1068,20 @@ def send_email(subject, body):
 def get_equity_slope():
     try:
         path = os.path.join(LOG_DIR, "equity_curve.log")
-        df = pd.read_csv(path, names=["timestamp", "equity"], delim_whitespace=True, engine='python')
-        df["equity"] = df["equity"].str.replace("EQUITY:", "").str.replace("$", "").astype(float)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], format="[%Y-%m-%d")
-        if len(df) < 5:
+        if not os.path.exists(path):
             return 0
-        slope = (df["equity"].iloc[-1] - df["equity"].iloc[-5]) / 5
+        values = []
+        with open(path, "r") as f:
+            for line in f:
+                parts = line.strip().split("EQUITY:")
+                if len(parts) == 2:
+                    try:
+                        values.append(float(parts[1].replace("$", "").strip()))
+                    except Exception:
+                        pass
+        if len(values) < 5:
+            return 0
+        slope = (values[-1] - values[-5]) / 5
         return slope
     except Exception as e:
         print(f"❌ Failed to analyze equity slope: {e}")
@@ -1437,6 +1445,94 @@ def send_weekly_summary():
         print(f"⚠️ Weekly summary failed: {e}")
         send_telegram_alert(f"⚠️ Weekly summary failed: {e}")
 
+def summarize_pnl_from_csv(path: str = TRADE_LOG_PATH) -> dict:
+    """Compute realized P&L stats from local trade_log.csv using SELL rows with numeric realized_pnl."""
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        print(f"⚠️ Unable to read trade log for summary: {e}")
+        return {
+            "total_realized_pnl": 0.0,
+            "trades_closed": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate_pct": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "best": 0.0,
+            "worst": 0.0,
+        }
+
+    if 'realized_pnl' not in df.columns:
+        df['realized_pnl'] = np.nan
+    if 'action' not in df.columns:
+        df['action'] = None
+
+    sells = df[df['action'].astype(str).str.upper() == 'SELL'].copy()
+    sells['realized_pnl'] = pd.to_numeric(sells['realized_pnl'], errors='coerce')
+    sells = sells.dropna(subset=['realized_pnl'])
+
+    total = float(sells['realized_pnl'].sum()) if not sells.empty else 0.0
+    wins_mask = sells['realized_pnl'] > 0
+    losses_mask = sells['realized_pnl'] <= 0
+    wins = int(wins_mask.sum())
+    losses = int(losses_mask.sum())
+    count = int(len(sells))
+    win_rate = (wins / count * 100.0) if count else 0.0
+    avg_win = float(sells.loc[wins_mask, 'realized_pnl'].mean() or 0.0)
+    avg_loss = float(sells.loc[losses_mask, 'realized_pnl'].mean() or 0.0)
+    best = float(sells['realized_pnl'].max()) if count else 0.0
+    worst = float(sells['realized_pnl'].min()) if count else 0.0
+
+    return {
+        "total_realized_pnl": round(total, 2),
+        "trades_closed": count,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(win_rate, 2),
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "best": round(best, 2),
+        "worst": round(worst, 2),
+    }
+
+
+def update_google_performance_sheet(metrics: dict, sheet_id: str = None, tab_name: str = None) -> None:
+    """Write key P&amp;L metrics to a dedicated Google Sheet tab (default: 'Performance')."""
+    try:
+        client = _get_gspread_client()
+        sid = _clean_env(sheet_id or os.getenv("GOOGLE_SHEET_ID"))
+        tab = _clean_env(tab_name or os.getenv("PERF_SHEET_NAME") or "Performance")
+        if not sid:
+            print("⚠️ No GOOGLE_SHEET_ID configured; skipping Performance sheet update.")
+            return
+        ss = client.open_by_key(sid)
+        try:
+            ws = ss.worksheet(tab)
+        except Exception:
+            ws = ss.add_worksheet(title=tab, rows=50, cols=4)
+
+        rows = [
+            ["Metric", "Value"],
+            ["Total Realized PnL", f"{metrics.get('total_realized_pnl', 0.0):.2f}"],
+            ["Trades Closed", str(metrics.get('trades_closed', 0))],
+            ["Wins", str(metrics.get('wins', 0))],
+            ["Losses", str(metrics.get('losses', 0))],
+            ["Win Rate %", f"{metrics.get('win_rate_pct', 0.0):.2f}"],
+            ["Avg Win", f"{metrics.get('avg_win', 0.0):.2f}"],
+            ["Avg Loss", f"{metrics.get('avg_loss', 0.0):.2f}"],
+            ["Best Trade", f"{metrics.get('best', 0.0):.2f}"],
+            ["Worst Trade", f"{metrics.get('worst', 0.0):.2f}"],
+        ]
+        try:
+            ws.clear()
+        except Exception:
+            pass
+        ws.update('A1', rows)
+        print("✅ Performance sheet updated.")
+    except Exception as e:
+        print(f"⚠️ Failed to update performance sheet: {e}")
+
 def start_auto_sell_monitor():
     def monitor():
         while True:
@@ -1478,6 +1574,12 @@ def start_auto_sell_monitor():
                         _last_close_attempt[symbol] = now_t  # start cooldown
                         if ok:
                             print(f"✅ Position closed for {symbol}")
+                            # Update Performance sheet after a realized SELL is logged
+                            try:
+                                metrics = summarize_pnl_from_csv(TRADE_LOG_PATH)
+                                update_google_performance_sheet(metrics)
+                            except Exception as perf_e:
+                                print(f"⚠️ Performance update failed: {perf_e}")
                             send_telegram_alert(f"💥 {symbol} auto-closed: {reason}")
                         else:
                             print(f"⚠️ Safe close failed for {symbol}; will retry after cooldown.")
@@ -1628,6 +1730,14 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status, action=None, f
 
     except Exception as e:
         print("⚠️ Failed to log trade to Google Sheet:", e)
+
+    # === Update Performance sheet on SELL/close ===
+    try:
+        if str(action).upper() == 'SELL' or str(status).lower() in ('closed', 'sell'):
+            metrics = summarize_pnl_from_csv(TRADE_LOG_PATH)
+            update_google_performance_sheet(metrics)
+    except Exception as perf_e:
+        print(f"⚠️ Performance update failed: {perf_e}")
 
 from time import monotonic
 
