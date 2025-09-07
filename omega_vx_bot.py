@@ -165,6 +165,21 @@ OMEGA_AUTOSCAN_DRYRUN = str(os.getenv("OMEGA_AUTOSCAN_DRYRUN", "0")).strip().low
 OMEGA_SCAN_INTERVAL_SEC = int(str(os.getenv("OMEGA_SCAN_INTERVAL_SEC", "120")).strip() or "120")
 OMEGA_MAX_OPEN_POSITIONS = int(str(os.getenv("OMEGA_MAX_OPEN_POSITIONS", "1")).strip() or "1")
 
+# --- Weekend Improvements Config -------------------------------------------
+# End‑of‑Day (EOD) summary appender
+EOD_SUMMARY = str(os.getenv("EOD_SUMMARY", "1")).strip().lower() in ("1","true","yes","y","on")
+EOD_SUMMARY_HOUR_UTC = int(str(os.getenv("EOD_SUMMARY_HOUR_UTC", "20")).strip() or "20")  # default 20:00 UTC
+PERF_DAILY_TAB = _clean_env(os.getenv("PERF_DAILY_TAB") or "Performance Daily")
+
+# Open Positions → Google Sheet pusher
+OPEN_POSITIONS_PUSH = str(os.getenv("OPEN_POSITIONS_PUSH", "1")).strip().lower() in ("1","true","yes","y","on")
+OPEN_POSITIONS_TAB = _clean_env(os.getenv("OPEN_POSITIONS_TAB") or "Open Positions")
+OPEN_POSITIONS_INTERVAL = int(str(os.getenv("OPEN_POSITIONS_INTERVAL", "90")).strip() or "90")
+
+# Stray order janitor (cleans SELLs when no position)
+ORDER_JANITOR = str(os.getenv("ORDER_JANITOR", "1")).strip().lower() in ("1","true","yes","y","on")
+ORDER_JANITOR_INTERVAL = int(str(os.getenv("ORDER_JANITOR_INTERVAL", "180")).strip() or "180")
+
 # --- SAFE CLOSE HELPERS -------------------------------------------------------
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
 from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce
@@ -1497,6 +1512,109 @@ def summarize_pnl_from_csv(path: str = TRADE_LOG_PATH) -> dict:
     }
 
 
+# === Weekend Improvements: Daily PnL, Google Sheet Appends ===
+from datetime import date as _date
+
+def _read_trades_df(path: str = TRADE_LOG_PATH) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(path)
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        return df
+    except Exception as e:
+        print(f"⚠️ Unable to read trade log: {e}")
+        return pd.DataFrame()
+
+
+def summarize_realized_pnl_for_day(day: _date = None, path: str = TRADE_LOG_PATH) -> dict:
+    """Realized PnL for a given calendar day (UTC), using SELL rows with numeric realized_pnl."""
+    day = day or _date.today()
+    df = _read_trades_df(path)
+    if df.empty:
+        return {
+            "date": str(day),
+            "total_realized_pnl": 0.0,
+            "trades_closed": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate_pct": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "best": 0.0,
+            "worst": 0.0,
+        }
+    if 'action' not in df.columns:
+        df['action'] = None
+    df['realized_pnl'] = pd.to_numeric(df.get('realized_pnl'), errors='coerce')
+    df_day = df[(df['action'].astype(str).str.upper() == 'SELL') & (df['timestamp'].dt.date == day)]
+    df_day = df_day.dropna(subset=['realized_pnl'])
+    total = float(df_day['realized_pnl'].sum()) if not df_day.empty else 0.0
+    wins_mask = df_day['realized_pnl'] > 0
+    losses_mask = df_day['realized_pnl'] <= 0
+    wins = int(wins_mask.sum())
+    losses = int(losses_mask.sum())
+    count = int(len(df_day))
+    win_rate = (wins / count * 100.0) if count else 0.0
+    avg_win = float(df_day.loc[wins_mask, 'realized_pnl'].mean() or 0.0)
+    avg_loss = float(df_day.loc[losses_mask, 'realized_pnl'].mean() or 0.0)
+    best = float(df_day['realized_pnl'].max()) if count else 0.0
+    worst = float(df_day['realized_pnl'].min()) if count else 0.0
+    return {
+        "date": str(day),
+        "total_realized_pnl": round(total, 2),
+        "trades_closed": count,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(win_rate, 2),
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "best": round(best, 2),
+        "worst": round(worst, 2),
+    }
+
+
+def append_daily_performance_row(metrics: dict, sheet_id: str = None, tab_name: str = None) -> None:
+    """Append a dated row to a Google Sheet tab (default: 'Performance Daily')."""
+    try:
+        client = _get_gspread_client()
+        sid = _clean_env(sheet_id or os.getenv("GOOGLE_SHEET_ID"))
+        tab = _clean_env(tab_name or PERF_DAILY_TAB or "Performance Daily")
+        if not sid:
+            print("⚠️ No GOOGLE_SHEET_ID configured; skipping Performance append.")
+            return
+        ss = client.open_by_key(sid)
+        try:
+            ws = ss.worksheet(tab)
+        except Exception:
+            ws = ss.add_worksheet(title=tab, rows=100, cols=10)
+        header = [
+            "Date","Total Realized PnL","Trades Closed","Wins","Losses",
+            "Win Rate %","Avg Win","Avg Loss","Best","Worst"
+        ]
+        try:
+            existing = ws.get_all_values()[:1]
+        except Exception:
+            existing = []
+        if not existing:
+            ws.update('A1', [header])
+        row = [
+            metrics.get('date'),
+            f"{metrics.get('total_realized_pnl', 0.0):.2f}",
+            str(metrics.get('trades_closed', 0)),
+            str(metrics.get('wins', 0)),
+            str(metrics.get('losses', 0)),
+            f"{metrics.get('win_rate_pct', 0.0):.2f}",
+            f"{metrics.get('avg_win', 0.0):.2f}",
+            f"{metrics.get('avg_loss', 0.0):.2f}",
+            f"{metrics.get('best', 0.0):.2f}",
+            f"{metrics.get('worst', 0.0):.2f}",
+        ]
+        ws.append_row(row)
+        print("✅ Appended daily performance row.")
+    except Exception as e:
+        print(f"⚠️ Failed to append performance row: {e}")
+
+
 def update_google_performance_sheet(metrics: dict, sheet_id: str = None, tab_name: str = None) -> None:
     """Write key P&amp;L metrics to a dedicated Google Sheet tab (default: 'Performance')."""
     try:
@@ -1532,6 +1650,153 @@ def update_google_performance_sheet(metrics: dict, sheet_id: str = None, tab_nam
         print("✅ Performance sheet updated.")
     except Exception as e:
         print(f"⚠️ Failed to update performance sheet: {e}")
+
+
+# --- Weekend Improvements: Open Positions helpers & EOD/Janitor schedulers ---
+from collections import defaultdict
+
+def get_symbol_tp_sl_open_orders(symbol: str):
+    """Return (tp_limit, sl_stop) from current OPEN SELL orders, if present."""
+    tp, sl = None, None
+    try:
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        for o in trading_client.get_orders(filter=req):
+            side = str(getattr(o, 'side', '')).lower()
+            if not side.endswith('sell'):
+                continue
+            otype = str(getattr(o, 'type', '')).lower()
+            if otype == 'limit':
+                try: tp = float(getattr(o, 'limit_price', tp))
+                except Exception: pass
+            elif otype == 'stop':
+                try: sl = float(getattr(o, 'stop_price', sl))
+                except Exception: pass
+    except Exception as e:
+        print(f"⚠️ get_symbol_tp_sl_open_orders failed for {symbol}: {e}")
+    return tp, sl
+
+
+def push_open_positions_to_sheet():
+    """Write current open positions to Google Sheet tab (clears & replaces)."""
+    try:
+        client = _get_gspread_client()
+        sid = _clean_env(os.getenv('GOOGLE_SHEET_ID'))
+        tab = OPEN_POSITIONS_TAB
+        if not sid:
+            print("⚠️ No GOOGLE_SHEET_ID configured; skip Open Positions push.")
+            return
+        ss = client.open_by_key(sid)
+        try:
+            ws = ss.worksheet(tab)
+        except Exception:
+            ws = ss.add_worksheet(title=tab, rows=200, cols=10)
+        header = ["symbol","qty","avg_entry","current","pnl_pct","tp","sl","updated_at"]
+        rows = [header]
+        positions = trading_client.get_all_positions()
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        for p in positions:
+            symbol = p.symbol
+            qty = int(float(p.qty))
+            avg_entry = float(p.avg_entry_price)
+            current = float(p.current_price)
+            pnl_pct = float(p.unrealized_plpc) * 100.0
+            tp, sl = get_symbol_tp_sl_open_orders(symbol)
+            rows.append([symbol, qty, round(avg_entry,2), round(current,2), round(pnl_pct,2), tp, sl, now])
+        try:
+            ws.clear()
+        except Exception:
+            pass
+        ws.update('A1', rows)
+        print(f"✅ Open positions pushed ({len(rows)-1} rows).")
+    except Exception as e:
+        print(f"⚠️ Open positions push failed: {e}")
+
+
+def start_open_positions_pusher():
+    if not OPEN_POSITIONS_PUSH:
+        print("📄 Open Positions pusher disabled.")
+        return
+    def _loop():
+        print(f"📄 Open Positions → Google Sheet every {OPEN_POSITIONS_INTERVAL}s → tab '{OPEN_POSITIONS_TAB}'")
+        while True:
+            try:
+                push_open_positions_to_sheet()
+            except Exception as e:
+                print(f"⚠️ Pusher error: {e}")
+            time.sleep(OPEN_POSITIONS_INTERVAL)
+    threading.Thread(target=_loop, daemon=True).start()
+
+
+def start_eod_summary_scheduler():
+    if not EOD_SUMMARY:
+        print("🕗 EOD summary disabled.")
+        return
+    last_file = os.path.join(LOG_DIR, 'eod_last_run.txt')
+    def _loop():
+        print(f"🕗 EOD summary scheduler active (UTC hour={EOD_SUMMARY_HOUR_UTC}, tab='{PERF_DAILY_TAB}')")
+        while True:
+            try:
+                now = datetime.utcnow()
+                should_run = now.hour == EOD_SUMMARY_HOUR_UTC
+                last_day = None
+                if os.path.exists(last_file):
+                    try:
+                        with open(last_file, 'r') as f:
+                            last_day = f.read().strip()
+                    except Exception:
+                        last_day = None
+                already_ran_today = (last_day == now.strftime('%Y-%m-%d'))
+                if should_run and not already_ran_today:
+                    metrics = summarize_realized_pnl_for_day(now.date())
+                    append_daily_performance_row(metrics)
+                    try:
+                        send_telegram_alert(
+                            f"📬 EOD summary appended for {metrics['date']}: PnL ${metrics['total_realized_pnl']:.2f} (win rate {metrics['win_rate_pct']:.1f}%)"
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        with open(last_file, 'w') as f:
+                            f.write(now.strftime('%Y-%m-%d'))
+                    except Exception:
+                        pass
+                time.sleep(60)
+            except Exception as e:
+                print(f"⚠️ EOD scheduler error: {e}")
+                time.sleep(60)
+    threading.Thread(target=_loop, daemon=True).start()
+
+
+def start_order_janitor():
+    if not ORDER_JANITOR:
+        print("🧹 Order janitor disabled.")
+        return
+    def _loop():
+        print(f"🧹 Order janitor running every {ORDER_JANITOR_INTERVAL}s …")
+        while True:
+            try:
+                pos_symbols = {p.symbol for p in trading_client.get_all_positions()}
+                req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+                open_orders = trading_client.get_orders(filter=req)
+                cancelled = 0
+                for o in open_orders:
+                    side = str(getattr(o, 'side','')).lower()
+                    sym = getattr(o, 'symbol', None)
+                    if sym and side.endswith('sell') and sym not in pos_symbols:
+                        try:
+                            trading_client.cancel_order_by_id(o.id)
+                            cancelled += 1
+                        except Exception as ce:
+                            print(f"⚠️ Cancel failed {sym}/{o.id}: {ce}")
+                if cancelled:
+                    msg = f"🧹 Cancelled {cancelled} stray SELL order(s) on symbols without positions."
+                    print(msg)
+                    try: send_telegram_alert(msg)
+                    except Exception: pass
+            except Exception as e:
+                print(f"⚠️ Janitor error: {e}")
+            time.sleep(ORDER_JANITOR_INTERVAL)
+    threading.Thread(target=_loop, daemon=True).start()
 
 def start_auto_sell_monitor():
     def monitor():
@@ -2001,6 +2266,11 @@ if __name__ == "__main__":
     start_auto_sell_monitor()
     # start autoscan if enabled
     start_autoscan_thread()
+
+    # --- start weekend‑improvement services ---
+    start_open_positions_pusher()
+    start_eod_summary_scheduler()
+    start_order_janitor()
 
     # --- start Flask without the reloader (prevents port conflicts) ---
     try:
