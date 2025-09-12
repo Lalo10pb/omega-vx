@@ -2137,4 +2137,19 @@ def place_split_protection(
     except Exception as e:
         print(f"⚠️ SL place failed for {symbol}: {e}")
 
-    return ok_any
+    return ok_anyif __name__ == "__main__":
+    # one-time boot notification
+    try:
+        handle_restart_notification()
+    except Exception:
+        pass
+
+    # background services
+    start_open_positions_pusher()
+    start_eod_summary_scheduler()
+    start_order_janitor()
+    start_auto_sell_monitor()
+
+    # required for Render
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
