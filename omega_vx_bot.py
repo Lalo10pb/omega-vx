@@ -29,7 +29,7 @@ from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.data.enums import DataFeed
-from datetime import datetime, timedelta, timezone  # add timezone
+from datetime import datetime, timedelta, time as dt_time, timezone
 # === Email Reporting ===
 import smtplib
 from email.message import EmailMessage
@@ -2068,29 +2068,34 @@ def place_split_protection(
     fully settled yet and qty_available == 0, return False so the caller can retry.
     """
     try:
-        # 0) Cancel any existing SELLs to avoid qty conflicts
+        # cancel any existing SELLs
         try:
             n = cancel_open_sells(symbol)
             if n:
-                print(f"🧹 Cancelled {n} open SELL(s) on {symbol} before attaching protection.")
-        except Exception as ce:
-            print(f"⚠️ Could not pre-cancel SELLs on {symbol}: {ce}")
-        import time as _t
-        _t.sleep(0.8)  # allow exchange to settle cancels
+                print(f"🧹 Cancelled {n} open SELL orders for {symbol} before attaching protection.")
+        except Exception as e:
+            print(f"⚠️ Pre-cancel SELLs failed for {symbol}: {e}")
 
-        # 1) Determine available quantity (reduce-only via qty sizing)
-        qty_av = _get_available_qty(symbol)
-        if qty_av <= 0:
-            # BUY leg likely not fully settled yet — caller should retry
-            print(f"⏳ No qty_available yet for {symbol}; will retry.")
+        qty_available = 0.0
+        try:
+            positions = trading_client.get_all_positions()
+            for p in positions:
+                if p.symbol.upper() == symbol.upper():
+                    qty_available = float(getattr(p, "qty_available", getattr(p, "qty", "0")))
+                    break
+        except Exception as e:
+            print(f"⚠️ Could not fetch positions for protection on {symbol}: {e}")
+
+        qty = int(float(qty_available or 0))
+        if qty <= 0:
+            print(f"⏳ qty_available=0 for {symbol}; delaying protection attach.")
             return False
-        qty = int(qty_av)
 
-        # 2) Derive TP/SL if not provided
+        # fetch current price if needed
         if tp_price is None or sl_price is None:
-            from alpaca.data.requests import StockLatestQuoteRequest
             last_px = None
             try:
+                from alpaca.data.requests import StockLatestQuoteRequest
                 req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=_DATA_FEED)
                 q = data_client.get_stock_latest_quote(req)
                 last_px = float(q[symbol].ask_price or q[symbol].bid_price)
@@ -2101,67 +2106,46 @@ def place_split_protection(
                         q = data_client.get_stock_latest_quote(req)
                         last_px = float(q[symbol].ask_price or q[symbol].bid_price)
                     except Exception as e2:
-                        print(f"⚠️ Fallback quote failed for {symbol}: {e2}")
+                        print(f"⚠️ Quote fallback failed for {symbol}: {e2}")
                 else:
                     print(f"⚠️ Quote fetch failed for {symbol}: {e}")
-            if last_px is None or last_px <= 0:
-                # As a last resort, use position price if available
-                try:
-                    for p in trading_client.get_all_positions():
-                        if p.symbol.upper() == symbol.upper():
-                            last_px = float(p.current_price)
-                            break
-                except Exception:
-                    last_px = None
-            if last_px is None or last_px <= 0:
-                print(f"⚠️ No valid reference price for {symbol}; cannot compute TP/SL.")
-                return False
+            if not last_px or last_px <= 0:
+                last_px = 0.01
             if tp_price is None:
-                tp_price = round(last_px * (1.0 + float(tp_pct)), 2)
+                tp_price = round(last_px * (1 + float(tp_pct)), 2)
             if sl_price is None:
-                sl_price = round(last_px * (1.0 - float(sl_pct)), 2)
+                sl_price = round(last_px * (1 - float(sl_pct)), 2)
 
-        # 3) Sanity: ensure SL < TP
-        try:
-            if float(sl_price) >= float(tp_price):
-                mid = (float(tp_price) + float(sl_price)) / 2.0
-                tp_price = round(mid * 1.02, 2)
-                sl_price = round(mid * 0.98, 2)
-        except Exception:
-            pass
+        tp_price = float(tp_price)
+        sl_price = float(sl_price)
 
-        # 4) Submit TP limit and SL stop — GTC
-        try:
-            tp_req = LimitOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.SELL,
-                limit_price=float(tp_price),
-                time_in_force=TimeInForce.GTC
-            )
-            trading_client.submit_order(order_data=tp_req)
-        except Exception as e:
-            print(f"⚠️ Failed to place TP limit on {symbol} @ {tp_price}: {e}")
-            # continue to try SL
+        # place TP limit
+        trading_client.submit_order(LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            limit_price=tp_price,
+            time_in_force=TimeInForce.GTC
+        ))
+        print(f"✅ TP limit placed for {symbol}: qty={qty} @ {tp_price}")
 
-        try:
-            sl_req = StopOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.SELL,
-                stop_price=float(sl_price),
-                time_in_force=TimeInForce.GTC
-            )
-            trading_client.submit_order(order_data=sl_req)
-        except Exception as e:
-            print(f"⚠️ Failed to place SL stop on {symbol} @ {sl_price}: {e}")
+        # place SL stop
+        trading_client.submit_order(StopOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            stop_price=sl_price,
+            time_in_force=TimeInForce.GTC
+        ))
+        print(f"✅ SL stop placed for {symbol}: qty={qty} @ {sl_price}")
 
-        print(f"🔐 Protection attached for {symbol}: TP={tp_price} SL={sl_price} qty={qty}")
+        print(f"🔐 Protection attached for {symbol}: TP {tp_price} | SL {sl_price}")
         return True
-    except Exception as e:
-        print(f"❌ place_split_protection error for {symbol}: {e}")
-        return False
 
+    except Exception as e:
+        print(f"⚠️ place_split_protection failed for {symbol}: {e}")
+        return False
+    
 if __name__ == "__main__":
     try:
         handle_restart_notification()
