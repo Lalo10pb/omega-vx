@@ -2072,68 +2072,108 @@ def place_split_protection(
         try:
             n = cancel_open_sells(symbol)
             if n:
-                print(f"🧹 Cancelled {n} existing SELLs for {symbol} before attaching protection.")
+                print(f"🧹 Cancelled {n} open SELL(s) on {symbol} before attaching protection.")
         except Exception as ce:
-            print(f"⚠️ Pre-cancel SELLs failed for {symbol}: {ce}")
+            print(f"⚠️ Could not pre-cancel SELLs on {symbol}: {ce}")
+        import time as _t
+        _t.sleep(0.8)  # allow exchange to settle cancels
 
-        # 1) Check qty_available — if zero, caller should retry later
-        qty_avail = _get_available_qty(symbol)
-        if qty_avail <= 0:
-            print(f"⏳ qty_available is 0 for {symbol}; protection will retry later.")
+        # 1) Determine available quantity (reduce-only via qty sizing)
+        qty_av = _get_available_qty(symbol)
+        if qty_av <= 0:
+            # BUY leg likely not fully settled yet — caller should retry
+            print(f"⏳ No qty_available yet for {symbol}; will retry.")
             return False
+        qty = int(qty_av)
 
-        # 2) Determine reference price for defaults if needed
-        ref_px = None
-        try:
-            req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=_DATA_FEED)
-            q = data_client.get_stock_latest_quote(req)
-            ref_px = float(q[symbol].ask_price or q[symbol].bid_price)
-        except Exception as e_q:
-            print(f"⚠️ Quote fetch for protection failed ({symbol}): {e_q}")
-            try:
-                pos = [p for p in trading_client.get_all_positions() if p.symbol.upper() == symbol.upper()]
-                if pos:
-                    ref_px = float(pos[0].current_price)
-            except Exception:
-                pass
-
-        if ref_px and (tp_price is None or sl_price is None):
-            if tp_price is None:
-                tp_price = round(ref_px * (1.0 + tp_pct), 2)
-            if sl_price is None:
-                sl_price = round(ref_px * (1.0 - sl_pct), 2)
-
+        # 2) Derive TP/SL if not provided
         if tp_price is None or sl_price is None:
-            print(f"⚠️ Could not determine TP/SL for {symbol}; skipping protection attach.")
-            return False
+            from alpaca.data.requests import StockLatestQuoteRequest
+            last_px = None
+            try:
+                req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=_DATA_FEED)
+                q = data_client.get_stock_latest_quote(req)
+                last_px = float(q[symbol].ask_price or q[symbol].bid_price)
+            except Exception as e:
+                if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
+                    try:
+                        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
+                        q = data_client.get_stock_latest_quote(req)
+                        last_px = float(q[symbol].ask_price or q[symbol].bid_price)
+                    except Exception as e2:
+                        print(f"⚠️ Fallback quote failed for {symbol}: {e2}")
+                else:
+                    print(f"⚠️ Quote fetch failed for {symbol}: {e}")
+            if last_px is None or last_px <= 0:
+                # As a last resort, use position price if available
+                try:
+                    for p in trading_client.get_all_positions():
+                        if p.symbol.upper() == symbol.upper():
+                            last_px = float(p.current_price)
+                            break
+                except Exception:
+                    last_px = None
+            if last_px is None or last_px <= 0:
+                print(f"⚠️ No valid reference price for {symbol}; cannot compute TP/SL.")
+                return False
+            if tp_price is None:
+                tp_price = round(last_px * (1.0 + float(tp_pct)), 2)
+            if sl_price is None:
+                sl_price = round(last_px * (1.0 - float(sl_pct)), 2)
 
-        # 3) Place TP limit
+        # 3) Sanity: ensure SL < TP
         try:
-            trading_client.submit_order(LimitOrderRequest(
-                symbol=symbol,
-                qty=qty_avail,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-                limit_price=float(tp_price)
-            ))
-            print(f"🔐 TP limit placed @ {tp_price} for {symbol} x{qty_avail}")
-        except Exception as e_tp:
-            print(f"⚠️ Failed to place TP for {symbol}: {e_tp}")
+            if float(sl_price) >= float(tp_price):
+                mid = (float(tp_price) + float(sl_price)) / 2.0
+                tp_price = round(mid * 1.02, 2)
+                sl_price = round(mid * 0.98, 2)
+        except Exception:
+            pass
 
-        # 4) Place SL stop
+        # 4) Submit TP limit and SL stop — GTC
         try:
-            trading_client.submit_order(StopOrderRequest(
+            tp_req = LimitOrderRequest(
                 symbol=symbol,
-                qty=qty_avail,
+                qty=qty,
                 side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-                stop_price=float(sl_price)
-            ))
-            print(f"🔐 SL stop placed @ {sl_price} for {symbol} x{qty_avail}")
-        except Exception as e_sl:
-            print(f"⚠️ Failed to place SL for {symbol}: {e_sl}")
+                limit_price=float(tp_price),
+                time_in_force=TimeInForce.GTC
+            )
+            trading_client.submit_order(order_data=tp_req)
+        except Exception as e:
+            print(f"⚠️ Failed to place TP limit on {symbol} @ {tp_price}: {e}")
+            # continue to try SL
 
+        try:
+            sl_req = StopOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                stop_price=float(sl_price),
+                time_in_force=TimeInForce.GTC
+            )
+            trading_client.submit_order(order_data=sl_req)
+        except Exception as e:
+            print(f"⚠️ Failed to place SL stop on {symbol} @ {sl_price}: {e}")
+
+        print(f"🔐 Protection attached for {symbol}: TP={tp_price} SL={sl_price} qty={qty}")
         return True
     except Exception as e:
         print(f"❌ place_split_protection error for {symbol}: {e}")
         return False
+
+if __name__ == "__main__":
+    try:
+        handle_restart_notification()
+    except Exception:
+        pass
+
+    # background services
+    start_open_positions_pusher()
+    start_eod_summary_scheduler()
+    start_order_janitor()
+    start_auto_sell_monitor()
+
+    # required for Render
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
