@@ -2137,7 +2137,9 @@ def place_split_protection(
     except Exception as e:
         print(f"⚠️ SL place failed for {symbol}: {e}")
 
-    return ok_anyif __name__ == "__main__":
+        return ok_any
+
+if __name__ == "__main__":
     # one-time boot notification
     try:
         handle_restart_notification()
