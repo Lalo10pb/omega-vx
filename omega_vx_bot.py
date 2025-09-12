@@ -2056,7 +2056,6 @@ def close_position_if_needed(symbol: str, reason: str) -> bool:
         return False
 
 def place_split_protection(
-def place_split_protection(
     symbol: str,
     tp_price: float = None,
     sl_price: float = None,
@@ -2064,7 +2063,7 @@ def place_split_protection(
     sl_pct: float = 0.02
 ) -> bool:
     """
-    Cancel all SELL orders on symbol, then attach reduce-only style protection by
+    Cancel all SELL orders on `symbol`, then attach reduce-only style protection by
     submitting a TP (limit SELL) and SL (stop SELL), each for the full qty_available.
     If qty_available is not yet free (e.g., BUY leg still settling), return False so
     callers can retry shortly.
@@ -2075,76 +2074,67 @@ def place_split_protection(
         if n:
             print(f"🧹 Cancelled {n} existing SELLs on {symbol} before attaching protection.")
     except Exception as e:
-        print(f"⚠️ Could not cancel existing SELLs for {symbol}: {e}")
+        print(f"⚠️ Cancel SELLs failed for {symbol}: {e}")
 
-    # 1) Determine quantity available to sell
-    qty_avail = _get_available_qty(symbol)
-    if qty_avail <= 0:
-        # BUY fill may not have fully settled yet; let caller retry later
+    # 1) Check qty_available from current position
+    qty_available = _get_available_qty(symbol)
+    if qty_available <= 0:
+        # BUY leg may still be settling; let caller retry later
         return False
 
-    # 2) Determine current price for sane TP/SL defaults if not provided
+    # 2) Get a recent price for % defaults if explicit prices weren't provided
+    from alpaca.data.requests import StockLatestQuoteRequest
     last_px = None
     try:
-        from alpaca.data.requests import StockLatestQuoteRequest
         req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=_DATA_FEED)
         q = data_client.get_stock_latest_quote(req)
         last_px = float(q[symbol].ask_price or q[symbol].bid_price)
     except Exception:
-        last_px = None
-
-    if last_px is None:
+        # Fallback to position price if available
         try:
-            for p in trading_client.get_all_positions():
-                if p.symbol.upper() == symbol.upper():
-                    last_px = float(p.current_price)
-                    break
+            pos = [p for p in trading_client.get_all_positions() if p.symbol.upper() == symbol.upper()]
+            if pos:
+                last_px = float(pos[0].current_price)
         except Exception:
-            pass
+            last_px = None
 
-    if last_px is None:
-        print(f"⚠️ No price context for {symbol}; cannot compute TP/SL.")
-        return False
+    if tp_price is None and last_px:
+        tp_price = round(last_px * (1.0 + tp_pct), 2)
+    if sl_price is None and last_px:
+        sl_price = round(last_px * (1.0 - sl_pct), 2)
 
-    tp_p = float(tp_price) if tp_price is not None else round(last_px * (1.0 + float(tp_pct)), 2)
-    sl_p = float(sl_price) if sl_price is not None else round(last_px * (1.0 - float(sl_pct)), 2)
+    ok_any = False
 
-    # 3) Clamp nonsensical values relative to last price
-    if tp_p <= last_px * 0.995:
-        tp_p = round(last_px * 1.03, 2)
-    if sl_p >= last_px * 1.005:
-        sl_p = round(last_px * 0.98, 2)
-
-    placed_any = False
-
-    # 4) Place TP (limit SELL)
+    # 3) Place TP limit SELL for the full qty_available
     try:
-        tp_req = LimitOrderRequest(
-            symbol=symbol,
-            qty=int(qty_avail),
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.GTC,
-            limit_price=tp_p,
-        )
-        trading_client.submit_order(order_data=tp_req)
-        print(f"🔒 TP limit SELL placed for {symbol} @ {tp_p} x{int(qty_avail)}")
-        placed_any = True
+        if tp_price:
+            tp_req = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty_available,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                limit_price=float(tp_price),
+            )
+            trading_client.submit_order(tp_req)
+            print(f"✅ TP limit SELL placed: {qty_available} {symbol} @ {tp_price}")
+            ok_any = True
     except Exception as e:
-        print(f"⚠️ Failed to place TP limit for {symbol}: {e}")
+        print(f"⚠️ TP place failed for {symbol}: {e}")
 
-    # 5) Place SL (stop market SELL)
+    # 4) Place SL stop SELL for the full qty_available
     try:
-        sl_req = StopOrderRequest(
-            symbol=symbol,
-            qty=int(qty_avail),
-            side=OrderSide.SELL,
-            time_in_force=TimeInForce.GTC,
-            stop_price=sl_p,
-        )
-        trading_client.submit_order(order_data=sl_req)
-        print(f"🛡️ SL stop SELL placed for {symbol} @ {sl_p} x{int(qty_avail)}")
-        placed_any = True
+        if sl_price:
+            sl_req = StopOrderRequest(
+                symbol=symbol,
+                qty=qty_available,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                stop_price=float(sl_price),
+            )
+            trading_client.submit_order(sl_req)
+            print(f"✅ SL stop SELL placed: {qty_available} {symbol} @ {sl_price}")
+            ok_any = True
     except Exception as e:
-        print(f"⚠️ Failed to place SL stop for {symbol}: {e}")
+        print(f"⚠️ SL place failed for {symbol}: {e}")
 
-    return placed_any
+    return ok_any
