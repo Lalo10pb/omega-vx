@@ -169,7 +169,25 @@ FORCE_WEBHOOK_TEST = str(os.getenv("FORCE_WEBHOOK_TEST", "0")).strip().lower() i
 OMEGA_AUTOSCAN = str(os.getenv("OMEGA_AUTOSCAN", "0")).strip().lower() in ("1","true","yes","y","on")
 OMEGA_AUTOSCAN_DRYRUN = str(os.getenv("OMEGA_AUTOSCAN_DRYRUN", "0")).strip().lower() in ("1","true","yes","y","on")
 OMEGA_SCAN_INTERVAL_SEC = int(str(os.getenv("OMEGA_SCAN_INTERVAL_SEC", "120")).strip() or "120")
-OMEGA_MAX_OPEN_POSITIONS = int(str(os.getenv("OMEGA_MAX_OPEN_POSITIONS", "1")).strip() or "1")
+
+# --- Dynamic max open positions cap based on account equity ---
+def get_dynamic_max_open_positions():
+    try:
+        account = trading_client.get_account()
+        equity = float(account.equity)
+        if equity < 500:
+            return 1
+        elif equity < 1000:
+            return 2
+        elif equity < 2000:
+            return 3
+        elif equity < 5000:
+            return 4
+        else:
+            return 5
+    except Exception as e:
+        print(f"⚠️ Failed to fetch equity for dynamic position cap: {e}")
+        return 2  # fallback default
 
 # --- Weekend Improvements Config -------------------------------------------
 # End‑of‑Day (EOD) summary appender
@@ -754,9 +772,10 @@ def _compute_entry_tp_sl(symbol: str):
     return entry, sl, tp
 
 def autoscan_once():
-    # stop if too many positions
-    if _open_positions_count() >= OMEGA_MAX_OPEN_POSITIONS:
-        print(f"⛔ Position cap reached ({OMEGA_MAX_OPEN_POSITIONS}).")
+    # stop if too many positions (dynamic cap)
+    print(f"🧮 Open positions: {_open_positions_count()} / Max allowed: {get_dynamic_max_open_positions()}")
+    if _open_positions_count() >= get_dynamic_max_open_positions():
+        print(f"⛔ Position cap reached ({get_dynamic_max_open_positions()}).")
         return False
 
     # read watchlist
@@ -804,7 +823,7 @@ def start_autoscan_thread():
         return
     def _loop():
         print(f"🤖 Autoscan running every {OMEGA_SCAN_INTERVAL_SEC}s "
-              f"(max open positions={OMEGA_MAX_OPEN_POSITIONS}, dryrun={OMEGA_AUTOSCAN_DRYRUN})")
+              f"(dynamic max open positions, dryrun={OMEGA_AUTOSCAN_DRYRUN})")
         while True:
             try:
                 autoscan_once()
@@ -1337,27 +1356,14 @@ def submit_order_with_retries(
         abs_sl = round(last_px * 0.98, 2)
     print(f"🧭 TP/SL sanity → last={last_px:.2f} | TP={abs_tp} | SL={abs_sl}")
 
-    # ---- Attach split protection ----
-    for attempt in range(1, 7):  # up to ~60s total
-        print(f"🔐 Attach protection attempt {attempt}/6 …")
-        if place_split_protection(symbol, tp_price=abs_tp, sl_price=abs_sl):
-            break
-        print("⏳ qty_available not free yet; retrying …")
-        time.sleep(10)
-    else:
-        print("⚠️ Could not attach protection after retries.")
-        try:
-            send_telegram_alert(f"⚠️ {symbol} BUY placed, but protection not attached (watchdog will still run).")
-        except Exception:
-            pass
-        # ---- protection failed but BUY succeeded ----
-        try:
-            log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed",
-                      action="BUY", fill_price=buy_fill_price, realized_pnl=None)
-            print("📝 Trade logged to CSV + Google Sheet (protection pending).")
-        except Exception as e:
-            print(f"⚠️ Trade log failed: {e}")
-        return True  # BUY succeeded, protection pending
+    # 🚨 Skip protection for now; let watchdog attach it in background
+    try:
+        log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed",
+                  action="BUY", fill_price=buy_fill_price, realized_pnl=None)
+        print("📝 Trade logged to CSV + Google Sheet (protection pending — fallback to watchdog).")
+        send_telegram_alert(f"⚠️ {symbol} BUY placed — protection will be attached by watchdog.")
+    except Exception as e:
+        print(f"⚠️ Trade log failed: {e}")
 
     # ---- Notify + log ----
     explanation = generate_trade_explanation(
@@ -1815,6 +1821,15 @@ def start_auto_sell_monitor():
                     percent_change = float(position.unrealized_plpc) * 100
 
                     print(f"📊 {symbol}: Qty={qty} Entry=${entry_price:.2f} Now=${current_price:.2f} PnL={percent_change:.2f}%")
+
+                    # 🛡️ Attach missing protection if not already present
+                    try:
+                        tp, sl = get_symbol_tp_sl_open_orders(symbol)
+                        if not tp or not sl:
+                            print(f"🛡️ Attaching missing protection for {symbol} via watchdog.")
+                            place_split_protection(symbol, tp_price=entry_price * 1.03, sl_price=entry_price * 0.98)
+                    except Exception as e:
+                        print(f"⚠️ Failed to attach protection in monitor for {symbol}: {e}")
 
                     # Cooldown guard (inserted)
                     now_t = monotonic()
