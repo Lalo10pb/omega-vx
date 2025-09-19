@@ -135,16 +135,50 @@ def _get_gspread_client():
         print(f"❌ Google auth error: {type(e).__name__}: {e}")
         raise
 
-# === Trading Configuration ===
-DAILY_RISK_LIMIT = -10  # 💥 Stop trading after $10 loss
-TRADE_COOLDOWN_SECONDS = 300  # ⏱️ 5 minutes cooldown
+# === Logging Configuration ===
+LOG_DIR = os.path.expanduser("~/omega-vx/logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,  # Set the desired log level
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(LOG_DIR, "omega_vx_bot.log")),  # Log to a file
+        logging.StreamHandler(sys.stdout),  # Log to the console
+    ],
+)
+
+# Replace print statements with logging.info, logging.warning, logging.error, etc.
+logging.info("Application started")
+DAILY_RISK_LIMIT = -10  # optional daily risk guard, currently unused
+TRADE_COOLDOWN_SECONDS = 300
 MAX_RISK_PER_TRADE_PERCENT = 1.0
 MIN_TRADE_QTY = 1
 
+# Watchdog thresholds
+WATCHDOG_TRAILING_STOP_PCT = -2.0
+WATCHDOG_TAKE_PROFIT_PCT = 5.0
+WATCHDOG_HARD_STOP_PCT = -3.5
+def _fetch_data_with_fallback(request_function, symbol, feed=_DATA_FEED):
+    """Fetches data using the given request function, with fallback to IEX if permission errors occur."""
+    try:
+        return request_function(feed=feed)
+    except Exception as e:
+        if "subscription does not permit" in str(e).lower() and feed != DataFeed.IEX:
+            print(f"ℹ️ Falling back to IEX for {symbol} due to feed permission.")
+            try:
+                return request_function(feed=DataFeed.IEX)
+            except Exception as e2:
+                print(f"❌ Data fetch failed for {symbol} (IEX fallback): {e2}")
+                return None
+        else:
+            print(f"❌ Data fetch failed for {symbol}: {e}")
+            return None
+
 # === Logging ===
-print = functools.partial(print, flush=True)
-LOG_DIR = os.path.expanduser("~/omega-vx/logs")
-os.makedirs(LOG_DIR, exist_ok=True)
+#print = functools.partial(print, flush=True)
 CRASH_LOG_FILE = os.path.join(LOG_DIR, "last_boot.txt")
 LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
 LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
@@ -176,18 +210,18 @@ def get_dynamic_max_open_positions():
         account = trading_client.get_account()
         equity = float(account.equity)
         if equity < 500:
-            return 1
-        elif equity < 1000:
             return 2
-        elif equity < 2000:
+        elif equity < 1000:
             return 3
-        elif equity < 5000:
+        elif equity < 2000:
             return 4
-        else:
+        elif equity < 5000:
             return 5
+        else:
+            return 10
     except Exception as e:
         print(f"⚠️ Failed to fetch equity for dynamic position cap: {e}")
-        return 2  # fallback default
+        return 3  # fallback default
 
 # --- Weekend Improvements Config -------------------------------------------
 # End‑of‑Day (EOD) summary appender
@@ -561,7 +595,7 @@ def get_bars(symbol, interval='15m', lookback=10):
     start = end - timedelta(minutes=15 * (lookback + 1))
     tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
 
-    def _fetch(feed):
+    def _request(feed):
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
@@ -571,21 +605,7 @@ def get_bars(symbol, interval='15m', lookback=10):
         )
         return data_client.get_stock_bars(req).df
 
-    try:
-        bars = _fetch(_DATA_FEED)
-    except Exception as e:
-        # Permission errors show up as SIP not permitted — drop to IEX
-        if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
-            print("ℹ️ Falling back to IEX for bars due to feed permission.")
-            try:
-                bars = _fetch(DataFeed.IEX)
-            except Exception as e2:
-                print(f"❌ Alpaca data fetch failed for {symbol} (IEX fallback): {e2}")
-                return None
-        else:
-            print(f"❌ Alpaca data fetch failed for {symbol}: {e}")
-            return None
-
+    bars = _fetch_data_with_fallback(_request, symbol, feed=_DATA_FEED)
     if bars is None or bars.empty:
         print(f"⚠️ No Alpaca data returned for {symbol}")
         return None
@@ -609,7 +629,7 @@ def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=2)
 
-    def _fetch(feed, _tf, _start, _end):
+    def _request(feed, _tf, _start, _end):
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=_tf,
@@ -620,18 +640,18 @@ def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
         return data_client.get_stock_bars(req).df
 
     # 1) Try requested timeframe on IEX
-    try:
-        bars = _fetch(DataFeed.IEX, tf, start, end)
-    except Exception as e:
-        bars = None
-        print(f"⚠️ Heikin-Ashi fetch error for {symbol} ({interval}) on IEX: {e}")
+    bars = _fetch_data_with_fallback(
+        lambda feed: _request(feed, tf, start, end), symbol, feed=DataFeed.IEX
+    )
 
     # 2) If missing or empty, fall back to DAILY bars
     if bars is None or bars.empty:
         try:
             d_start = end - timedelta(days=20)
             d_tf = TimeFrame.Day
-            d_bars = _fetch(DataFeed.IEX, d_tf, d_start, end)
+            d_bars = _fetch_data_with_fallback(
+                lambda feed: _request(feed, d_tf, d_start, end), symbol, feed=DataFeed.IEX
+            )
             if d_bars is None or d_bars.empty:
                 print(f"⚠️ No data returned for {symbol} even on daily.")
                 return None
@@ -865,6 +885,8 @@ def calculate_position_size(entry_price, stop_loss):
             return 0
 
         position_size = int(risk_amount / risk_per_share)
+        if position_size <= 0:
+            return 1
         return position_size
     except Exception as e:
         print(f"❌ Error calculating position size: {e}")
@@ -997,6 +1019,8 @@ def calculate_trade_qty(entry_price, stop_loss_price):
             return 0
 
         qty = int(max(max_risk_amount / risk_per_share, MIN_TRADE_QTY))
+        if qty <= 0:
+            qty = 1
         print(f"  • Final calculated qty: {qty}")
         return qty
 
@@ -1069,7 +1093,7 @@ def should_block_trading_due_to_equity():
         if max_equity == 0:
             return False
         drop_percent = (max_equity - equity) / max_equity
-        if drop_percent >= 0.05:
+        if drop_percent >= 0.10:
             msg = f"🛑 Trading blocked — Portfolio dropped {drop_percent*100:.2f}% from high (${max_equity:.2f} → ${equity:.2f})"
             print(msg)
             send_telegram_alert(msg)
@@ -1132,7 +1156,7 @@ def get_rsi_value(symbol, interval='15m', period=14):
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=5)
 
-    def _fetch(feed, _tf, _start, _end):
+    def _request(feed, _tf, _start, _end):
         req = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=_tf,
@@ -1143,11 +1167,9 @@ def get_rsi_value(symbol, interval='15m', period=14):
         return data_client.get_stock_bars(req).df
 
     # 1) Try requested timeframe on IEX
-    try:
-        bars = _fetch(DataFeed.IEX, tf, start, end)
-    except Exception as e:
-        print(f"⚠️ RSI fetch error for {symbol} ({interval}) on IEX: {e}")
-        bars = None
+    bars = _fetch_data_with_fallback(
+        lambda feed: _request(feed, tf, start, end), symbol, feed=DataFeed.IEX
+    )
 
     # 2) Fallback to DAILY if needed
     used_daily = False
@@ -1155,7 +1177,9 @@ def get_rsi_value(symbol, interval='15m', period=14):
         try:
             d_start = end - timedelta(days=100)
             d_tf = TimeFrame.Day
-            bars = _fetch(DataFeed.IEX, d_tf, d_start, end)
+            bars = _fetch_data_with_fallback(
+                lambda feed: _request(feed, d_tf, d_start, end), symbol, feed=DataFeed.IEX
+            )
             used_daily = True
         except Exception as e2:
             print(f"❌ Daily RSI fallback failed for {symbol}: {e2}")
@@ -1356,12 +1380,17 @@ def submit_order_with_retries(
         abs_sl = round(last_px * 0.98, 2)
     print(f"🧭 TP/SL sanity → last={last_px:.2f} | TP={abs_tp} | SL={abs_sl}")
 
-    # 🚨 Skip protection for now; let watchdog attach it in background
+    # 🚨 Attach protection immediately (always place TP/SL after buy)
+    try:
+        place_split_protection(symbol, tp_price=abs_tp, sl_price=abs_sl)
+        print(f"🛡️ Protection attached for {symbol}: TP={abs_tp}, SL={abs_sl}")
+    except Exception as e:
+        print(f"⚠️ Immediate protection attach failed for {symbol}: {e} — watchdog will retry.")
+
     try:
         log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed",
                   action="BUY", fill_price=buy_fill_price, realized_pnl=None)
-        print("📝 Trade logged to CSV + Google Sheet (protection pending — fallback to watchdog).")
-        send_telegram_alert(f"⚠️ {symbol} BUY placed — protection will be attached by watchdog.")
+        print("📝 Trade logged to CSV + Google Sheet.")
     except Exception as e:
         print(f"⚠️ Trade log failed: {e}")
 
@@ -1837,9 +1866,9 @@ def start_auto_sell_monitor():
                     if now_t - last_t < _CLOSE_COOLDOWN_SEC:
                         continue
 
-                    hit_trailing = percent_change <= -2.0
-                    hit_take_profit = percent_change >= 5.0
-                    hit_stop_loss = percent_change <= -3.5
+                    hit_trailing = percent_change <= WATCHDOG_TRAILING_STOP_PCT
+                    hit_take_profit = percent_change >= WATCHDOG_TAKE_PROFIT_PCT
+                    hit_stop_loss = percent_change <= WATCHDOG_HARD_STOP_PCT
 
                     if hit_trailing or hit_take_profit or hit_stop_loss:
                         reason = "❗"
@@ -2082,9 +2111,97 @@ def place_split_protection(
     SL (stop SELL) orders sized to the full qty_available. If the BUY leg hasn't
     fully settled yet and qty_available == 0, return False so the caller can retry.
     """
-#    ...truncated...
+    # 0) Clear any existing protection legs to avoid qty collisions
+    try:
+        cancelled = cancel_open_sells(symbol)
+        if cancelled:
+            print(f"🧹 Cancelled {cancelled} existing SELL orders for {symbol} before re-attaching protection.")
+    except Exception as e:
+        print(f"⚠️ Failed to cancel existing SELLs for {symbol}: {e}")
+
+    # 1) Determine how many shares are available to protect
+    qty_available = _get_available_qty(symbol)
+    if qty_available <= 0:
+        print(f"⏳ Protection skipped for {symbol} — qty not yet available (likely still settling).")
+        return False
+
+    # 2) Resolve TP/SL defaults if prices weren't provided
+    from alpaca.data.requests import StockLatestQuoteRequest
+
+    def _fetch_quote(feed):
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=feed)
+        data = data_client.get_stock_latest_quote(req)
+        quote = data[symbol]
+        return float(quote.ask_price or quote.bid_price or 0.0)
+
+    last_px = 0.0
+    try:
+        last_px = _fetch_quote(_DATA_FEED)
+    except Exception as e:
+        if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
+            try:
+                last_px = _fetch_quote(DataFeed.IEX)
+            except Exception as fallback_err:
+                print(f"⚠️ Could not fetch quote for {symbol} (IEX fallback): {fallback_err}")
+        else:
+            print(f"⚠️ Could not fetch quote for {symbol}: {e}")
+
+    if last_px <= 0:
+        try:
+            pos = [p for p in trading_client.get_all_positions() if p.symbol.upper() == symbol.upper()]
+            if pos:
+                last_px = float(getattr(pos[0], "current_price", 0.0) or 0.0)
+        except Exception:
+            last_px = 0.0
+
+    if tp_price is None and last_px > 0:
+        tp_price = round(last_px * (1.0 + float(tp_pct)), 2)
+    if sl_price is None and last_px > 0:
+        sl_price = round(last_px * (1.0 - float(sl_pct)), 2)
+
+    ok_any = False
+
+    # 3) Submit limit TP order
+    try:
+        if tp_price and tp_price > 0:
+            tp_req = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty_available,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                limit_price=float(tp_price),
+            )
+            trading_client.submit_order(tp_req)
+            print(f"✅ TP limit SELL placed for {symbol}: qty={qty_available} @ {tp_price}")
+            ok_any = True
+    except Exception as e:
+        print(f"⚠️ Failed to place TP for {symbol}: {e}")
+
+    # 4) Submit stop-loss order
+    try:
+        if sl_price and sl_price > 0:
+            sl_req = StopOrderRequest(
+                symbol=symbol,
+                qty=qty_available,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                stop_price=float(sl_price),
+            )
+            trading_client.submit_order(sl_req)
+            print(f"✅ SL stop SELL placed for {symbol}: qty={qty_available} @ {sl_price}")
+            ok_any = True
+    except Exception as e:
+        print(f"⚠️ Failed to place SL for {symbol}: {e}")
+
+    if not ok_any:
+        print(f"⚠️ No protection orders were submitted for {symbol} (tp={tp_price}, sl={sl_price}).")
+
+    return ok_any
 
 # === Run the Flask app and start autoscan thread if main ===
 if __name__ == "__main__":
     start_autoscan_thread()
-    app.run(host="0.0.0.0", port=10000)
+    logging.info("Starting Flask App")
+    try:
+        app.run(host="0.0.0.0", port=10000)
+    except Exception as e: logging.error(e)
