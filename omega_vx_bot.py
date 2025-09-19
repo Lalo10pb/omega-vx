@@ -210,18 +210,18 @@ def get_dynamic_max_open_positions():
         account = trading_client.get_account()
         equity = float(account.equity)
         if equity < 500:
-            return 2
+            return 3   # minimum floor raised
         elif equity < 1000:
-            return 3
-        elif equity < 2000:
             return 4
-        elif equity < 5000:
+        elif equity < 2000:
             return 5
+        elif equity < 5000:
+            return 6
         else:
             return 10
     except Exception as e:
         print(f"⚠️ Failed to fetch equity for dynamic position cap: {e}")
-        return 3  # fallback default
+        return 3  # fallback default, never less than 3
 
 # --- Weekend Improvements Config -------------------------------------------
 # End‑of‑Day (EOD) summary appender
