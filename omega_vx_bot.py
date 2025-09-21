@@ -157,6 +157,10 @@ TRADE_COOLDOWN_SECONDS = 300
 MAX_RISK_PER_TRADE_PERCENT = 1.0
 MIN_TRADE_QTY = 1
 
+_LOG_WRITE_LOCK = threading.Lock()
+_BACKGROUND_WORKERS_LOCK = threading.Lock()
+_BACKGROUND_WORKERS_STARTED = False
+
 # Watchdog thresholds
 WATCHDOG_TRAILING_STOP_PCT = -2.0
 WATCHDOG_TAKE_PROFIT_PCT = 5.0
@@ -858,8 +862,7 @@ def log_equity_curve():
         equity = get_account_equity()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # 🔧 Write to the local logs/ folder
-        with open("logs/equity_curve.log", "a") as f:
+        with open(EQUITY_CURVE_LOG_PATH, "a") as f:
             f.write(f"[{now}] EQUITY: ${equity:.2f}\n")
 
         print(f"📈 Equity logged: ${equity:.2f}")
@@ -884,9 +887,10 @@ def calculate_position_size(entry_price, stop_loss):
             print("⚠️ Risk per share is zero. Skipping.")
             return 0
 
-        position_size = int(risk_amount / risk_per_share)
-        if position_size <= 0:
-            return 1
+        position_size = int(risk_amount // risk_per_share)
+        if position_size < MIN_TRADE_QTY:
+            print("⚠️ Risk budget too small for minimum position size.")
+            return 0
         return position_size
     except Exception as e:
         print(f"❌ Error calculating position size: {e}")
@@ -1001,6 +1005,7 @@ MAX_EQUITY_FILE = os.path.join(LOG_DIR, "max_equity.txt")
 SNAPSHOT_LOG_PATH = os.path.join(LOG_DIR, "last_snapshot.txt")
 PORTFOLIO_LOG_PATH = os.path.join(LOG_DIR, "portfolio_log.csv")
 TRADE_LOG_PATH = os.path.join(LOG_DIR, "trade_log.csv")
+EQUITY_CURVE_LOG_PATH = os.path.join(LOG_DIR, "equity_curve.log")
 
 def calculate_trade_qty(entry_price, stop_loss_price):
     try:
@@ -1018,9 +1023,12 @@ def calculate_trade_qty(entry_price, stop_loss_price):
             print("⚠️ Risk per share is 0 — invalid stop loss?")
             return 0
 
-        qty = int(max(max_risk_amount / risk_per_share, MIN_TRADE_QTY))
-        if qty <= 0:
-            qty = 1
+        raw_qty = int(max_risk_amount // risk_per_share)
+        if raw_qty < MIN_TRADE_QTY:
+            print("⚠️ Risk budget too small for even the minimum quantity — skipping.")
+            return 0
+
+        qty = raw_qty
         print(f"  • Final calculated qty: {qty}")
         return qty
 
@@ -1127,7 +1135,7 @@ def send_email(subject, body):
 
 def get_equity_slope():
     try:
-        path = os.path.join(LOG_DIR, "equity_curve.log")
+        path = EQUITY_CURVE_LOG_PATH
         if not os.path.exists(path):
             return 0
         values = []
@@ -1291,7 +1299,7 @@ def submit_order_with_retries(
         live_price = max(entry, 0.01)
 
     max_qty_by_bp = int((effective_bp * SAFETY) // live_price)
-    if max_qty_by_bp <= 0:
+    if max_qty_by_bp < MIN_TRADE_QTY:
         print(f"❌ Not enough usable buying power for even 1 share at ~${live_price:.2f} (effective_bp=${effective_bp:.2f}).")
         try:
             send_telegram_alert(f"❌ Trade aborted — usable buying power ${effective_bp:.2f} too low for {symbol}.")
@@ -1305,9 +1313,24 @@ def submit_order_with_retries(
             f"(effective_bp ${effective_bp:.2f}, live ~${live_price:.2f})"
         )
         qty = max_qty_by_bp
+        if qty < MIN_TRADE_QTY:
+            print("⚠️ Buying power reduction pushed qty below minimum — skipping trade.")
+            try:
+                send_telegram_alert(f"⚠️ Trade aborted — insufficient buying power for {symbol} after reduction.")
+            except Exception:
+                pass
+            return False
 
     if qty * live_price > effective_bp * SAFETY:
-        qty = max(1, int((effective_bp * SAFETY) // live_price))
+        bp_qty = int((effective_bp * SAFETY) // live_price)
+        if bp_qty < MIN_TRADE_QTY:
+            print("⚠️ Safety shave left no affordable quantity — skipping trade.")
+            try:
+                send_telegram_alert(f"⚠️ Trade aborted — post-safety buying power insufficient for {symbol}.")
+            except Exception:
+                pass
+            return False
+        qty = bp_qty
         print(f"🛡️ Safety shave → qty={qty}")
 
     print(f"📌 Quantity calculated: {qty}")
@@ -1386,13 +1409,6 @@ def submit_order_with_retries(
         print(f"🛡️ Protection attached for {symbol}: TP={abs_tp}, SL={abs_sl}")
     except Exception as e:
         print(f"⚠️ Immediate protection attach failed for {symbol}: {e} — watchdog will retry.")
-
-    try:
-        log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed",
-                  action="BUY", fill_price=buy_fill_price, realized_pnl=None)
-        print("📝 Trade logged to CSV + Google Sheet.")
-    except Exception as e:
-        print(f"⚠️ Trade log failed: {e}")
 
     # ---- Notify + log ----
     explanation = generate_trade_explanation(
@@ -1971,54 +1987,55 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status, action=None, f
     else:
         context_time = "afternoon"
 
+    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    if status == "executed":
+        with open(LAST_TRADE_FILE, "w") as f:
+            f.write(timestamp_str)
+
     context_recent_outcome = "unknown"
     context_equity_change = "unknown"
 
-    try:
-        if os.path.isfile(TRADE_LOG_PATH):
-            recent_df = pd.read_csv(TRADE_LOG_PATH)
-            if not recent_df.empty:
-                last_status = recent_df.iloc[-1]["status"]
-                context_recent_outcome = "win" if last_status == "executed" else "loss"
+    with _LOG_WRITE_LOCK:
+        try:
+            if os.path.isfile(TRADE_LOG_PATH):
+                recent_df = pd.read_csv(TRADE_LOG_PATH)
+                if not recent_df.empty:
+                    last_status = str(recent_df.iloc[-1].get("status", ""))
+                    if last_status:
+                        context_recent_outcome = "win" if "executed" in last_status.lower() else "loss"
 
-                if "equity" in recent_df.columns:
-                    prev_equity = float(recent_df.iloc[-1].get("equity", 0))
-                    account = trading_client.get_account()
-                    current_equity = float(account.equity)
-                    context_equity_change = "gain" if current_equity > prev_equity else "loss"
-    except Exception as e:
-        print("⚠️ Failed to fetch recent outcome context:", e)
+                    if "equity" in recent_df.columns:
+                        prev_equity = float(recent_df.iloc[-1].get("equity", 0) or 0)
+                        try:
+                            account = trading_client.get_account()
+                            current_equity = float(account.equity)
+                            if prev_equity:
+                                context_equity_change = "gain" if current_equity > prev_equity else "loss"
+                        except Exception as equity_err:
+                            print(f"⚠️ Failed to fetch account equity for context: {equity_err}")
+        except Exception as e:
+            print("⚠️ Failed to load recent trade context:", e)
 
-    # 🕰 Timestamp
-    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        trade_data = {
+            "timestamp": timestamp_str,
+            "symbol": symbol,
+            "qty": qty,
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "status": status,
+            "explanation": explanation,
+            "context_time_of_day": context_time,
+            "context_recent_outcome": context_recent_outcome,
+            "context_equity_change": context_equity_change,
+            "action": action,
+            "fill_price": fill_price,
+            "realized_pnl": realized_pnl
+        }
 
-    if status == "executed":
-        with open(LAST_TRADE_FILE, 'w') as f:
-            f.write(timestamp_str)
-
-    # 🧠 Compile and log trade data
-    trade_data = {
-        "timestamp": timestamp_str,
-        "symbol": symbol,
-        "qty": qty,
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "take_profit": take_profit,
-        "status": status,
-        "explanation": explanation,
-        "context_time_of_day": context_time,
-        "context_recent_outcome": context_recent_outcome,
-        "context_equity_change": context_equity_change,
-        "action": action,
-        "fill_price": fill_price,
-        "realized_pnl": realized_pnl
-    }
-
-    df = pd.DataFrame([trade_data])
-    if not os.path.isfile(TRADE_LOG_PATH):
-        df.to_csv(TRADE_LOG_PATH, index=False)
-    else:
-        df.to_csv(TRADE_LOG_PATH, mode='a', header=False, index=False)
+        df = pd.DataFrame([trade_data])
+        write_mode = 'a' if os.path.isfile(TRADE_LOG_PATH) else 'w'
+        df.to_csv(TRADE_LOG_PATH, mode=write_mode, header=write_mode == 'w', index=False)
 
     # ✅ Google Sheet Logging
     try:
@@ -2198,9 +2215,25 @@ def place_split_protection(
 
     return ok_any
 
+
+def start_background_workers():
+    """Start long-running helper threads exactly once."""
+    global _BACKGROUND_WORKERS_STARTED
+    with _BACKGROUND_WORKERS_LOCK:
+        if _BACKGROUND_WORKERS_STARTED:
+            return
+        print("🧵 Spawning background worker threads …")
+        start_autoscan_thread()
+        start_open_positions_pusher()
+        start_eod_summary_scheduler()
+        start_order_janitor()
+        start_auto_sell_monitor()
+        _BACKGROUND_WORKERS_STARTED = True
+
+
 # === Run the Flask app and start autoscan thread if main ===
 if __name__ == "__main__":
-    start_autoscan_thread()
+    start_background_workers()
     logging.info("Starting Flask App")
     try:
         app.run(host="0.0.0.0", port=10000)

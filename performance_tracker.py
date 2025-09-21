@@ -1,13 +1,18 @@
 import csv
-from datetime import datetime
-import alpaca_trade_api as tradeapi
+import os
 import time
+from datetime import datetime
 
-API_KEY = 'YOUR_API_KEY'
-API_SECRET = 'YOUR_API_SECRET'
-BASE_URL = 'https://paper-api.alpaca.markets'
+from dotenv import load_dotenv
+from alpaca.trading.client import TradingClient
 
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version='v2')
+load_dotenv()
+
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+PAPER_MODE = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1", "true", "yes")
+
+trading_client = TradingClient(API_KEY, API_SECRET, paper=PAPER_MODE)
 
 def log_exit(symbol, qty, entry_price, exit_price, stop_loss, take_profit, reason):
     pnl = (exit_price - entry_price) * qty
@@ -35,9 +40,10 @@ def monitor_closed_positions():
 
     while True:
         try:
-            closed = api.list_positions()
+            closed = trading_client.get_all_positions()
             for pos in closed:
-                if pos.unrealized_pl == '0.00' and pos.symbol not in recorded:
+                unrealized_pl = float(getattr(pos, "unrealized_pl", 0) or 0)
+                if abs(unrealized_pl) < 0.005 and pos.symbol not in recorded:
                     entry_price = float(pos.avg_entry_price)
                     exit_price = float(pos.current_price)
                     qty = float(pos.qty)

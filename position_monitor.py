@@ -1,16 +1,18 @@
 import time
-import alpaca_trade_api as tradeapi
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import ActivityType
 from datetime import datetime
 from dotenv import load_dotenv
 import os
+from dateutil.parser import isoparse
 
 load_dotenv()
 
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("APCA_API_BASE_URL")
+PAPER_MODE = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1", "true", "yes")
 
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL)
+client = TradingClient(API_KEY, API_SECRET, paper=PAPER_MODE)
 # ✅ Thresholds
 TAKE_PROFIT_THRESHOLD = 5.0  # +5%
 STOP_LOSS_THRESHOLD = -1.5   # -1.5%
@@ -25,7 +27,7 @@ def send_telegram_alert(message):
 
 def monitor_positions():
     try:
-        positions = api.list_positions()
+        positions = client.get_all_positions()
         print("🔍 Monitoring open positions...")
 
         for pos in positions:
@@ -40,19 +42,19 @@ def monitor_positions():
             # 📈 Take Profit if gain >= +5%
             if percent_change >= 5.0:
                 print(f"🏆 Closing {symbol} — Profit target hit ({percent_change:.2f}%)")
-                api.close_position(symbol)
+                client.close_position(symbol)
                 send_telegram_alert(f"🏆 {symbol} closed at +{percent_change:.2f}% profit")
 
             # 📉 Stop Loss if loss <= -3%
             elif percent_change <= -3.0:
                 print(f"❌ Closing {symbol} — Stop loss hit ({percent_change:.2f}%)")
-                api.close_position(symbol)
+                client.close_position(symbol)
                 send_telegram_alert(f"❌ {symbol} closed at {percent_change:.2f}% loss")
 
             # 📉 Auto-close if loss exceeds threshold
             if percent_change <= STOP_LOSS_THRESHOLD:
                 print(f"❌ Closing {symbol} due to loss ({percent_change:.2f}%)")
-                api.close_position(symbol)
+                client.close_position(symbol)
                 send_telegram_alert(f"❌ Auto-closed {symbol} due to loss ({percent_change:.2f}%)")
 
             # ✅ Optional: add take-profit logic here if you want
@@ -62,11 +64,21 @@ def monitor_positions():
 
 def log_closed_trades():
     try:
-        activities = api.get_activities(activity_types='FILL')
+        activities = client.get_activities(activity_type=ActivityType.FILL)
         now = datetime.utcnow()
         for activity in activities:
-            if activity.side == 'sell' and activity.transaction_time:
-                sell_time = activity.transaction_time.replace(tzinfo=None)
+            if activity.side == 'sell' and getattr(activity, 'transaction_time', None):
+                txn = activity.transaction_time
+                sell_time = None
+                if isinstance(txn, datetime):
+                    sell_time = txn.replace(tzinfo=None)
+                else:
+                    try:
+                        sell_time = isoparse(str(txn)).replace(tzinfo=None)
+                    except Exception:
+                        sell_time = None
+                if sell_time is None:
+                    continue
                 time_diff = (now - sell_time).total_seconds()
                 if time_diff < 70:  # trade closed in the last cycle
                     symbol = activity.symbol

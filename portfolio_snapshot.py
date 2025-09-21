@@ -2,19 +2,19 @@ import os
 import csv
 from datetime import datetime
 from dotenv import load_dotenv
-import alpaca_trade_api as tradeapi
+from alpaca.trading.client import TradingClient
 
 # Load environment variables
 load_dotenv()
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("APCA_API_BASE_URL")
+PAPER_MODE = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1", "true", "yes")
 
 # Connect to Alpaca
-api = tradeapi.REST(API_KEY, API_SECRET, BASE_URL)
+client = TradingClient(API_KEY, API_SECRET, paper=PAPER_MODE)
 
 # Get account info
-account = api.get_account()
+account = client.get_account()
 timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 equity = float(account.equity)
 cash = float(account.cash)
