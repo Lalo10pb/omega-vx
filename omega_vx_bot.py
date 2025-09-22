@@ -16,6 +16,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import json
 import base64
+from decimal import Decimal, ROUND_HALF_UP
 
 from alpaca.trading.requests import (
     MarketOrderRequest,
@@ -198,6 +199,55 @@ app = Flask(__name__)
 from time import monotonic
 _last_close_attempt = {}
 _CLOSE_COOLDOWN_SEC = 20  # consider 60–120 during market hours
+_PDT_LOCKOUT_SEC = 600  # seconds to pause close attempts after PDT denial
+_pdt_lockouts = {}
+
+
+def _quantize_to_tick(price):
+    """Clamp price to the allowed tick size (>= $1 → $0.01, otherwise $0.0001)."""
+    if price is None:
+        return None
+    try:
+        dec_price = Decimal(str(price))
+    except (TypeError, ValueError):
+        return price
+
+    tick = Decimal("0.01") if dec_price >= Decimal("1") else Decimal("0.0001")
+    quantized = dec_price.quantize(tick, rounding=ROUND_HALF_UP)
+    if quantized <= 0:
+        return 0.0
+    return float(quantized)
+
+
+def _is_pattern_day_trading_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    if "pattern day trading protection" in msg:
+        return True
+    code = getattr(err, "code", None) or getattr(err, "error_code", None)
+    if code and str(code) == "40310100":
+        return True
+    return False
+
+
+def _register_pdt_lockout(symbol: str) -> int:
+    """Record that PDT blocked the symbol and return the lockout duration (seconds)."""
+    until = monotonic() + _PDT_LOCKOUT_SEC
+    _pdt_lockouts[symbol.upper()] = until
+    return _PDT_LOCKOUT_SEC
+
+
+def _pdt_lockout_remaining(symbol: str) -> int:
+    until = _pdt_lockouts.get(symbol.upper())
+    if not until:
+        return 0
+    remaining = int(max(0, until - monotonic()))
+    if remaining == 0:
+        _pdt_lockouts.pop(symbol.upper(), None)
+    return remaining
+
+
+def _pdt_lockout_active(symbol: str) -> bool:
+    return _pdt_lockout_remaining(symbol) > 0
 
 # === Dev flags ===
 
@@ -378,6 +428,18 @@ def close_position_safely(symbol: str) -> bool:
             print(f"⚠️ Could not backfill SELL fill for {symbol}: {_fe}")
         return True
     except Exception as e:
+        if _is_pattern_day_trading_error(e):
+            cooldown = _register_pdt_lockout(symbol)
+            remaining = _pdt_lockout_remaining(symbol)
+            minutes = max(1, remaining // 60) if remaining else max(1, cooldown // 60)
+            print(f"⛔ Close denied for {symbol}: pattern day trading protection. Deferring retries for ~{minutes} minute(s).")
+            try:
+                send_telegram_alert(
+                    f"⛔ Close blocked for {symbol}: pattern day trading protection. Retrying after ~{minutes} minute(s)."
+                )
+            except Exception:
+                pass
+            return False
         # Fallback: explicit market SELL sized to position
         try:
             pos = [p for p in trading_client.get_all_positions() if p.symbol.upper()==symbol.upper()]
@@ -411,6 +473,18 @@ def close_position_safely(symbol: str) -> bool:
                 print(f"⚠️ Trade log (SELL) failed: {_le}")
             return True
         except Exception as e2:
+            if _is_pattern_day_trading_error(e2):
+                cooldown = _register_pdt_lockout(symbol)
+                remaining = _pdt_lockout_remaining(symbol)
+                minutes = max(1, remaining // 60) if remaining else max(1, cooldown // 60)
+                print(f"⛔ Fallback close denied for {symbol}: pattern day trading protection. Deferring retries for ~{minutes} minute(s).")
+                try:
+                    send_telegram_alert(
+                        f"⛔ Fallback close blocked for {symbol}: pattern day trading protection. Retrying after ~{minutes} minute(s)."
+                    )
+                except Exception:
+                    pass
+                return False
             print(f"❌ Safe close failed for {symbol}: {e} / fallback: {e2}")
             send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
             return False
@@ -1401,6 +1475,8 @@ def submit_order_with_retries(
     # If SL is at/above ~market, cut to -2%
     if abs_sl >= last_px * 1.005:
         abs_sl = round(last_px * 0.98, 2)
+    abs_tp = _quantize_to_tick(abs_tp)
+    abs_sl = _quantize_to_tick(abs_sl)
     print(f"🧭 TP/SL sanity → last={last_px:.2f} | TP={abs_tp} | SL={abs_sl}")
 
     # 🚨 Attach protection immediately (always place TP/SL after buy)
@@ -1881,6 +1957,10 @@ def start_auto_sell_monitor():
                     last_t = _last_close_attempt.get(symbol, 0.0)
                     if now_t - last_t < _CLOSE_COOLDOWN_SEC:
                         continue
+                    if _pdt_lockout_active(symbol):
+                        remaining = _pdt_lockout_remaining(symbol)
+                        print(f"⏳ PDT lockout active for {symbol}; skipping close ({remaining}s left).")
+                        continue
 
                     hit_trailing = percent_change <= WATCHDOG_TRAILING_STOP_PCT
                     hit_take_profit = percent_change >= WATCHDOG_TAKE_PROFIT_PCT
@@ -2087,6 +2167,10 @@ def _get_available_qty(symbol: str) -> float:
 def close_position_if_needed(symbol: str, reason: str) -> bool:
     """Safely close a position if qty is available. Returns True if order was submitted."""
     now = monotonic()
+    if _pdt_lockout_active(symbol):
+        remaining = _pdt_lockout_remaining(symbol)
+        print(f"⏳ Skipping close for {symbol} — PDT lockout ({remaining}s remaining).")
+        return False
     last = _last_close_attempt.get(symbol)
     if last is not None and (now - last) < _CLOSE_COOLDOWN_SEC:
         print(f"⏳ Skipping close for {symbol} (cooldown {int(_CLOSE_COOLDOWN_SEC - (now - last))}s).")
@@ -2175,6 +2259,9 @@ def place_split_protection(
         tp_price = round(last_px * (1.0 + float(tp_pct)), 2)
     if sl_price is None and last_px > 0:
         sl_price = round(last_px * (1.0 - float(sl_pct)), 2)
+
+    tp_price = _quantize_to_tick(tp_price)
+    sl_price = _quantize_to_tick(sl_price)
 
     ok_any = False
 
