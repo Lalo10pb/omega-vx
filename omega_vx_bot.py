@@ -44,7 +44,32 @@ from pathlib import Path
 ENV_PATH = Path(__file__).parent / ".env"
 if not load_dotenv(ENV_PATH):
     print(f"⚠️ Could not load .env at {ENV_PATH} — using environment vars only.", flush=True)
-    
+
+
+def _float_env(name: str, default: float) -> float:
+    """Parse environment variable as float with a safe default."""
+    raw = os.getenv(name, None)
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return float(default)
+    return val
+
+
+def _int_env(name: str, default: int) -> int:
+    """Parse environment variable as int with a safe default."""
+    raw = os.getenv(name, None)
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return int(default)
+    return val
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = os.getenv("APCA_API_BASE_URL")
@@ -155,8 +180,29 @@ logging.basicConfig(
 logging.info("Application started")
 DAILY_RISK_LIMIT = -10  # optional daily risk guard, currently unused
 TRADE_COOLDOWN_SECONDS = 300
-MAX_RISK_PER_TRADE_PERCENT = 1.0
+MAX_RISK_BASE_PERCENT = _float_env("MAX_RISK_BASE_PERCENT", 1.0)
+MAX_RISK_PER_TRADE_PERCENT = MAX_RISK_BASE_PERCENT
+MAX_RISK_AUTO_MIN = _float_env("MAX_RISK_AUTO_MIN_PCT", 0.5)
+MAX_RISK_AUTO_MAX = _float_env("MAX_RISK_AUTO_MAX_PCT", MAX_RISK_BASE_PERCENT)
+MAX_RISK_AUTO_UP_STEP = _float_env("MAX_RISK_AUTO_UP_STEP", 0.5)
+MAX_RISK_AUTO_DOWN_STEP = _float_env("MAX_RISK_AUTO_DOWN_STEP", 0.5)
+EQUITY_GUARD_MIN_DRAWDOWN = _float_env("EQUITY_GUARD_MIN_DRAWDOWN_PCT", 0.10)
+EQUITY_GUARD_STALE_RATIO = _float_env("EQUITY_GUARD_STALE_RATIO", 5.0)
+EQUITY_GUARD_MAX_EQUITY_FLOOR = _float_env("EQUITY_GUARD_MAX_EQUITY_FLOOR", 0.0)
+MAX_OPEN_POSITIONS_HIGH_EQUITY = _int_env("MAX_OPEN_POSITIONS_HIGH_EQUITY", 8)
 MIN_TRADE_QTY = 1
+
+# sanity clamps to keep env overrides within reasonable bounds
+if MAX_RISK_AUTO_MIN < 0:
+    MAX_RISK_AUTO_MIN = 0.0
+if MAX_RISK_AUTO_MAX < MAX_RISK_AUTO_MIN:
+    MAX_RISK_AUTO_MAX = MAX_RISK_AUTO_MIN
+if EQUITY_GUARD_MIN_DRAWDOWN < 0:
+    EQUITY_GUARD_MIN_DRAWDOWN = 0.0
+if EQUITY_GUARD_MIN_DRAWDOWN > 1:
+    EQUITY_GUARD_MIN_DRAWDOWN = 1.0
+if EQUITY_GUARD_STALE_RATIO < 0:
+    EQUITY_GUARD_STALE_RATIO = 0.0
 
 _LOG_WRITE_LOCK = threading.Lock()
 _BACKGROUND_WORKERS_LOCK = threading.Lock()
@@ -272,7 +318,7 @@ def get_dynamic_max_open_positions():
         elif equity < 5000:
             return 6
         else:
-            return 10
+            return MAX_OPEN_POSITIONS_HIGH_EQUITY
     except Exception as e:
         print(f"⚠️ Failed to fetch equity for dynamic position cap: {e}")
         return 3  # fallback default, never less than 3
@@ -638,8 +684,9 @@ def auto_adjust_risk_percent():
                     parts = line.strip().split("EQUITY:")
                     if len(parts) == 2:
                         equity = float(parts[1].replace("$", ""))
-                        equity_values.append(equity)
-                except:
+                        if equity > 0:
+                            equity_values.append(equity)
+                except Exception:
                     continue
 
         if len(equity_values) < 2:
@@ -650,15 +697,20 @@ def auto_adjust_risk_percent():
         print(f"📈 Equity slope: {slope:.2f}")
 
         global MAX_RISK_PER_TRADE_PERCENT
-        if slope < -10:
-            MAX_RISK_PER_TRADE_PERCENT = 0.5
-            print("⚠️ AI Auto-Tune: Slope negative → Risk reduced to 0.5%")
-        elif slope > 20:
-            MAX_RISK_PER_TRADE_PERCENT = 1.5
-            print("🚀 AI Auto-Tune: Strong growth → Risk increased to 1.5%")
+        target = MAX_RISK_BASE_PERCENT
+        if slope <= -10:
+            target = MAX_RISK_BASE_PERCENT - MAX_RISK_AUTO_DOWN_STEP
+            target = _clamp(target, MAX_RISK_AUTO_MIN, MAX_RISK_AUTO_MAX)
+            print(f"⚠️ AI Auto-Tune: Negative slope → Risk adjusted to {target:.2f}%")
+        elif slope >= 20:
+            target = MAX_RISK_BASE_PERCENT + MAX_RISK_AUTO_UP_STEP
+            target = _clamp(target, MAX_RISK_AUTO_MIN, MAX_RISK_AUTO_MAX)
+            print(f"🚀 AI Auto-Tune: Positive slope → Risk adjusted to {target:.2f}%")
         else:
-            MAX_RISK_PER_TRADE_PERCENT = 1.0
-            print("🧠 AI Auto-Tune: Risk normalized to 1.0%")
+            target = _clamp(MAX_RISK_BASE_PERCENT, MAX_RISK_AUTO_MIN, MAX_RISK_AUTO_MAX)
+            print(f"🧠 AI Auto-Tune: Risk normalized to {target:.2f}%")
+
+        MAX_RISK_PER_TRADE_PERCENT = target
 
     except Exception as e:
         print(f"❌ AI Auto-Tune failed: {e}")
@@ -1154,29 +1206,69 @@ def get_current_vix():
         print("⚠️ No VIX data found.")
         return 0
 
+def _write_max_equity(value: float):
+    try:
+        with open(MAX_EQUITY_FILE, "w") as f:
+            f.write(f"{value:.2f}")
+    except Exception as e:
+        print(f"⚠️ Failed to write max equity: {e}")
+
+
 def get_max_equity():
     if os.path.exists(MAX_EQUITY_FILE):
-        with open(MAX_EQUITY_FILE, "r") as f:
-            return float(f.read().strip())
+        try:
+            with open(MAX_EQUITY_FILE, "r") as f:
+                return float(f.read().strip())
+        except Exception as e:
+            print(f"⚠️ Could not read max equity file: {e}")
     return 0.0
 
+
 def update_max_equity(current_equity):
+    current_equity = max(current_equity, EQUITY_GUARD_MAX_EQUITY_FLOOR)
     max_equity = get_max_equity()
     if current_equity > max_equity:
-        with open(MAX_EQUITY_FILE, "w") as f:
-            f.write(str(current_equity))
+        _write_max_equity(current_equity)
 
 def should_block_trading_due_to_equity():
     try:
         account = trading_client.get_account()  # ✅ Updated
-        equity = float(account.equity)
-        update_max_equity(equity)
-        max_equity = get_max_equity()
-        if max_equity == 0:
+        equity = max(float(account.equity), 0.0)
+        if equity <= 0:
+            print("⚠️ Equity fetch returned 0 — skipping guard update.")
             return False
-        drop_percent = (max_equity - equity) / max_equity
-        if drop_percent >= 0.10:
-            msg = f"🛑 Trading blocked — Portfolio dropped {drop_percent*100:.2f}% from high (${max_equity:.2f} → ${equity:.2f})"
+        update_max_equity(equity)
+        max_equity = max(get_max_equity(), EQUITY_GUARD_MAX_EQUITY_FLOOR)
+        if max_equity <= 0:
+            return False
+
+        if (
+            EQUITY_GUARD_STALE_RATIO > 0
+            and equity > 0
+            and max_equity > equity
+            and (max_equity / max(equity, 1e-6)) >= EQUITY_GUARD_STALE_RATIO
+        ):
+            msg = (
+                f"🔄 Equity guard baseline reset (max ${max_equity:.2f} ≫ equity ${equity:.2f}); "
+                "assuming manual deposit/withdrawal."
+            )
+            print(msg)
+            try:
+                send_telegram_alert(msg)
+            except Exception:
+                pass
+            _write_max_equity(equity)
+            return False
+
+        drop_percent = 0.0
+        if max_equity > 0:
+            drop_percent = (max_equity - equity) / max_equity
+
+        if drop_percent >= EQUITY_GUARD_MIN_DRAWDOWN:
+            msg = (
+                f"🛑 Trading blocked — Portfolio dropped {drop_percent*100:.2f}% from high "
+                f"(${max_equity:.2f} → ${equity:.2f})."
+            )
             print(msg)
             send_telegram_alert(msg)
             send_email("🚫 Trading Disabled", msg)
