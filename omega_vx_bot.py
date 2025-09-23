@@ -70,6 +70,11 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _bool_env(name: str, default: str = "0") -> bool:
+    raw = os.getenv(name, str(default))
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = os.getenv("APCA_API_BASE_URL")
@@ -178,6 +183,7 @@ logging.basicConfig(
 
 # Replace print statements with logging.info, logging.warning, logging.error, etc.
 logging.info("Application started")
+print("✅ Omega-VX live build 08a8d10 (risk guard + PDT safeguards active)")
 DAILY_RISK_LIMIT = -10  # optional daily risk guard, currently unused
 TRADE_COOLDOWN_SECONDS = 300
 MAX_RISK_BASE_PERCENT = _float_env("MAX_RISK_BASE_PERCENT", 1.0)
@@ -190,6 +196,12 @@ EQUITY_GUARD_MIN_DRAWDOWN = _float_env("EQUITY_GUARD_MIN_DRAWDOWN_PCT", 0.10)
 EQUITY_GUARD_STALE_RATIO = _float_env("EQUITY_GUARD_STALE_RATIO", 5.0)
 EQUITY_GUARD_MAX_EQUITY_FLOOR = _float_env("EQUITY_GUARD_MAX_EQUITY_FLOOR", 0.0)
 MAX_OPEN_POSITIONS_HIGH_EQUITY = _int_env("MAX_OPEN_POSITIONS_HIGH_EQUITY", 8)
+PDT_GUARD_ENABLED = _bool_env("PDT_GUARD_ENABLED", "1")
+PDT_MIN_DAY_TRADES_BUFFER = max(0, _int_env("PDT_MIN_DAY_TRADES_BUFFER", 0))
+PDT_GLOBAL_LOCK_SECONDS = max(0, _int_env("PDT_GLOBAL_LOCK_SECONDS", 900))
+PDT_SYMBOL_LOCK_SECONDS = max(0, _int_env("PDT_SYMBOL_LOCK_SECONDS", 600))
+PDT_ALERT_COOLDOWN_SECONDS = max(0, _int_env("PDT_ALERT_COOLDOWN_SECONDS", 300))
+PDT_STATUS_CACHE_SECONDS = max(5, _int_env("PDT_STATUS_CACHE_SECONDS", 60))
 MIN_TRADE_QTY = 1
 
 # sanity clamps to keep env overrides within reasonable bounds
@@ -245,8 +257,12 @@ app = Flask(__name__)
 from time import monotonic
 _last_close_attempt = {}
 _CLOSE_COOLDOWN_SEC = 20  # consider 60–120 during market hours
-_PDT_LOCKOUT_SEC = 600  # seconds to pause close attempts after PDT denial
+_PDT_LOCKOUT_SEC = PDT_SYMBOL_LOCK_SECONDS or 600
 _pdt_lockouts = {}
+
+_PDT_GLOBAL_LOCKOUT_UNTIL = 0.0
+_PDT_LAST_ALERT_MONO = 0.0
+_DAY_TRADE_STATUS_CACHE = {"expires": 0.0, "remaining": None, "is_pdt": None}
 
 
 def _quantize_to_tick(price):
@@ -299,6 +315,102 @@ def _pdt_lockout_active(symbol: str) -> bool:
 
 FORCE_WEBHOOK_TEST = str(os.getenv("FORCE_WEBHOOK_TEST", "0")).strip().lower() in ("1", "true", "yes")
 
+
+def _update_day_trade_status_from_account(account) -> tuple:
+    if not PDT_GUARD_ENABLED:
+        return (None, None)
+    try:
+        remaining = getattr(account, "day_trades_left", None)
+    except Exception:
+        remaining = None
+    try:
+        is_pdt = bool(getattr(account, "pattern_day_trader", False))
+    except Exception:
+        is_pdt = None
+    _DAY_TRADE_STATUS_CACHE.update(
+        {
+            "remaining": remaining,
+            "is_pdt": is_pdt,
+            "expires": monotonic() + PDT_STATUS_CACHE_SECONDS,
+        }
+    )
+    return remaining, is_pdt
+
+
+def _get_day_trade_status() -> tuple:
+    if not PDT_GUARD_ENABLED:
+        return (None, None)
+    now = monotonic()
+    if now < _DAY_TRADE_STATUS_CACHE.get("expires", 0.0):
+        return (
+            _DAY_TRADE_STATUS_CACHE.get("remaining"),
+            _DAY_TRADE_STATUS_CACHE.get("is_pdt"),
+        )
+    try:
+        account = trading_client.get_account()
+        return _update_day_trade_status_from_account(account)
+    except Exception as e:
+        print(f"⚠️ Failed to refresh day trade status: {e}")
+        return (
+            _DAY_TRADE_STATUS_CACHE.get("remaining"),
+            _DAY_TRADE_STATUS_CACHE.get("is_pdt"),
+        )
+
+
+def _pdt_global_lockout_remaining() -> int:
+    if not PDT_GUARD_ENABLED:
+        return 0
+    remaining = int(max(0.0, _PDT_GLOBAL_LOCKOUT_UNTIL - monotonic()))
+    return remaining
+
+
+def _pdt_global_lockout_active() -> bool:
+    return _pdt_global_lockout_remaining() > 0
+
+
+def _maybe_alert_pdt(reason: str, day_trades_left=None, pattern_flag=None):
+    if not PDT_GUARD_ENABLED:
+        return
+    global _PDT_LAST_ALERT_MONO
+    now = monotonic()
+    if now - _PDT_LAST_ALERT_MONO < PDT_ALERT_COOLDOWN_SECONDS:
+        return
+    if day_trades_left is None or pattern_flag is None:
+        cached_remaining, cached_flag = _get_day_trade_status()
+        if day_trades_left is None:
+            day_trades_left = cached_remaining
+        if pattern_flag is None:
+            pattern_flag = cached_flag
+    msg = "🚫 PDT guard active"
+    if reason:
+        msg += f": {reason}"
+    if day_trades_left is not None:
+        msg += f" | day_trades_left={day_trades_left}"
+    if pattern_flag is not None:
+        msg += f" | pattern_day_trader={pattern_flag}"
+    remaining = _pdt_global_lockout_remaining()
+    if remaining:
+        msg += f" | lockout={remaining}s"
+    print(msg)
+    try:
+        send_telegram_alert(msg)
+    except Exception:
+        pass
+    _PDT_LAST_ALERT_MONO = now
+
+
+def _set_pdt_global_lockout(reason: str = "", seconds: int = None, day_trades_left=None, pattern_flag=None):
+    if not PDT_GUARD_ENABLED:
+        return
+    global _PDT_GLOBAL_LOCKOUT_UNTIL
+    duration = seconds if seconds is not None else PDT_GLOBAL_LOCK_SECONDS
+    if duration <= 0:
+        return
+    until = monotonic() + duration
+    if until > _PDT_GLOBAL_LOCKOUT_UNTIL:
+        _PDT_GLOBAL_LOCKOUT_UNTIL = until
+        _maybe_alert_pdt(reason, day_trades_left=day_trades_left, pattern_flag=pattern_flag)
+
 # --- Auto‑Scanner flags ---
 OMEGA_AUTOSCAN = str(os.getenv("OMEGA_AUTOSCAN", "0")).strip().lower() in ("1","true","yes","y","on")
 OMEGA_AUTOSCAN_DRYRUN = str(os.getenv("OMEGA_AUTOSCAN_DRYRUN", "0")).strip().lower() in ("1","true","yes","y","on")
@@ -308,6 +420,7 @@ OMEGA_SCAN_INTERVAL_SEC = int(str(os.getenv("OMEGA_SCAN_INTERVAL_SEC", "120")).s
 def get_dynamic_max_open_positions():
     try:
         account = trading_client.get_account()
+        _update_day_trade_status_from_account(account)
         equity = float(account.equity)
         if equity < 500:
             return 3   # minimum floor raised
@@ -430,6 +543,8 @@ def close_position_safely(symbol: str) -> bool:
       2) Wait briefly for cancels to settle
       3) Close position with a single market SELL (reduce‑only via close_position)
     """
+    if PDT_GUARD_ENABLED and _pdt_global_lockout_active():
+        return False
     # Capture pre-close position details
     pre_qty = 0
     pre_avg = None
@@ -478,6 +593,7 @@ def close_position_safely(symbol: str) -> bool:
             cooldown = _register_pdt_lockout(symbol)
             remaining = _pdt_lockout_remaining(symbol)
             minutes = max(1, remaining // 60) if remaining else max(1, cooldown // 60)
+            _set_pdt_global_lockout(f"Close denied for {symbol}")
             print(f"⛔ Close denied for {symbol}: pattern day trading protection. Deferring retries for ~{minutes} minute(s).")
             try:
                 send_telegram_alert(
@@ -523,6 +639,7 @@ def close_position_safely(symbol: str) -> bool:
                 cooldown = _register_pdt_lockout(symbol)
                 remaining = _pdt_lockout_remaining(symbol)
                 minutes = max(1, remaining // 60) if remaining else max(1, cooldown // 60)
+                _set_pdt_global_lockout(f"Fallback close denied for {symbol}")
                 print(f"⛔ Fallback close denied for {symbol}: pattern day trading protection. Deferring retries for ~{minutes} minute(s).")
                 try:
                     send_telegram_alert(
@@ -998,6 +1115,7 @@ def log_equity_curve():
 def get_account_equity():
     try:
         account = trading_client.get_account()  # ✅ from alpaca-py
+        _update_day_trade_status_from_account(account)
         return float(account.equity)
     except Exception as e:
         print(f"❌ Failed to fetch account equity: {e}")
@@ -1136,6 +1254,7 @@ EQUITY_CURVE_LOG_PATH = os.path.join(LOG_DIR, "equity_curve.log")
 def calculate_trade_qty(entry_price, stop_loss_price):
     try:
         account = trading_client.get_account()  # ✅ Updated
+        _update_day_trade_status_from_account(account)
         equity = float(account.equity)
         max_risk_amount = equity * (MAX_RISK_PER_TRADE_PERCENT / 100)
         risk_per_share = abs(entry_price - stop_loss_price)
@@ -1233,6 +1352,7 @@ def update_max_equity(current_equity):
 def should_block_trading_due_to_equity():
     try:
         account = trading_client.get_account()  # ✅ Updated
+        _update_day_trade_status_from_account(account)
         equity = max(float(account.equity), 0.0)
         if equity <= 0:
             print("⚠️ Equity fetch returned 0 — skipping guard update.")
@@ -1403,6 +1523,21 @@ def submit_order_with_retries(
       4) Attach split reduce_only TP/SL (with retries if qty_available=0)
     """
     print("📌 About to calculate quantity...")
+
+    if PDT_GUARD_ENABLED and _pdt_global_lockout_active() and not dry_run:
+        remaining = _pdt_global_lockout_remaining()
+        msg = f"⏳ PDT lockout active ({remaining}s) — skipping BUY {symbol}."
+        _maybe_alert_pdt(msg)
+        return False
+
+    if PDT_GUARD_ENABLED and not dry_run:
+        rem, pattern_flag = _get_day_trade_status()
+        if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
+            msg = f"🛑 Skipping {symbol} — only {rem} day trade(s) remaining."
+            print(msg)
+            _maybe_alert_pdt(msg, day_trades_left=rem, pattern_flag=pattern_flag)
+            return False
+
     qty = calculate_trade_qty(entry, stop_loss)
     if qty == 0:
         print("❌ Qty is 0 — skipping order.")
@@ -1440,11 +1575,19 @@ def submit_order_with_retries(
     # ⚖️ Use an 'effective' buying power for cash accounts where bp may show 0
     try:
         acct = trading_client.get_account()
+        rem, pattern_flag = _update_day_trade_status_from_account(acct)
         bp = float(getattr(acct, "buying_power", 0) or 0)
         nmbp = float(getattr(acct, "non_marginable_buying_power", 0) or 0)
         regt = float(getattr(acct, "regt_buying_power", 0) or 0)
         cash_avail = float(getattr(acct, "cash", 0) or 0)
         multiplier = float(getattr(acct, "multiplier", 1) or 1)
+
+        if PDT_GUARD_ENABLED and not dry_run:
+            if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
+                msg = f"🛑 Abort {symbol} — remaining day trades {rem} at/under buffer."
+                print(msg)
+                _maybe_alert_pdt(msg, day_trades_left=rem, pattern_flag=pattern_flag)
+                return False
 
         # If margin account, prefer broker-reported BP; otherwise take the max available cash-like field.
         if multiplier > 1:
@@ -1538,6 +1681,8 @@ def submit_order_with_retries(
         except Exception as _:
             buy_fill_price = None
     except Exception as e:
+        if _is_pattern_day_trading_error(e):
+            _set_pdt_global_lockout(f"BUY denied for {symbol}")
         print("🧨 BUY submit failed:", e)
         try: send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
         except Exception: pass
@@ -2027,6 +2172,8 @@ def start_auto_sell_monitor():
                 positions = trading_client.get_all_positions()
 
                 for position in positions:
+                    if PDT_GUARD_ENABLED and _pdt_global_lockout_active():
+                        continue
                     symbol = position.symbol
                     qty = float(position.qty)
                     entry_price = float(position.avg_entry_price)
@@ -2259,6 +2406,8 @@ def _get_available_qty(symbol: str) -> float:
 def close_position_if_needed(symbol: str, reason: str) -> bool:
     """Safely close a position if qty is available. Returns True if order was submitted."""
     now = monotonic()
+    if PDT_GUARD_ENABLED and _pdt_global_lockout_active():
+        return False
     if _pdt_lockout_active(symbol):
         remaining = _pdt_lockout_remaining(symbol)
         print(f"⏳ Skipping close for {symbol} — PDT lockout ({remaining}s remaining).")
@@ -2304,6 +2453,18 @@ def place_split_protection(
     SL (stop SELL) orders sized to the full qty_available. If the BUY leg hasn't
     fully settled yet and qty_available == 0, return False so the caller can retry.
     """
+    if PDT_GUARD_ENABLED:
+        if _pdt_global_lockout_active():
+            return False
+        rem, pattern_flag = _get_day_trade_status()
+        if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
+            _maybe_alert_pdt(
+                f"Skipping protection for {symbol} — day trades left {rem} at/under buffer.",
+                day_trades_left=rem,
+                pattern_flag=pattern_flag,
+            )
+            return False
+
     # 0) Clear any existing protection legs to avoid qty collisions
     try:
         cancelled = cancel_open_sells(symbol)
@@ -2372,6 +2533,8 @@ def place_split_protection(
             ok_any = True
     except Exception as e:
         print(f"⚠️ Failed to place TP for {symbol}: {e}")
+        if _is_pattern_day_trading_error(e):
+            _set_pdt_global_lockout(f"TP attach denied for {symbol}")
 
     # 4) Submit stop-loss order
     try:
@@ -2388,6 +2551,8 @@ def place_split_protection(
             ok_any = True
     except Exception as e:
         print(f"⚠️ Failed to place SL for {symbol}: {e}")
+        if _is_pattern_day_trading_error(e):
+            _set_pdt_global_lockout(f"SL attach denied for {symbol}")
 
     if not ok_any:
         print(f"⚠️ No protection orders were submitted for {symbol} (tp={tp_price}, sl={sl_price}).")
