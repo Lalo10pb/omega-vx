@@ -196,6 +196,8 @@ EQUITY_GUARD_MIN_DRAWDOWN = _float_env("EQUITY_GUARD_MIN_DRAWDOWN_PCT", 0.10)
 EQUITY_GUARD_STALE_RATIO = _float_env("EQUITY_GUARD_STALE_RATIO", 5.0)
 EQUITY_GUARD_MAX_EQUITY_FLOOR = _float_env("EQUITY_GUARD_MAX_EQUITY_FLOOR", 0.0)
 MAX_OPEN_POSITIONS_HIGH_EQUITY = _int_env("MAX_OPEN_POSITIONS_HIGH_EQUITY", 8)
+DAILY_TRADE_CAP = _int_env("DAILY_TRADE_CAP", 0)
+EQUITY_DRAWDOWN_MAX_PCT = _float_env("EQUITY_DRAWDOWN_MAX_PCT", 0.0) / 100.0
 PDT_GUARD_ENABLED = _bool_env("PDT_GUARD_ENABLED", "1")
 PDT_MIN_DAY_TRADES_BUFFER = max(0, _int_env("PDT_MIN_DAY_TRADES_BUFFER", 0))
 PDT_GLOBAL_LOCK_SECONDS = max(0, _int_env("PDT_GLOBAL_LOCK_SECONDS", 900))
@@ -203,6 +205,29 @@ PDT_SYMBOL_LOCK_SECONDS = max(0, _int_env("PDT_SYMBOL_LOCK_SECONDS", 600))
 PDT_ALERT_COOLDOWN_SECONDS = max(0, _int_env("PDT_ALERT_COOLDOWN_SECONDS", 300))
 PDT_STATUS_CACHE_SECONDS = max(5, _int_env("PDT_STATUS_CACHE_SECONDS", 60))
 MIN_TRADE_QTY = 1
+
+_DAILY_TRADE_COUNT = 0
+_DAILY_TRADE_DATE = datetime.now().date()
+
+def _check_daily_trade_cap():
+    global _DAILY_TRADE_COUNT, _DAILY_TRADE_DATE
+    today = datetime.now().date()
+    if today != _DAILY_TRADE_DATE:
+        _DAILY_TRADE_DATE = today
+        _DAILY_TRADE_COUNT = 0
+    if DAILY_TRADE_CAP > 0 and _DAILY_TRADE_COUNT >= DAILY_TRADE_CAP:
+        print(f"🛑 Daily trade cap reached ({DAILY_TRADE_CAP}) — skipping.")
+        try:
+            send_telegram_alert(f"🛑 Daily trade cap reached ({DAILY_TRADE_CAP}) — skipping.")
+        except Exception:
+            pass
+        return False
+    return True
+
+
+def _increment_daily_trade_count():
+    global _DAILY_TRADE_COUNT
+    _DAILY_TRADE_COUNT += 1
 
 # sanity clamps to keep env overrides within reasonable bounds
 if MAX_RISK_AUTO_MIN < 0:
@@ -1393,6 +1418,21 @@ def should_block_trading_due_to_equity():
             send_telegram_alert(msg)
             send_email("🚫 Trading Disabled", msg)
             return True
+
+        if EQUITY_DRAWDOWN_MAX_PCT > 0:
+            drawdown_pct = (max_equity - equity) / max_equity if max_equity > 0 else 0
+            if drawdown_pct >= EQUITY_DRAWDOWN_MAX_PCT:
+                msg = (
+                    "🛑 Trading blocked — Max drawdown "
+                    f"{drawdown_pct*100:.2f}% exceeded (limit {EQUITY_DRAWDOWN_MAX_PCT*100:.2f}%)."
+                )
+                print(msg)
+                try:
+                    send_telegram_alert(msg)
+                    send_email("🚫 Trading Disabled", msg)
+                except Exception:
+                    pass
+                return True
         return False
     except Exception as e:
         print("⚠️ Error checking equity drop:", e)
@@ -1537,6 +1577,9 @@ def submit_order_with_retries(
             print(msg)
             _maybe_alert_pdt(msg, day_trades_left=rem, pattern_flag=pattern_flag)
             return False
+
+    if not _check_daily_trade_cap():
+        return False
 
     qty = calculate_trade_qty(entry, stop_loss)
     if qty == 0:
@@ -1735,6 +1778,7 @@ def submit_order_with_retries(
     except Exception: pass
 
     print(f"✅ Order + protection finished for {symbol}.")
+    _increment_daily_trade_count()
     try:
         log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed",
                   action="BUY", fill_price=buy_fill_price, realized_pnl=None)
