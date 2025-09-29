@@ -45,8 +45,10 @@ def connect_client() -> TradingClient:
     if not key or not sec:
         print("❌ Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY in .env")
         sys.exit(1)
-    paper = os.getenv("ALPACA_PAPER", "false").lower() == "true"
-    return TradingClient(key, sec, paper=paper)
+
+    # Force explicit base URL instead of relying on 'paper' flag
+    base_url = os.getenv("APCA_API_BASE_URL", "https://api.alpaca.markets")
+    return TradingClient(key, sec, base_url=base_url)
 
 
 def list_open_orders(tc: TradingClient):
