@@ -2599,15 +2599,25 @@ def place_split_protection(symbol, tp_price, sl_price):
         else:
             if tp_price:
                 print(f"📌 Submitting TP for {symbol} @ {tp_price}")
-                trading_client.submit_order(
-                    LimitOrderRequest(
-                        symbol=symbol,
-                        qty=_get_qty(),
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.GTC,
-                        limit_price=tp_price,
+                try:
+                    trading_client.submit_order(
+                        LimitOrderRequest(
+                            symbol=symbol,
+                            qty=_get_qty(),
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                            limit_price=tp_price,
+                        )
                     )
-                )
+                except Exception as e:
+                    err = str(e).lower()
+                    if "pattern day trading protection" in err or '"code":40310100' in err:
+                        print(f"⏳ PDT active — deferring TP attach for {symbol}.")
+                        return 0
+                    if "insufficient qty available" in err or '"code":40310000' in err:
+                        print(f"ℹ️ {symbol}: qty held by existing orders — skip duplicate TP.")
+                        return 0
+                    raise
 
         # --- Place SL if missing ---
         if existing_sl and sl_price and _close_enough(existing_sl, sl_price):
@@ -2615,15 +2625,25 @@ def place_split_protection(symbol, tp_price, sl_price):
         else:
             if sl_price:
                 print(f"📌 Submitting SL for {symbol} @ {sl_price}")
-                trading_client.submit_order(
-                    StopOrderRequest(
-                        symbol=symbol,
-                        qty=_get_qty(),
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.GTC,
-                        stop_price=sl_price,
+                try:
+                    trading_client.submit_order(
+                        StopOrderRequest(
+                            symbol=symbol,
+                            qty=_get_qty(),
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                            stop_price=sl_price,
+                        )
                     )
-                )
+                except Exception as e:
+                    err = str(e).lower()
+                    if "pattern day trading protection" in err or '"code":40310100' in err:
+                        print(f"⏳ PDT active — deferring SL attach for {symbol}.")
+                        return 0
+                    if "insufficient qty available" in err or '"code":40310000' in err:
+                        print(f"ℹ️ {symbol}: qty held by existing orders — skip duplicate SL.")
+                        return 0
+                    raise
 
     except Exception as e:
         print(f"❌ place_split_protection error for {symbol}: {e}")
