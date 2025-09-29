@@ -2555,123 +2555,65 @@ def close_position_if_needed(symbol: str, reason: str) -> bool:
         send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
         return False
 
-def place_split_protection(
-    symbol: str,
-    tp_price: float = None,
-    sl_price: float = None,
-    tp_pct: float = 0.03,
-    sl_pct: float = 0.02
-) -> bool:
-    """
-    Cancel all SELL orders on `symbol`, then attach separate TP (limit SELL) and
-    SL (stop SELL) orders sized to the full qty_available. If the BUY leg hasn't
-    fully settled yet and qty_available == 0, return False so the caller can retry.
-    """
-    if PDT_GUARD_ENABLED:
-        if _pdt_global_lockout_active():
-            return False
-        rem, pattern_flag = _get_day_trade_status()
-        if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
-            _maybe_alert_pdt(
-                f"Skipping protection for {symbol} — day trades left {rem} at/under buffer.",
-                day_trades_left=rem,
-                pattern_flag=pattern_flag,
-            )
-            return False
-
-    # 0) Clear any existing protection legs to avoid qty collisions
+def place_split_protection(symbol, tp_price, sl_price):
+    """Attach TP and SL if they are not already present (avoid duplicates)."""
     try:
-        cancelled = cancel_open_sells(symbol)
-        if cancelled:
-            print(f"🧹 Cancelled {cancelled} existing SELL orders for {symbol} before re-attaching protection.")
-    except Exception as e:
-        print(f"⚠️ Failed to cancel existing SELLs for {symbol}: {e}")
-
-    # 1) Determine how many shares are available to protect
-    qty_available = _get_available_qty(symbol)
-    if qty_available <= 0:
-        print(f"⏳ Protection skipped for {symbol} — qty not yet available (likely still settling).")
-        return False
-
-    # 2) Resolve TP/SL defaults if prices weren't provided
-    from alpaca.data.requests import StockLatestQuoteRequest
-
-    def _fetch_quote(feed):
-        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=feed)
-        data = data_client.get_stock_latest_quote(req)
-        quote = data[symbol]
-        return float(quote.ask_price or quote.bid_price or 0.0)
-
-    last_px = 0.0
-    try:
-        last_px = _fetch_quote(_DATA_FEED)
-    except Exception as e:
-        if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
+        # --- Check existing open SELL orders ---
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        open_orders = trading_client.get_orders(filter=req)
+        existing_tp = None
+        existing_sl = None
+        for o in open_orders:
+            side = str(getattr(o, "side", "")).lower()
+            if side != "sell":
+                continue
+            otype = str(getattr(o, "order_type", "")).lower()
+            price = None
             try:
-                last_px = _fetch_quote(DataFeed.IEX)
-            except Exception as fallback_err:
-                print(f"⚠️ Could not fetch quote for {symbol} (IEX fallback): {fallback_err}")
+                price = float(getattr(o, "limit_price") or getattr(o, "stop_price") or 0)
+            except Exception:
+                continue
+            if otype == "limit" and price > 0:
+                existing_tp = price
+            elif otype == "stop" and price > 0:
+                existing_sl = price
+
+        # --- Helper to compare within tolerance (±0.5%) ---
+        def _close_enough(p1, p2):
+            return abs(p1 - p2) / max(1e-6, p1) <= 0.005
+
+        # --- Place TP if missing ---
+        if existing_tp and _close_enough(existing_tp, tp_price):
+            print(f"⏭️ TP already exists at {existing_tp}, skipping new TP.")
         else:
-            print(f"⚠️ Could not fetch quote for {symbol}: {e}")
-
-    if last_px <= 0:
-        try:
-            pos = [p for p in trading_client.get_all_positions() if p.symbol.upper() == symbol.upper()]
-            if pos:
-                last_px = float(getattr(pos[0], "current_price", 0.0) or 0.0)
-        except Exception:
-            last_px = 0.0
-
-    if tp_price is None and last_px > 0:
-        tp_price = round(last_px * (1.0 + float(tp_pct)), 2)
-    if sl_price is None and last_px > 0:
-        sl_price = round(last_px * (1.0 - float(sl_pct)), 2)
-
-    tp_price = _quantize_to_tick(tp_price)
-    sl_price = _quantize_to_tick(sl_price)
-
-    ok_any = False
-
-    # 3) Submit limit TP order
-    try:
-        if tp_price and tp_price > 0:
-            tp_req = LimitOrderRequest(
-                symbol=symbol,
-                qty=qty_available,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-                limit_price=float(tp_price),
+            print(f"📌 Submitting TP for {symbol} @ {tp_price}")
+            trading_client.submit_order(
+                LimitOrderRequest(
+                    symbol=symbol,
+                    qty=trading_client.get_open_position(symbol).qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                    limit_price=tp_price,
+                )
             )
-            trading_client.submit_order(tp_req)
-            print(f"✅ TP limit SELL placed for {symbol}: qty={qty_available} @ {tp_price}")
-            ok_any = True
-    except Exception as e:
-        print(f"⚠️ Failed to place TP for {symbol}: {e}")
-        if _is_pattern_day_trading_error(e):
-            _set_pdt_global_lockout(f"TP attach denied for {symbol}")
 
-    # 4) Submit stop-loss order
-    try:
-        if sl_price and sl_price > 0:
-            sl_req = StopOrderRequest(
-                symbol=symbol,
-                qty=qty_available,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-                stop_price=float(sl_price),
+        # --- Place SL if missing ---
+        if existing_sl and _close_enough(existing_sl, sl_price):
+            print(f"⏭️ SL already exists at {existing_sl}, skipping new SL.")
+        else:
+            print(f"📌 Submitting SL for {symbol} @ {sl_price}")
+            trading_client.submit_order(
+                StopOrderRequest(
+                    symbol=symbol,
+                    qty=trading_client.get_open_position(symbol).qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                    stop_price=sl_price,
+                )
             )
-            trading_client.submit_order(sl_req)
-            print(f"✅ SL stop SELL placed for {symbol}: qty={qty_available} @ {sl_price}")
-            ok_any = True
+
     except Exception as e:
-        print(f"⚠️ Failed to place SL for {symbol}: {e}")
-        if _is_pattern_day_trading_error(e):
-            _set_pdt_global_lockout(f"SL attach denied for {symbol}")
-
-    if not ok_any:
-        print(f"⚠️ No protection orders were submitted for {symbol} (tp={tp_price}, sl={sl_price}).")
-
-    return ok_any
+        print(f"❌ place_split_protection error for {symbol}: {e}")
 
 
 def start_background_workers():
