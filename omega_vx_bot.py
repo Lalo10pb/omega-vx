@@ -2556,17 +2556,31 @@ def close_position_if_needed(symbol: str, reason: str) -> bool:
         return False
 
 def place_split_protection(symbol, tp_price, sl_price):
-    """Attach TP and SL if they are not already present (avoid duplicates)."""
+    """Attach TP/SL protection without re-submitting duplicates."""
+    ok_tp = False
+    ok_sl = False
     try:
-        # --- Normalize price increments ---
         tp_price = _quantize_to_tick(tp_price)
         sl_price = _quantize_to_tick(sl_price)
 
-        # --- Check existing open SELL orders ---
+        try:
+            position = trading_client.get_open_position(symbol)
+            pos_qty = float(getattr(position, "qty", getattr(position, "qty_available", 0)))
+        except Exception:
+            pos_qty = 0.0
+
+        if pos_qty <= 0:
+            print(f"⏳ Protection skipped for {symbol} — no open qty to protect.")
+            return False
+
         req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
         open_orders = trading_client.get_orders(filter=req)
+
         existing_tp = None
         existing_sl = None
+        stale_tp_orders = []
+        stale_sl_orders = []
+
         for o in open_orders:
             side = str(getattr(o, "side", "")).lower()
             if side != "sell":
@@ -2577,76 +2591,94 @@ def place_split_protection(symbol, tp_price, sl_price):
                 price = float(getattr(o, "limit_price") or getattr(o, "stop_price") or 0)
             except Exception:
                 continue
+
             if otype == "limit" and price > 0:
-                existing_tp = price
+                if tp_price and abs(price - tp_price) / max(1e-6, tp_price) <= 0.005:
+                    existing_tp = o
+                else:
+                    stale_tp_orders.append((o, price))
             elif otype == "stop" and price > 0:
-                existing_sl = price
+                if sl_price and abs(price - sl_price) / max(1e-6, sl_price) <= 0.005:
+                    existing_sl = o
+                else:
+                    stale_sl_orders.append((o, price))
 
-        # --- Helper to compare within tolerance (±0.5%) ---
-        def _close_enough(p1, p2):
-            return abs(p1 - p2) / max(1e-6, p1) <= 0.005
-
-        qty_cache = {"val": None}
-
-        def _get_qty():
-            if qty_cache["val"] is None:
-                qty_cache["val"] = trading_client.get_open_position(symbol).qty
-            return qty_cache["val"]
-
-        # --- Place TP if missing ---
-        if existing_tp and tp_price and _close_enough(existing_tp, tp_price):
-            print(f"⏭️ TP already exists at {existing_tp}, skipping new TP.")
-        else:
-            if tp_price:
-                print(f"📌 Submitting TP for {symbol} @ {tp_price}")
+        def _cancel_orders(orders, label):
+            for order, price in orders:
                 try:
-                    trading_client.submit_order(
-                        LimitOrderRequest(
-                            symbol=symbol,
-                            qty=_get_qty(),
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.GTC,
-                            limit_price=tp_price,
-                        )
-                    )
-                except Exception as e:
-                    err = str(e).lower()
-                    if "pattern day trading protection" in err or '"code":40310100' in err:
-                        print(f"⏳ PDT active — deferring TP attach for {symbol}.")
-                        return 0
-                    if "insufficient qty available" in err or '"code":40310000' in err:
-                        print(f"ℹ️ {symbol}: qty held by existing orders — skip duplicate TP.")
-                        return 0
-                    raise
+                    trading_client.cancel_order(order.id)
+                    print(f"🧹 Cancelled stale {label} order {order.id} @ {price} for {symbol}.")
+                except Exception as cancel_err:
+                    print(f"⚠️ Failed to cancel stale {label} order {order.id}: {cancel_err}")
 
-        # --- Place SL if missing ---
-        if existing_sl and sl_price and _close_enough(existing_sl, sl_price):
-            print(f"⏭️ SL already exists at {existing_sl}, skipping new SL.")
-        else:
-            if sl_price:
-                print(f"📌 Submitting SL for {symbol} @ {sl_price}")
-                try:
-                    trading_client.submit_order(
-                        StopOrderRequest(
-                            symbol=symbol,
-                            qty=_get_qty(),
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.GTC,
-                            stop_price=sl_price,
-                        )
+        if tp_price and stale_tp_orders:
+            _cancel_orders(stale_tp_orders, "TP")
+            existing_tp = None  # force re-placement after cancelling stale legs
+        if sl_price and stale_sl_orders:
+            _cancel_orders(stale_sl_orders, "SL")
+            existing_sl = None
+
+        qty = float(pos_qty)
+
+        if existing_tp:
+            print(f"⏭️ TP already exists at {getattr(existing_tp, 'limit_price', tp_price)}, skipping new TP.")
+            ok_tp = True
+        elif tp_price:
+            print(f"📌 Submitting TP for {symbol} @ {tp_price}")
+            try:
+                trading_client.submit_order(
+                    LimitOrderRequest(
+                        symbol=symbol,
+                        qty=qty,
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC,
+                        limit_price=tp_price,
                     )
-                except Exception as e:
-                    err = str(e).lower()
-                    if "pattern day trading protection" in err or '"code":40310100' in err:
-                        print(f"⏳ PDT active — deferring SL attach for {symbol}.")
-                        return 0
-                    if "insufficient qty available" in err or '"code":40310000' in err:
-                        print(f"ℹ️ {symbol}: qty held by existing orders — skip duplicate SL.")
-                        return 0
-                    raise
+                )
+                ok_tp = True
+            except Exception as e:
+                if _is_pattern_day_trading_error(e):
+                    print(f"⏳ PDT active — deferring TP attach for {symbol}.")
+                    _set_pdt_global_lockout(f"TP attach denied for {symbol}")
+                    return False
+                err = str(e).lower()
+                if "insufficient qty available" in err or '"code":40310000' in err:
+                    print(f"ℹ️ {symbol}: qty held by existing orders — skip duplicate TP for now.")
+                    return False
+                raise
+
+        if existing_sl:
+            print(f"⏭️ SL already exists at {getattr(existing_sl, 'stop_price', sl_price)}, skipping new SL.")
+            ok_sl = True
+        elif sl_price:
+            print(f"📌 Submitting SL for {symbol} @ {sl_price}")
+            try:
+                trading_client.submit_order(
+                    StopOrderRequest(
+                        symbol=symbol,
+                        qty=qty,
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC,
+                        stop_price=sl_price,
+                    )
+                )
+                ok_sl = True
+            except Exception as e:
+                if _is_pattern_day_trading_error(e):
+                    print(f"⏳ PDT active — deferring SL attach for {symbol}.")
+                    _set_pdt_global_lockout(f"SL attach denied for {symbol}")
+                    return False
+                err = str(e).lower()
+                if "insufficient qty available" in err or '"code":40310000' in err:
+                    print(f"ℹ️ {symbol}: qty held by existing orders — skip duplicate SL for now.")
+                    return False
+                raise
+
+        return (not tp_price or ok_tp) and (not sl_price or ok_sl)
 
     except Exception as e:
         print(f"❌ place_split_protection error for {symbol}: {e}")
+        return False
 
 
 def start_background_workers():
