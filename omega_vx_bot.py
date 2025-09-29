@@ -211,6 +211,10 @@ MIN_TRADE_QTY = 1
 _DAILY_TRADE_COUNT = 0
 _DAILY_TRADE_DATE = datetime.now().date()
 
+# --- Trade Re-entry Guards ---
+REENTRY_DIP_PCT = _float_env("REENTRY_DIP_PCT", 2.0)  # % dip required for same-day reentry
+_symbol_last_trade = {}  # {"SNAP": {"date": date, "exit_price": 8.57, "count": 1}}
+
 def _check_daily_trade_cap():
     global _DAILY_TRADE_COUNT, _DAILY_TRADE_DATE
     today = datetime.now().date()
@@ -230,6 +234,31 @@ def _check_daily_trade_cap():
 def _increment_daily_trade_count():
     global _DAILY_TRADE_COUNT
     _DAILY_TRADE_COUNT += 1
+
+
+def _can_trade_symbol_today(symbol: str, entry: float) -> bool:
+    today = datetime.now().date()
+    record = _symbol_last_trade.get(symbol.upper())
+
+    if not record:
+        return True
+
+    if record.get("date") == today:
+        count = int(record.get("count", 0) or 0)
+        if count >= 2:
+            print(f"🚫 Re-entry blocked for {symbol}: max daily trades reached ({count}).")
+            return False
+        last_exit = record.get("exit_price")
+        if last_exit is None:
+            print(f"🚫 Re-entry blocked for {symbol}: exit price unavailable for dip check.")
+            return False
+        dip_threshold = last_exit * (1 - REENTRY_DIP_PCT / 100.0)
+        if entry < dip_threshold:
+            print(f"🔄 Re-entry allowed for {symbol}: entry {entry} < dip threshold {dip_threshold:.2f}")
+            return True
+        print(f"🚫 Re-entry blocked for {symbol}: entry {entry} not below dip threshold {dip_threshold:.2f}")
+        return False
+    return True
 
 # sanity clamps to keep env overrides within reasonable bounds
 if MAX_RISK_AUTO_MIN < 0:
@@ -680,6 +709,26 @@ def close_position_safely(symbol: str) -> bool:
                           fill_price=favg, realized_pnl=realized)
             except Exception as _le:
                 print(f"⚠️ Trade log (SELL) failed: {_le}")
+
+            exit_price = None
+            try:
+                if favg is not None:
+                    exit_price = float(favg)
+                elif pre_avg is not None:
+                    exit_price = float(pre_avg)
+            except Exception:
+                exit_price = None
+            if exit_price is not None:
+                key = symbol.upper()
+                prev = _symbol_last_trade.get(key, {})
+                current_count = int(prev.get("count", 0) or 0)
+                if current_count <= 0:
+                    current_count = 1
+                _symbol_last_trade[key] = {
+                    "date": datetime.now().date(),
+                    "exit_price": exit_price,
+                    "count": current_count,
+                }
         except Exception as _fe:
             print(f"⚠️ Could not backfill SELL fill for {symbol}: {_fe}")
         return True
@@ -728,6 +777,26 @@ def close_position_safely(symbol: str) -> bool:
                           fill_price=favg, realized_pnl=realized)
             except Exception as _le:
                 print(f"⚠️ Trade log (SELL) failed: {_le}")
+
+            exit_price = None
+            try:
+                if favg is not None:
+                    exit_price = float(favg)
+                elif pre_avg is not None:
+                    exit_price = float(pre_avg)
+            except Exception:
+                exit_price = None
+            if exit_price is not None:
+                key = symbol.upper()
+                prev = _symbol_last_trade.get(key, {})
+                current_count = int(prev.get("count", 0) or 0)
+                if current_count <= 0:
+                    current_count = 1
+                _symbol_last_trade[key] = {
+                    "date": datetime.now().date(),
+                    "exit_price": exit_price,
+                    "count": current_count,
+                }
             return True
         except Exception as e2:
             if _is_pattern_day_trading_error(e2):
@@ -1648,6 +1717,15 @@ def submit_order_with_retries(
             _maybe_alert_pdt(msg, day_trades_left=rem, pattern_flag=pattern_flag)
             return False
 
+    # --- Per-symbol daily trade guard ---
+    if not _can_trade_symbol_today(symbol, entry):
+        print(f"🚫 Skipping {symbol} — already traded today and dip rule not met.")
+        try:
+            send_telegram_alert(f"🚫 Skipping {symbol} — already traded today and dip rule not met.")
+        except Exception:
+            pass
+        return False
+
     if not _check_daily_trade_cap():
         return False
 
@@ -1848,6 +1926,23 @@ def submit_order_with_retries(
     except Exception: pass
 
     print(f"✅ Order + protection finished for {symbol}.")
+
+    # Track per-symbol trade count for re-entry guard
+    today = datetime.now().date()
+    key = symbol.upper()
+    prev = _symbol_last_trade.get(key)
+    if prev and prev.get("date") == today:
+        count = int(prev.get("count", 0) or 0) + 1
+        exit_price = prev.get("exit_price")
+    else:
+        count = 1
+        exit_price = None
+    _symbol_last_trade[key] = {
+        "date": today,
+        "exit_price": exit_price,
+        "count": count,
+    }
+
     _increment_daily_trade_count()
     try:
         log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed",
