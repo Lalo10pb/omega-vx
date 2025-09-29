@@ -45,7 +45,8 @@ def connect_client() -> TradingClient:
     if not key or not sec:
         print("❌ Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY in .env")
         sys.exit(1)
-    return TradingClient(key, sec, paper=True)
+    paper = os.getenv("ALPACA_PAPER", "false").lower() == "true"
+    return TradingClient(key, sec, paper=paper)
 
 
 def list_open_orders(tc: TradingClient):
