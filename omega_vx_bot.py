@@ -10,6 +10,7 @@ import requests
 import subprocess
 import sys
 import functools
+from typing import Optional
 from datetime import datetime, timedelta, time as dt_time
 import numpy as np
 import pandas as pd
