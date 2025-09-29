@@ -28,6 +28,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderSt
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.mappings import BAR_MAPPING
 from alpaca.trading.client import TradingClient
 from alpaca.data.enums import DataFeed
 from datetime import datetime, timedelta, time as dt_time, timezone
@@ -274,6 +275,65 @@ LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
 # === Alpaca Clients ===
 trading_client = TradingClient(API_KEY, API_SECRET, paper=PAPER_MODE)
 data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
+try:
+    _RAW_DATA_CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET, raw_data=True)
+except Exception:
+    _RAW_DATA_CLIENT = None
+
+
+def _bars_df_from_raw_payload(raw_payload):
+    if not raw_payload:
+        return pd.DataFrame()
+
+    records = []
+    for symbol, bars in raw_payload.items():
+        if not bars:
+            continue
+        for bar in bars:
+            if not isinstance(bar, dict):
+                continue
+            mapped = {
+                BAR_MAPPING[key]: value
+                for key, value in bar.items()
+                if key in BAR_MAPPING and value is not None
+            }
+            if not mapped:
+                continue
+            mapped["symbol"] = symbol
+            records.append(mapped)
+
+    if not records:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(records)
+    if "timestamp" in frame.columns:
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+        frame = frame.dropna(subset=["timestamp"])
+        if frame.empty:
+            return pd.DataFrame()
+        frame = frame.set_index(["symbol", "timestamp"]).sort_index()
+    return frame
+
+
+def _fetch_bars_df(symbol: str, request: StockBarsRequest) -> pd.DataFrame:
+    try:
+        return data_client.get_stock_bars(request).df
+    except AttributeError as err:
+        if "items" not in str(err):
+            raise
+        print(f"⚠️ Alpaca returned null bars for {symbol}; sanitizing raw payload.")
+        if _RAW_DATA_CLIENT is None:
+            print(f"⚠️ Raw data client unavailable; returning empty bars for {symbol}.")
+            return pd.DataFrame()
+        try:
+            raw_payload = _RAW_DATA_CLIENT.get_stock_bars(request)
+        except Exception as raw_err:
+            print(f"⚠️ Raw payload fetch failed for {symbol}: {raw_err}")
+            return pd.DataFrame()
+        sanitized = _bars_df_from_raw_payload(raw_payload)
+        if sanitized.empty:
+            print(f"⚠️ No usable bars found for {symbol} after sanitizing raw payload.")
+        return sanitized
 
 # === Flask App ===
 app = Flask(__name__)
@@ -875,7 +935,7 @@ def get_bars(symbol, interval='15m', lookback=10):
             end=end,
             feed=feed,
         )
-        return data_client.get_stock_bars(req).df
+        return _fetch_bars_df(symbol, req)
 
     bars = _fetch_data_with_fallback(_request, symbol, feed=_DATA_FEED)
     if bars is None or bars.empty:
@@ -909,7 +969,7 @@ def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
             end=_end,
             feed=feed,
         )
-        return data_client.get_stock_bars(req).df
+        return _fetch_bars_df(symbol, req)
 
     # 1) Try requested timeframe on IEX
     bars = _fetch_data_with_fallback(
@@ -1316,7 +1376,7 @@ def get_current_vix():
             end=datetime.now(timezone.utc),
             feed=_DATA_FEED,
         )
-        bars = data_client.get_stock_bars(req).df
+        bars = _fetch_bars_df("^VIX", req)
     except Exception as e:
         if "subscription does not permit" in str(e).lower() and _DATA_FEED != DataFeed.IEX:
             try:
@@ -1327,7 +1387,7 @@ def get_current_vix():
                     end=datetime.now(timezone.utc),
                     feed=DataFeed.IEX,
                 )
-                bars = data_client.get_stock_bars(req).df
+                bars = _fetch_bars_df("^VIX", req)
             except Exception as e2:
                 print(f"❌ Failed to get VIX (IEX fallback): {e2}")
                 return 0
@@ -1498,7 +1558,7 @@ def get_rsi_value(symbol, interval='15m', period=14):
             end=_end,
             feed=feed,
         )
-        return data_client.get_stock_bars(req).df
+        return _fetch_bars_df(symbol, req)
 
     # 1) Try requested timeframe on IEX
     bars = _fetch_data_with_fallback(
