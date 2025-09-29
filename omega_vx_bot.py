@@ -315,24 +315,33 @@ def _bars_df_from_raw_payload(raw_payload):
     return frame
 
 
-def _fetch_bars_df(symbol: str, request: StockBarsRequest) -> pd.DataFrame:
+def _fetch_bars_df(symbol: str, request: StockBarsRequest) -> Optional[pd.DataFrame]:
     try:
         return data_client.get_stock_bars(request).df
     except AttributeError as err:
         if "items" not in str(err):
             raise
-        print(f"⚠️ Alpaca returned null bars for {symbol}; sanitizing raw payload.")
+        timeframe = getattr(request, "timeframe", None)
+        feed = getattr(request, "feed", None)
+        print(
+            "⚠️ Alpaca returned null bars for "
+            f"{symbol} (tf={getattr(timeframe, 'value', timeframe)}, feed={getattr(feed, 'value', feed)}); sanitizing raw payload."
+        )
         if _RAW_DATA_CLIENT is None:
             print(f"⚠️ Raw data client unavailable; returning empty bars for {symbol}.")
-            return pd.DataFrame()
+            return None
         try:
             raw_payload = _RAW_DATA_CLIENT.get_stock_bars(request)
         except Exception as raw_err:
             print(f"⚠️ Raw payload fetch failed for {symbol}: {raw_err}")
-            return pd.DataFrame()
+            return None
         sanitized = _bars_df_from_raw_payload(raw_payload)
         if sanitized.empty:
-            print(f"⚠️ No usable bars found for {symbol} after sanitizing raw payload.")
+            print(
+                f"⚠️ No usable bars found for {symbol} after sanitizing raw payload "
+                f"(tf={getattr(timeframe, 'value', timeframe)}, feed={getattr(feed, 'value', feed)})."
+            )
+            return None
         return sanitized
 
 # === Flask App ===
