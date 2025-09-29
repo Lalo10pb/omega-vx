@@ -2558,6 +2558,10 @@ def close_position_if_needed(symbol: str, reason: str) -> bool:
 def place_split_protection(symbol, tp_price, sl_price):
     """Attach TP and SL if they are not already present (avoid duplicates)."""
     try:
+        # --- Normalize price increments ---
+        tp_price = _quantize_to_tick(tp_price)
+        sl_price = _quantize_to_tick(sl_price)
+
         # --- Check existing open SELL orders ---
         req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
         open_orders = trading_client.get_orders(filter=req)
@@ -2582,35 +2586,44 @@ def place_split_protection(symbol, tp_price, sl_price):
         def _close_enough(p1, p2):
             return abs(p1 - p2) / max(1e-6, p1) <= 0.005
 
+        qty_cache = {"val": None}
+
+        def _get_qty():
+            if qty_cache["val"] is None:
+                qty_cache["val"] = trading_client.get_open_position(symbol).qty
+            return qty_cache["val"]
+
         # --- Place TP if missing ---
-        if existing_tp and _close_enough(existing_tp, tp_price):
+        if existing_tp and tp_price and _close_enough(existing_tp, tp_price):
             print(f"⏭️ TP already exists at {existing_tp}, skipping new TP.")
         else:
-            print(f"📌 Submitting TP for {symbol} @ {tp_price}")
-            trading_client.submit_order(
-                LimitOrderRequest(
-                    symbol=symbol,
-                    qty=trading_client.get_open_position(symbol).qty,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.GTC,
-                    limit_price=tp_price,
+            if tp_price:
+                print(f"📌 Submitting TP for {symbol} @ {tp_price}")
+                trading_client.submit_order(
+                    LimitOrderRequest(
+                        symbol=symbol,
+                        qty=_get_qty(),
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC,
+                        limit_price=tp_price,
+                    )
                 )
-            )
 
         # --- Place SL if missing ---
-        if existing_sl and _close_enough(existing_sl, sl_price):
+        if existing_sl and sl_price and _close_enough(existing_sl, sl_price):
             print(f"⏭️ SL already exists at {existing_sl}, skipping new SL.")
         else:
-            print(f"📌 Submitting SL for {symbol} @ {sl_price}")
-            trading_client.submit_order(
-                StopOrderRequest(
-                    symbol=symbol,
-                    qty=trading_client.get_open_position(symbol).qty,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.GTC,
-                    stop_price=sl_price,
+            if sl_price:
+                print(f"📌 Submitting SL for {symbol} @ {sl_price}")
+                trading_client.submit_order(
+                    StopOrderRequest(
+                        symbol=symbol,
+                        qty=_get_qty(),
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC,
+                        stop_price=sl_price,
+                    )
                 )
-            )
 
     except Exception as e:
         print(f"❌ place_split_protection error for {symbol}: {e}")
