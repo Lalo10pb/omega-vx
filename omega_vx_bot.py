@@ -297,7 +297,7 @@ def _fetch_data_with_fallback(request_function, symbol, feed=_DATA_FEED):
             return None
 
 # === Logging ===
-#print = functools.partial(print, flush=True)
+print = functools.partial(print, flush=True)
 CRASH_LOG_FILE = os.path.join(LOG_DIR, "last_boot.txt")
 LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
 LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
