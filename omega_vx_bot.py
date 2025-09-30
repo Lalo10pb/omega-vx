@@ -1709,12 +1709,18 @@ def submit_order_with_retries(
         _maybe_alert_pdt(msg)
         return False
 
+    # 🚦 Extra PDT guard: block BUY if we likely can't close safely
     if PDT_GUARD_ENABLED and not dry_run:
         rem, pattern_flag = _get_day_trade_status()
         if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
-            msg = f"🛑 Skipping {symbol} — only {rem} day trade(s) remaining."
+            msg = f"🚫 Skipping BUY {symbol} — insufficient day trades left to safely exit later (rem={rem})."
             print(msg)
             _maybe_alert_pdt(msg, day_trades_left=rem, pattern_flag=pattern_flag)
+            try:
+                send_telegram_alert(msg)
+                send_telegram_alert(f"📊 PDT Status: {rem} day trades left | PDT flag={pattern_flag}")
+            except Exception:
+                pass
             return False
 
     # --- Per-symbol daily trade guard ---
