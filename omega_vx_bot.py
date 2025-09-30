@@ -375,7 +375,13 @@ def _fetch_bars_df(symbol: str, request: StockBarsRequest) -> Optional[pd.DataFr
         return sanitized
 
 # === Flask App ===
+
 app = Flask(__name__)
+
+# --- Health check root route for Render ---
+@app.route("/", methods=["GET"])
+def home():
+    return "Omega-VX running", 200
 
 # === Watchdog cooldown ===
 from time import monotonic
