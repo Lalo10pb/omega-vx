@@ -2664,12 +2664,7 @@ def place_split_protection(symbol, tp_price, sl_price):
         tp_price = _quantize_to_tick(tp_price)
         sl_price = _quantize_to_tick(sl_price)
 
-        try:
-            position = trading_client.get_open_position(symbol)
-            pos_qty = float(getattr(position, "qty", getattr(position, "qty_available", 0)))
-        except Exception:
-            pos_qty = 0.0
-
+        pos_qty = _get_available_qty(symbol)
         if pos_qty <= 0:
             print(f"⏳ Protection skipped for {symbol} — no open qty to protect.")
             return False
@@ -2719,7 +2714,15 @@ def place_split_protection(symbol, tp_price, sl_price):
             _cancel_orders(stale_sl_orders, "SL")
             existing_sl = None
 
-        qty = float(pos_qty)
+        qty_dec = Decimal(str(pos_qty))
+        if qty_dec <= 0:
+            print(f"⏳ Protection skipped for {symbol} — non-positive qty {qty_dec}.")
+            return False
+
+        if qty_dec == qty_dec.to_integral_value():
+            qty = int(qty_dec)
+        else:
+            qty = str(qty_dec.normalize())
 
         if existing_tp:
             print(f"⏭️ TP already exists at {getattr(existing_tp, 'limit_price', tp_price)}, skipping new TP.")
@@ -2799,8 +2802,15 @@ def start_background_workers():
 
 # === Run the Flask app and start autoscan thread if main ===
 if __name__ == "__main__":
+    try:
+        handle_restart_notification()
+    except Exception:
+        pass
+
     start_background_workers()
     logging.info("Starting Flask App")
+    port = int(os.getenv("PORT", "10000"))
     try:
-        app.run(host="0.0.0.0", port=10000)
-    except Exception as e: logging.error(e)
+        app.run(host="0.0.0.0", port=port)
+    except Exception as e:
+        logging.error(e)
