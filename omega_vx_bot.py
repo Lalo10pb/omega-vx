@@ -2113,14 +2113,137 @@ def _read_trades_df(path: str = TRADE_LOG_PATH) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def summarize_realized_pnl_for_da<truncated__content/>
+def summarize_realized_pnl_for_day(day: _date = None, path: str = TRADE_LOG_PATH) -> dict:
+    """Realized PnL for a given calendar day (UTC), using SELL rows with numeric realized_pnl."""
+    day = day or _date.today()
+    df = _read_trades_df(path)
+    if df.empty:
+        return {
+            "date": str(day),
+            "total_realized_pnl": 0.0,
+            "trades_closed": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate_pct": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "best": 0.0,
+            "worst": 0.0,
+        }
+    if 'action' not in df.columns:
+        df['action'] = None
+    df['realized_pnl'] = pd.to_numeric(df.get('realized_pnl'), errors='coerce')
+    df_day = df[(df['action'].astype(str).str.upper() == 'SELL') & (df['timestamp'].dt.date == day)]
+    df_day = df_day.dropna(subset=['realized_pnl'])
+    total = float(df_day['realized_pnl'].sum()) if not df_day.empty else 0.0
+    wins_mask = df_day['realized_pnl'] > 0
+    losses_mask = df_day['realized_pnl'] <= 0
+    wins = int(wins_mask.sum())
+    losses = int(losses_mask.sum())
+    count = int(len(df_day))
+    win_rate = (wins / count * 100.0) if count else 0.0
+    avg_win = float(df_day.loc[wins_mask, 'realized_pnl'].mean() or 0.0)
+    avg_loss = float(df_day.loc[losses_mask, 'realized_pnl'].mean() or 0.0)
+    best = float(df_day['realized_pnl'].max()) if count else 0.0
+    worst = float(df_day['realized_pnl'].min()) if count else 0.0
+    return {
+        "date": str(day),
+        "total_realized_pnl": round(total, 2),
+        "trades_closed": count,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(win_rate, 2),
+        "avg_win": round(avg_win, 2),
+        "avg_loss": round(avg_loss, 2),
+        "best": round(best, 2),
+        "worst": round(worst, 2),
+    }
+
+
+def append_daily_performance_row(metrics: dict, sheet_id: str = None, tab_name: str = None) -> None:
+    """Append a dated row to a Google Sheet tab (default: 'Performance Daily')."""
+    try:
+        client = _get_gspread_client()
+        sid = _clean_env(sheet_id or os.getenv("GOOGLE_SHEET_ID"))
+        tab = _clean_env(tab_name or PERF_DAILY_TAB or "Performance Daily")
+        if not sid:
+            print("⚠️ No GOOGLE_SHEET_ID configured; skipping Performance append.")
+            return
+        ss = client.open_by_key(sid)
+        try:
+            ws = ss.worksheet(tab)
+        except Exception:
+            ws = ss.add_worksheet(title=tab, rows=100, cols=10)
+        header = [
+            "Date","Total Realized PnL","Trades Closed","Wins","Losses",
+            "Win Rate %","Avg Win","Avg Loss","Best","Worst"
+        ]
+        try:
+            existing = ws.get_all_values()[:1]
+        except Exception:
+            existing = []
+        if not existing:
+            ws.update(values=[header], range_name='A1')
+        row = [
+            metrics.get('date'),
+            f"{metrics.get('total_realized_pnl', 0.0):.2f}",
+            str(metrics.get('trades_closed', 0)),
+            str(metrics.get('wins', 0)),
+            str(metrics.get('losses', 0)),
+            f"{metrics.get('win_rate_pct', 0.0):.2f}",
+            f"{metrics.get('avg_win', 0.0):.2f}",
+            f"{metrics.get('avg_loss', 0.0):.2f}",
+            f"{metrics.get('best', 0.0):.2f}",
+            f"{metrics.get('worst', 0.0):.2f}",
+        ]
+        ws.append_row(row)
+        print("✅ Appended daily performance row.")
+    except Exception as e:
+        print(f"⚠️ Failed to append performance row: {e}")
+
+
+def update_google_performance_sheet(metrics: dict, sheet_id: str = None, tab_name: str = None) -> None:
+    """Write key P&L metrics to a dedicated Google Sheet tab (default: 'Performance')."""
+    try:
+        client = _get_gspread_client()
+        sid = _clean_env(sheet_id or os.getenv("GOOGLE_SHEET_ID"))
+        tab = _clean_env(tab_name or os.getenv("PERF_SHEET_NAME") or "Performance")
+        if not sid:
+            print("⚠️ No GOOGLE_SHEET_ID configured; skipping Performance sheet update.")
+            return
+        ss = client.open_by_key(sid)
+        try:
+            ws = ss.worksheet(tab)
+        except Exception:
+            ws = ss.add_worksheet(title=tab, rows=50, cols=4)
+
+        rows = [
+            ["Metric", "Value"],
+            ["Total Realized PnL", f"{metrics.get('total_realized_pnl', 0.0):.2f}"],
+            ["Trades Closed", str(metrics.get('trades_closed', 0))],
+            ["Wins", str(metrics.get('wins', 0))],
+            ["Losses", str(metrics.get('losses', 0))],
+            ["Win Rate %", f"{metrics.get('win_rate_pct', 0.0):.2f}"],
+            ["Avg Win", f"{metrics.get('avg_win', 0.0):.2f}"],
+            ["Avg Loss", f"{metrics.get('avg_loss', 0.0):.2f}"],
+            ["Best Trade", f"{metrics.get('best', 0.0):.2f}"],
+            ["Worst Trade", f"{metrics.get('worst', 0.0):.2f}"],
+        ]
+        try:
+            ws.clear()
+        except Exception:
+            pass
+        ws.update(values=rows, range_name='A1')
+        print("✅ Performance sheet updated.")
+    except Exception as e:
+        print(f"⚠️ Failed to update performance sheet: {e}")
+
 
 # === MAIN GUARD ===
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
     handle_restart_notification()
     with _BACKGROUND_WORKERS_LOCK:
-        global _BACKGROUND_WORKERS_STARTED
         if not _BACKGROUND_WORKERS_STARTED:
             _BACKGROUND_WORKERS_STARTED = True
             start_autoscan_thread()
