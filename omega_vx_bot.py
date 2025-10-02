@@ -2238,6 +2238,488 @@ def update_google_performance_sheet(metrics: dict, sheet_id: str = None, tab_nam
     except Exception as e:
         print(f"⚠️ Failed to update performance sheet: {e}")
 
+# --- Weekend Improvements: Open Positions helpers & EOD/Janitor schedulers ---
+
+def get_symbol_tp_sl_open_orders(symbol: str):
+    """Return (tp_limit, sl_stop) from current OPEN SELL orders, if present."""
+    tp, sl = None, None
+    try:
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        for o in trading_client.get_orders(filter=req):
+            side = str(getattr(o, 'side', '')).lower()
+            if not side.endswith('sell'):
+                continue
+            otype = str(getattr(o, 'type', '')).lower()
+            if otype == 'limit':
+                try: tp = float(getattr(o, 'limit_price', tp))
+                except Exception: pass
+            elif otype == 'stop':
+                try: sl = float(getattr(o, 'stop_price', sl))
+                except Exception: pass
+    except Exception as e:
+        print(f"⚠️ get_symbol_tp_sl_open_orders failed for {symbol}: {e}")
+    return tp, sl
+
+
+def push_open_positions_to_sheet():
+    """Write current open positions to Google Sheet tab (clears & replaces)."""
+    try:
+        client = _get_gspread_client()
+        sid = _clean_env(os.getenv('GOOGLE_SHEET_ID'))
+        tab = OPEN_POSITIONS_TAB
+        if not sid:
+            print("⚠️ No GOOGLE_SHEET_ID configured; skip Open Positions push.")
+            return
+        ss = client.open_by_key(sid)
+        try:
+            ws = ss.worksheet(tab)
+        except Exception:
+            ws = ss.add_worksheet(title=tab, rows=200, cols=10)
+        header = ["symbol","qty","avg_entry","current","pnl_pct","tp","sl","updated_at"]
+        rows = [header]
+        positions = trading_client.get_all_positions()
+        now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+        for p in positions:
+            symbol = p.symbol
+            qty = int(float(p.qty))
+            avg_entry = float(p.avg_entry_price)
+            current = float(p.current_price)
+            pnl_pct = float(p.unrealized_plpc) * 100.0
+            tp, sl = get_symbol_tp_sl_open_orders(symbol)
+            rows.append([symbol, qty, round(avg_entry,2), round(current,2), round(pnl_pct,2), tp, sl, now])
+        try:
+            ws.clear()
+        except Exception:
+            pass
+        ws.update(values=rows, range_name='A1')
+        print(f"✅ Open positions pushed ({len(rows)-1} rows).")
+    except Exception as e:
+        print(f"⚠️ Open positions push failed: {e}")
+
+
+def start_open_positions_pusher():
+    if not OPEN_POSITIONS_PUSH:
+        print("📄 Open Positions pusher disabled.")
+        return
+    def _loop():
+        print(f"📄 Open Positions → Google Sheet every {OPEN_POSITIONS_INTERVAL}s → tab '{OPEN_POSITIONS_TAB}'")
+        while True:
+            try:
+                push_open_positions_to_sheet()
+            except Exception as e:
+                print(f"⚠️ Pusher error: {e}")
+            time.sleep(OPEN_POSITIONS_INTERVAL)
+    threading.Thread(target=_loop, daemon=True).start()
+
+
+def start_eod_summary_scheduler():
+    if not EOD_SUMMARY:
+        print("🕗 EOD summary disabled.")
+        return
+    last_file = os.path.join(LOG_DIR, 'eod_last_run.txt')
+    def _loop():
+        print(f"🕗 EOD summary scheduler active (UTC hour={EOD_SUMMARY_HOUR_UTC}, tab='{PERF_DAILY_TAB}')")
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                should_run = now.hour == EOD_SUMMARY_HOUR_UTC
+                last_day = None
+                if os.path.exists(last_file):
+                    try:
+                        with open(last_file, 'r') as f:
+                            last_day = f.read().strip()
+                    except Exception:
+                        last_day = None
+                already_ran_today = (last_day == now.strftime('%Y-%m-%d'))
+                if should_run and not already_ran_today:
+                    metrics = summarize_realized_pnl_for_day(now.date())
+                    append_daily_performance_row(metrics)
+                    try:
+                        send_telegram_alert(
+                            f"📬 EOD summary appended for {metrics['date']}: PnL ${metrics['total_realized_pnl']:.2f} (win rate {metrics['win_rate_pct']:.1f}%)"
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        with open(last_file, 'w') as f:
+                            f.write(now.strftime('%Y-%m-%d'))
+                    except Exception:
+                        pass
+                time.sleep(60)
+            except Exception as e:
+                print(f"⚠️ EOD scheduler error: {e}")
+                time.sleep(60)
+    threading.Thread(target=_loop, daemon=True).start()
+
+
+def start_order_janitor():
+    if not ORDER_JANITOR:
+        print("🧹 Order janitor disabled.")
+        return
+    def _loop():
+        print(f"🧹 Order janitor running every {ORDER_JANITOR_INTERVAL}s …")
+        while True:
+            try:
+                pos_symbols = {p.symbol for p in trading_client.get_all_positions()}
+                req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+                open_orders = trading_client.get_orders(filter=req)
+                cancelled = 0
+                for o in open_orders:
+                    side = str(getattr(o, 'side','')).lower()
+                    sym = getattr(o, 'symbol', None)
+                    if sym and side.endswith('sell') and sym not in pos_symbols:
+                        try:
+                            trading_client.cancel_order_by_id(o.id)
+                            cancelled += 1
+                        except Exception as ce:
+                            print(f"⚠️ Cancel failed {sym}/{o.id}: {ce}")
+                if cancelled:
+                    msg = f"🧹 Cancelled {cancelled} stray SELL order(s) on symbols without positions."
+                    print(msg)
+                    try: send_telegram_alert(msg)
+                    except Exception: pass
+            except Exception as e:
+                print(f"⚠️ Janitor error: {e}")
+            time.sleep(ORDER_JANITOR_INTERVAL)
+    threading.Thread(target=_loop, daemon=True).start()
+
+def start_auto_sell_monitor():
+    def monitor():
+        while True:
+            try:
+                # Add a timeout to the API call
+                positions = trading_client.get_all_positions()
+
+                for position in positions:
+                    symbol = position.symbol
+                    qty = float(position.qty)
+                    entry_price = float(position.avg_entry_price)
+                    current_price = float(position.current_price)
+                    percent_change = float(position.unrealized_plpc) * 100
+
+                    print(f"📊 {symbol}: Qty={qty} Entry=${entry_price:.2f} Now=${current_price:.2f} PnL={percent_change:.2f}%")
+
+                    # Cooldown guard (inserted)
+                    now_t = monotonic()
+                    last_t = _last_close_attempt.get(symbol, 0.0)
+                    if now_t - last_t < _CLOSE_COOLDOWN_SEC:
+                        continue
+
+                    hit_trailing = percent_change <= -2.0
+                    hit_take_profit = percent_change >= 5.0
+                    hit_stop_loss = percent_change <= -3.5
+
+                    if hit_trailing or hit_take_profit or hit_stop_loss:
+                        reason = "❗"
+                        if hit_take_profit:
+                            reason += "Take Profit Hit"
+                        elif hit_trailing:
+                            reason += "Trailing Stop Hit"
+                        elif hit_stop_loss:
+                            reason += "Hard Stop Hit"
+
+                        print(f"💥 {symbol} closing position — {reason}")
+                        now_t = monotonic()
+                        ok = close_position_safely(symbol)  # cancels SELLs, then closes
+                        _last_close_attempt[symbol] = now_t  # start cooldown
+                        if ok:
+                            print(f"✅ Position closed for {symbol}")
+                            # Update Performance sheet after a realized SELL is logged
+                            try:
+                                metrics = summarize_pnl_from_csv(TRADE_LOG_PATH)
+                                update_google_performance_sheet(metrics)
+                            except Exception as perf_e:
+                                print(f"⚠️ Performance update failed: {perf_e}")
+                            send_telegram_alert(f"💥 {symbol} auto-closed: {reason}")
+                        else:
+                            print(f"⚠️ Safe close failed for {symbol}; will retry after cooldown.")
+                            send_telegram_alert(f"⚠️ Safe close failed for {symbol}; will retry after cooldown.")
+
+            except Exception as monitor_error:
+                print(f"❌ Watchdog error: {monitor_error}")
+                send_telegram_alert(f"⚠️ Watchdog error: {monitor_error}")
+
+            time.sleep(30)
+
+    t = threading.Thread(target=monitor, daemon=True)
+    t.start()
+
+def is_cooldown_active():
+    if not os.path.exists(LAST_TRADE_FILE):
+        return False
+    with open(LAST_TRADE_FILE, 'r') as f:
+        last_trade_time_str = f.read().strip()
+    if not last_trade_time_str:
+        return False
+    try:
+        last_trade_time = datetime.strptime(last_trade_time_str, "%Y-%m-%d %H:%M:%S")
+        elapsed = (datetime.now() - last_trade_time).total_seconds()
+        return elapsed < TRADE_COOLDOWN_SECONDS
+    except Exception as e:
+        print("⚠️ Error reading last trade time:", e)
+        return False
+
+def is_ai_mood_bad():
+    """Evaluate trade mood based on recent outcomes and equity drawdown."""
+    try:
+        df = pd.read_csv(TRADE_LOG_PATH, parse_dates=["timestamp"])
+        recent = df.tail(5)
+
+        loss_streak = sum(recent["status"].str.contains("loss|error|skipped", case=False))
+        win_streak = sum(recent["status"].str.contains("executed", case=False))
+
+        account = trading_client.get_account()  # ✅ New SDK method
+        equity = float(account.equity)
+        max_equity = get_max_equity()
+
+        drawdown = 0
+        if max_equity and equity < max_equity:
+            drawdown = (max_equity - equity) / max_equity
+
+        # 💡 Mood logic
+        if drawdown >= 0.05:
+            print("🧠 Mood: Drawdown triggered")
+            return True
+        if loss_streak >= 3 and win_streak == 0:
+            print("🧠 Mood: Consecutive losses")
+            return True
+
+        return False
+
+    except Exception as e:
+        print("⚠️ AI Mood check failed:", e)
+        return False
+
+def log_trade(symbol, qty, entry, stop_loss, take_profit, status, action=None, fill_price=None, realized_pnl=None):
+    explanation = generate_trade_explanation(
+        symbol=symbol,
+        entry=entry,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        rsi=None,
+        trend=None,
+        ha_candle=None
+    )
+
+    now = datetime.now()
+    hour = now.hour
+    if hour < 10:
+        context_time = "morning"
+    elif hour < 14:
+        context_time = "midday"
+    else:
+        context_time = "afternoon"
+
+    context_recent_outcome = "unknown"
+    context_equity_change = "unknown"
+
+    try:
+        if os.path.isfile(TRADE_LOG_PATH):
+            recent_df = pd.read_csv(TRADE_LOG_PATH)
+            if not recent_df.empty:
+                last_status = recent_df.iloc[-1]["status"]
+                context_recent_outcome = "win" if last_status == "executed" else "loss"
+
+                if "equity" in recent_df.columns:
+                    prev_equity = float(recent_df.iloc[-1].get("equity", 0))
+                    account = trading_client.get_account()
+                    current_equity = float(account.equity)
+                    context_equity_change = "gain" if current_equity > prev_equity else "loss"
+    except Exception as e:
+        print("⚠️ Failed to fetch recent outcome context:", e)
+
+    # 🕰 Timestamp
+    timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    if status == "executed":
+        with open(LAST_TRADE_FILE, 'w') as f:
+            f.write(timestamp_str)
+
+    # 🧠 Compile and log trade data
+    trade_data = {
+        "timestamp": timestamp_str,
+        "symbol": symbol,
+        "qty": qty,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "status": status,
+        "explanation": explanation,
+        "context_time_of_day": context_time,
+        "context_recent_outcome": context_recent_outcome,
+        "context_equity_change": context_equity_change,
+        "action": action,
+        "fill_price": fill_price,
+        "realized_pnl": realized_pnl
+    }
+
+    df = pd.DataFrame([trade_data])
+    if not os.path.isfile(TRADE_LOG_PATH):
+        df.to_csv(TRADE_LOG_PATH, index=False)
+    else:
+        df.to_csv(TRADE_LOG_PATH, mode='a', header=False, index=False)
+
+    # ✅ Google Sheet Logging
+    try:
+        client = _get_gspread_client()
+
+        sheet_id = _clean_env(os.getenv("GOOGLE_SHEET_ID"))
+        sheet_name = _clean_env(os.getenv("TRADE_SHEET_NAME") or "Trade Log")
+
+        if not sheet_id or not sheet_name:
+            raise ValueError("Missing GOOGLE_SHEET_ID or TRADE_SHEET_NAME environment variable.")
+
+        sheet = client.open_by_key(sheet_id).worksheet(sheet_name)
+
+        sheet.append_row([
+            timestamp_str, symbol, qty, entry, stop_loss, take_profit,
+            status, explanation, context_time, context_recent_outcome, context_equity_change,
+            action, fill_price, realized_pnl
+        ])
+        print("✅ Trade logged to Google Sheet.")
+
+    except Exception as e:
+        print("⚠️ Failed to log trade to Google Sheet:", e)
+
+    # === Update Performance sheet on SELL/close ===
+    try:
+        if str(action).upper() == 'SELL' or str(status).lower() in ('closed', 'sell'):
+            metrics = summarize_pnl_from_csv(TRADE_LOG_PATH)
+            update_google_performance_sheet(metrics)
+    except Exception as perf_e:
+        print(f"⚠️ Performance update failed: {perf_e}")
+
+
+_last_close_attempt = {}
+_CLOSE_COOLDOWN_SEC = 20  # seconds between close attempts per symbol
+
+def _get_available_qty(symbol: str) -> float:
+    """Return qty_available for an open position, or 0 if none."""
+    try:
+        positions = trading_client.get_all_positions()
+        for p in positions:
+            if p.symbol.upper() == symbol.upper():
+                return float(getattr(p, "qty_available", getattr(p, "qty", "0")))
+        return 0.0
+    except Exception as e:
+        print(f"⚠️ Could not fetch positions: {e}")
+        return 0.0
+
+def close_position_if_needed(symbol: str, reason: str) -> bool:
+    """Safely close a position if qty is available. Returns True if order was submitted."""
+    now = monotonic()
+    last = _last_close_attempt.get(symbol)
+    if last is not None and (now - last) < _CLOSE_COOLDOWN_SEC:
+        print(f"⏳ Skipping close for {symbol} (cooldown {int(_CLOSE_COOLDOWN_SEC - (now - last))}s).")
+        return False
+
+    qty_available = _get_available_qty(symbol)
+    if qty_available <= 0:
+        print(f"⚠️ No available qty for {symbol}, skipping close.")
+        return False
+
+    print(f"💥 {symbol} closing position — {reason} (qty_available={qty_available})")
+    try:
+        market_order = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty_available,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC
+        )
+        trading_client.submit_order(order_data=market_order)
+        _last_close_attempt[symbol] = now
+        send_telegram_alert(f"✅ {symbol} closed at market. Reason: {reason}")
+        print(f"✅ {symbol} position close submitted.")
+        return True
+    except Exception as e:
+        _last_close_attempt[symbol] = now
+        print(f"❌ Failed to close {symbol}: {e}")
+        send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
+        return False
+
+def place_split_protection(
+    symbol: str,
+    tp_price: float = None,
+    sl_price: float = None,
+    tp_pct: float = 0.03,
+    sl_pct: float = 0.02
+) -> bool:
+    """
+    Cancel all SELL orders on `symbol`, then attach reduce-only style protection by
+    submitting a TP (limit SELL) and SL (stop SELL), each for the full qty_available.
+    If qty_available is not yet free (e.g., BUY leg still settling), return False so
+    callers can retry shortly.
+    """
+    # 0) Cancel any existing SELLs to avoid qty conflicts
+    try:
+        n = cancel_open_sells(symbol)
+        if n:
+            print(f"🧹 Cancelled {n} existing SELLs on {symbol} before attaching protection.")
+    except Exception as e:
+        print(f"⚠️ Cancel SELLs failed for {symbol}: {e}")
+
+    # 1) Check qty_available from current position
+    qty_available = _get_available_qty(symbol)
+    if qty_available <= 0:
+        # BUY leg may still be settling; let caller retry later
+        return False
+
+    # 2) Get a recent price for % defaults if explicit prices weren't provided
+    from alpaca.data.requests import StockLatestQuoteRequest
+    last_px = None
+    try:
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=_DATA_FEED)
+        q = data_client.get_stock_latest_quote(req)
+        last_px = float(q[symbol].ask_price or q[symbol].bid_price)
+    except Exception:
+        # Fallback to position price if available
+        try:
+            pos = [p for p in trading_client.get_all_positions() if p.symbol.upper() == symbol.upper()]
+            if pos:
+                last_px = float(pos[0].current_price)
+        except Exception:
+            last_px = None
+
+    if tp_price is None and last_px:
+        tp_price = round(last_px * (1.0 + tp_pct), 2)
+    if sl_price is None and last_px:
+        sl_price = round(last_px * (1.0 - sl_pct), 2)
+
+    ok_any = False
+
+    # 3) Place TP limit SELL for the full qty_available
+    try:
+        if tp_price:
+            tp_req = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty_available,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                limit_price=float(tp_price),
+            )
+            trading_client.submit_order(tp_req)
+            print(f"✅ TP limit SELL placed: {qty_available} {symbol} @ {tp_price}")
+            ok_any = True
+    except Exception as e:
+        print(f"⚠️ TP place failed for {symbol}: {e}")
+
+    # 4) Place SL stop SELL for the full qty_available
+    try:
+        if sl_price:
+            sl_req = StopOrderRequest(
+                symbol=symbol,
+                qty=qty_available,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+                stop_price=float(sl_price),
+            )
+            trading_client.submit_order(sl_req)
+            print(f"✅ SL stop SELL placed: {qty_available} {symbol} @ {sl_price}")
+            ok_any = True
+    except Exception as e:
+        print(f"⚠️ SL place failed for {symbol}: {e}")
+
+    return ok_any
 
 # === MAIN GUARD ===
 if __name__ == "__main__":
