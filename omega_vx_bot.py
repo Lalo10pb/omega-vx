@@ -666,7 +666,7 @@ def cancel_open_sells(symbol: str) -> int:
         print(f"⚠️ list open sells failed for {symbol}: {e}")
     return n
 
-def close_position_safely(symbol: str) -> bool:
+def close_position_safely(symbol: str, *, session_type: str = "intraday", close_reason: str = "") -> bool:
     """
     Prevent “potential wash trade detected” by:
       1) Cancel all open SELL orders for the symbol
@@ -710,9 +710,19 @@ def close_position_safely(symbol: str) -> bool:
             if pre_avg is not None and favg is not None and fqty > 0:
                 realized = (float(favg) - float(pre_avg)) * float(fqty)
             try:
-                log_trade(symbol, fqty or pre_qty, pre_avg if pre_avg is not None else 0.0,
-                          None, None, status="closed", action="SELL",
-                          fill_price=favg, realized_pnl=realized)
+                log_trade(
+                    symbol,
+                    fqty or pre_qty,
+                    pre_avg if pre_avg is not None else 0.0,
+                    None,
+                    None,
+                    status="closed",
+                    action="SELL",
+                    fill_price=favg,
+                    realized_pnl=realized,
+                    session_type=session_type,
+                    close_reason=close_reason,
+                )
             except Exception as _le:
                 print(f"⚠️ Trade log (SELL) failed: {_le}")
 
@@ -778,9 +788,19 @@ def close_position_safely(symbol: str) -> bool:
             print(f"✅ Submitted market SELL {fqty} {symbol} (fallback).")
             send_telegram_alert(f"✅ Closed {symbol} with market SELL (fallback).")
             try:
-                log_trade(symbol, fqty, pre_avg if pre_avg is not None else 0.0,
-                          None, None, status="closed", action="SELL",
-                          fill_price=favg, realized_pnl=realized)
+                log_trade(
+                    symbol,
+                    fqty,
+                    pre_avg if pre_avg is not None else 0.0,
+                    None,
+                    None,
+                    status="closed",
+                    action="SELL",
+                    fill_price=favg,
+                    realized_pnl=realized,
+                    session_type=session_type,
+                    close_reason=close_reason,
+                )
             except Exception as _le:
                 print(f"⚠️ Trade log (SELL) failed: {_le}")
 
@@ -821,6 +841,26 @@ def close_position_safely(symbol: str) -> bool:
             print(f"❌ Safe close failed for {symbol}: {e} / fallback: {e2}")
             send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
             return False
+
+def smart_hold_check(symbol: str) -> bool:
+    """
+    Decide whether to hold a position overnight.
+    Only hold if both 15m and 1h Heikin-Ashi trends are bullish AND RSI > 60.
+    """
+    try:
+        trend_15m = get_heikin_ashi_trend(symbol, interval="15m")
+        trend_1h = get_heikin_ashi_trend(symbol, interval="1h")
+        rsi = get_rsi_value(symbol, interval="15m")
+
+        if trend_15m == "bullish" and trend_1h == "bullish" and rsi and rsi > 60:
+            print(f"🌙 Smart Hold: {symbol} passes hold criteria (RSI={rsi}, trends bullish).")
+            return True
+        else:
+            print(f"🌙 Smart Hold: {symbol} fails hold criteria (RSI={rsi}, trends={trend_15m}/{trend_1h}).")
+            return False
+    except Exception as e:
+        print(f"⚠️ Smart Hold check failed for {symbol}: {e}")
+        return False
 
 # 🧠 Generate AI-based trade explanation
 def generate_trade_explanation(symbol, entry, stop_loss, take_profit, rsi=None, trend=None, ha_candle=None):
@@ -1155,14 +1195,37 @@ def _best_candidate_from_watchlist(symbols):
       +2 if 15m and 1h Heikin‑Ashi are both bullish
       +1 if RSI(15m) is in a neutral (35–65) zone
       −1 if RSI is very extreme (<25 or >75)
+      +1 if avg volume > 1,000,000
+      -1 if volatility > 3%
+    Filters:
+      - skip if avg volume < 100,000 or volatility > 5%
+      - skip if already traded today
     Returns best symbol or None if nothing scores positive.
     """
     ranked = []
+    today = datetime.now().date()
     for sym in symbols:
         try:
             s = sym.strip().upper()
             if not s:
                 continue
+            # --- Skip if already traded today ---
+            record = _symbol_last_trade.get(s)
+            if record and record.get("date") == today:
+                print(f"🚫 Skipping {s}: already traded today.")
+                continue
+            # --- Fetch bars for volume/volatility filter ---
+            bars = get_bars(s, interval='15m', lookback=20)
+            if bars is None or 'volume' not in bars.columns or len(bars) < 5:
+                print(f"⚠️ Skipping {s}: insufficient volume data.")
+                continue
+            avg_vol = bars['volume'].mean()
+            returns = bars['close'].pct_change().dropna()
+            volatility = returns.std() * 100
+            if avg_vol < 100000 or volatility > 5:
+                print(f"🚫 Skipping {s}: volume={avg_vol:.0f}, volatility={volatility:.2f}% — outside safe limits.")
+                continue
+            # --- MTF and RSI scoring ---
             mtf_bull = is_multi_timeframe_confirmed(s)
             rsi = get_rsi_value(s, interval='15m')
             score = 0
@@ -1173,8 +1236,15 @@ def _best_candidate_from_watchlist(symbols):
                     score += 1
                 elif rsi < 25 or rsi > 75:
                     score -= 1
+            # --- Volume/volatility scoring ---
+            score_mod = 0
+            if avg_vol > 1000000:
+                score_mod += 1
+            if volatility > 3:
+                score_mod -= 1
+            score += score_mod
+            print(f"🧪 Score {s}: score={score} (mtf_bull={mtf_bull}, rsi={rsi}, vol={avg_vol:.0f}, volat={volatility:.2f}%)")
             ranked.append((score, s))
-            print(f"🧪 Score {s}: score={score} (mtf_bull={mtf_bull}, rsi={rsi})")
         except Exception as e:
             print(f"⚠️ scoring {sym} failed: {e}")
             continue
@@ -1419,6 +1489,25 @@ MAX_EQUITY_FILE = os.path.join(LOG_DIR, "max_equity.txt")
 SNAPSHOT_LOG_PATH = os.path.join(LOG_DIR, "last_snapshot.txt")
 PORTFOLIO_LOG_PATH = os.path.join(LOG_DIR, "portfolio_log.csv")
 TRADE_LOG_PATH = os.path.join(LOG_DIR, "trade_log.csv")
+TRADE_LOG_HEADER = [
+    "timestamp",
+    "symbol",
+    "qty",
+    "entry",
+    "stop_loss",
+    "take_profit",
+    "status",
+    "action",
+    "fill_price",
+    "realized_pnl",
+    "session_type",
+    "hold_reason",
+    "close_reason",
+    "explanation",
+    "context_time_of_day",
+    "context_recent_outcome",
+    "context_equity_change",
+]
 EQUITY_CURVE_LOG_PATH = os.path.join(LOG_DIR, "equity_curve.log")
 
 def calculate_trade_qty(entry_price, stop_loss_price):
@@ -1972,14 +2061,14 @@ def log_portfolio_snapshot():
         cash = float(account.cash)
         portfolio_value = float(account.portfolio_value)
 
-        row = [timestamp, equity, cash, portfolio_value]
+        row = [timestamp, equity, cash, portfolio_value, "intraday", "", ""]
 
         # ✅ Log to local CSV file
         file_exists = os.path.exists(PORTFOLIO_LOG_PATH)
         with open(PORTFOLIO_LOG_PATH, mode='a', newline='') as file:
             writer = csv.writer(file)
             if not file_exists:
-                writer.writerow(["timestamp", "equity", "cash", "portfolio_value"])
+                writer.writerow(["timestamp", "equity", "cash", "portfolio_value", "session_type", "hold_reason", "close_reason"])
             writer.writerow(row)
 
         print("✅ Daily snapshot logged (CSV):", row)
@@ -2312,6 +2401,29 @@ def start_open_positions_pusher():
     threading.Thread(target=_loop, daemon=True).start()
 
 
+def start_eod_close_thread():
+    """Automatically close all open positions near market close, unless Smart Hold Check passes."""
+    def _loop():
+        while True:
+            now_utc = datetime.now(timezone.utc)
+            if now_utc.time().hour == 19 and 45 <= now_utc.time().minute <= 50:
+                try:
+                    positions = trading_client.get_all_positions()
+                    for pos in positions:
+                        sym = pos.symbol.upper()
+                        if not smart_hold_check(sym):
+                            print(f"🌙 EOD closing {sym} (fails hold check).")
+                            send_telegram_alert(f"🌙 EOD close executed for {sym}")
+                            close_position_safely(sym, close_reason="EOD forced exit")
+                            time.sleep(3)
+                        else:
+                            print(f"✅ Holding {sym} overnight per Smart Hold Check.")
+                except Exception as e:
+                    print(f"⚠️ EOD close thread error: {e}")
+            time.sleep(60)
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 def start_eod_summary_scheduler():
     if not EOD_SUMMARY:
         print("🕗 EOD summary disabled.")
@@ -2490,7 +2602,21 @@ def is_ai_mood_bad():
         print("⚠️ AI Mood check failed:", e)
         return False
 
-def log_trade(symbol, qty, entry, stop_loss, take_profit, status, action=None, fill_price=None, realized_pnl=None):
+def log_trade(
+    symbol,
+    qty,
+    entry,
+    stop_loss,
+    take_profit,
+    status,
+    action=None,
+    fill_price=None,
+    realized_pnl=None,
+    *,
+    session_type: str = "intraday",
+    hold_reason: str = "",
+    close_reason: str = "",
+):
     explanation = generate_trade_explanation(
         symbol=symbol,
         entry=entry,
@@ -2550,14 +2676,23 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status, action=None, f
         "context_equity_change": context_equity_change,
         "action": action,
         "fill_price": fill_price,
-        "realized_pnl": realized_pnl
+        "realized_pnl": realized_pnl,
+        "session_type": session_type,
+        "hold_reason": hold_reason,
+        "close_reason": close_reason,
     }
 
-    df = pd.DataFrame([trade_data])
-    if not os.path.isfile(TRADE_LOG_PATH):
-        df.to_csv(TRADE_LOG_PATH, index=False)
-    else:
-        df.to_csv(TRADE_LOG_PATH, mode='a', header=False, index=False)
+    row = []
+    for col in TRADE_LOG_HEADER:
+        value = trade_data.get(col, "")
+        row.append("" if value is None else value)
+
+    file_exists = os.path.isfile(TRADE_LOG_PATH)
+    with open(TRADE_LOG_PATH, mode='a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(TRADE_LOG_HEADER)
+        writer.writerow(row)
 
     # ✅ Google Sheet Logging
     try:
@@ -2571,11 +2706,7 @@ def log_trade(symbol, qty, entry, stop_loss, take_profit, status, action=None, f
 
         sheet = client.open_by_key(sheet_id).worksheet(sheet_name)
 
-        sheet.append_row([
-            timestamp_str, symbol, qty, entry, stop_loss, take_profit,
-            status, explanation, context_time, context_recent_outcome, context_equity_change,
-            action, fill_price, realized_pnl
-        ])
+        sheet.append_row(row)
         print("✅ Trade logged to Google Sheet.")
 
     except Exception as e:
@@ -2730,4 +2861,5 @@ if __name__ == "__main__":
             _BACKGROUND_WORKERS_STARTED = True
             start_autoscan_thread()
             # Add other background workers here (e.g., watchdog, monitors)
+            start_eod_close_thread()
     app.run(host="0.0.0.0", port=port, debug=False)
