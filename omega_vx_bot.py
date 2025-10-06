@@ -188,16 +188,17 @@ logging.info("Application started")
 print("✅ Omega-VX live build 08a8d10 (risk guard + PDT safeguards active)")
 DAILY_RISK_LIMIT = -10  # optional daily risk guard, currently unused
 TRADE_COOLDOWN_SECONDS = 300
-MAX_RISK_BASE_PERCENT = _float_env("MAX_RISK_BASE_PERCENT", 1.0)
+PER_SYMBOL_COOLDOWN_SECONDS = _int_env("PER_SYMBOL_COOLDOWN_SECONDS", 600)
+MAX_RISK_BASE_PERCENT = _float_env("MAX_RISK_BASE_PERCENT", 3.0)
 MAX_RISK_PER_TRADE_PERCENT = MAX_RISK_BASE_PERCENT
-MAX_RISK_AUTO_MIN = _float_env("MAX_RISK_AUTO_MIN_PCT", 0.5)
+MAX_RISK_AUTO_MIN = _float_env("MAX_RISK_AUTO_MIN_PCT", MAX_RISK_BASE_PERCENT)
 MAX_RISK_AUTO_MAX = _float_env("MAX_RISK_AUTO_MAX_PCT", MAX_RISK_BASE_PERCENT)
-MAX_RISK_AUTO_UP_STEP = _float_env("MAX_RISK_AUTO_UP_STEP", 0.5)
-MAX_RISK_AUTO_DOWN_STEP = _float_env("MAX_RISK_AUTO_DOWN_STEP", 0.5)
+MAX_RISK_AUTO_UP_STEP = _float_env("MAX_RISK_AUTO_UP_STEP", 0.0)
+MAX_RISK_AUTO_DOWN_STEP = _float_env("MAX_RISK_AUTO_DOWN_STEP", 0.0)
 EQUITY_GUARD_MIN_DRAWDOWN = _float_env("EQUITY_GUARD_MIN_DRAWDOWN_PCT", 0.10)
 EQUITY_GUARD_STALE_RATIO = _float_env("EQUITY_GUARD_STALE_RATIO", 5.0)
 EQUITY_GUARD_MAX_EQUITY_FLOOR = _float_env("EQUITY_GUARD_MAX_EQUITY_FLOOR", 0.0)
-MAX_OPEN_POSITIONS_HIGH_EQUITY = _int_env("MAX_OPEN_POSITIONS_HIGH_EQUITY", 8)
+MAX_OPEN_POSITIONS_HIGH_EQUITY = _int_env("MAX_OPEN_POSITIONS_HIGH_EQUITY", 3)
 DAILY_TRADE_CAP = _int_env("DAILY_TRADE_CAP", 0)
 EQUITY_DRAWDOWN_MAX_PCT = _float_env("EQUITY_DRAWDOWN_MAX_PCT", 0.0) / 100.0
 PDT_GUARD_ENABLED = _bool_env("PDT_GUARD_ENABLED", "1")
@@ -213,7 +214,9 @@ _DAILY_TRADE_DATE = datetime.now().date()
 
 # --- Trade Re-entry Guards ---
 REENTRY_DIP_PCT = _float_env("REENTRY_DIP_PCT", 2.0)  # % dip required for same-day reentry
-_symbol_last_trade = {}  # {"SNAP": {"date": date, "exit_price": 8.57, "count": 1}}
+_symbol_last_trade = {}  # {"SNAP": {"date": date, "exit_price": 8.57, "count": 1, "last_trade_ts": iso}}
+_symbol_peak_unrealized = {}  # track peak % gains for trailing logic
+_DAILY_PNL_ALERT_STATE = {"gain": None, "loss": None}
 
 def _check_daily_trade_cap():
     global _DAILY_TRADE_COUNT, _DAILY_TRADE_DATE
@@ -236,12 +239,80 @@ def _increment_daily_trade_count():
     _DAILY_TRADE_COUNT += 1
 
 
+def _get_daily_equity_baseline(current_equity: float) -> float:
+    today = datetime.now(timezone.utc).date().isoformat()
+    if os.path.exists(DAILY_EQUITY_BASELINE_FILE):
+        try:
+            with open(DAILY_EQUITY_BASELINE_FILE, "r") as f:
+                raw = f.read().strip()
+            if raw:
+                stored_day, stored_equity = raw.split(",")
+                if stored_day == today:
+                    return float(stored_equity)
+        except Exception as e:
+            print(f"⚠️ Could not read daily baseline: {e}")
+    try:
+        with open(DAILY_EQUITY_BASELINE_FILE, "w") as f:
+            f.write(f"{today},{current_equity:.2f}")
+    except Exception as e:
+        print(f"⚠️ Could not persist daily baseline: {e}")
+    _DAILY_PNL_ALERT_STATE["gain"] = None
+    _DAILY_PNL_ALERT_STATE["loss"] = None
+    return current_equity
+
+
+def _daily_pnl_guard_allows_trading() -> bool:
+    try:
+        account = trading_client.get_account()
+        equity = float(account.equity)
+    except Exception as e:
+        print(f"⚠️ Daily PnL guard could not fetch equity: {e}")
+        return True
+
+    if equity <= 0:
+        return True
+
+    baseline = _get_daily_equity_baseline(equity)
+    if baseline <= 0:
+        return True
+
+    change_pct = ((equity - baseline) / baseline) * 100.0
+    if change_pct >= DAILY_GAIN_CAP_PCT:
+        if _DAILY_PNL_ALERT_STATE.get("gain") != datetime.now().date():
+            msg = f"🛑 Daily gain cap hit (+{change_pct:.2f}% ≥ {DAILY_GAIN_CAP_PCT}%). Pausing new trades."
+            print(msg)
+            try: send_telegram_alert(msg)
+            except Exception: pass
+            _DAILY_PNL_ALERT_STATE["gain"] = datetime.now().date()
+        return False
+    if change_pct <= DAILY_LOSS_CAP_PCT:
+        if _DAILY_PNL_ALERT_STATE.get("loss") != datetime.now().date():
+            msg = f"🛑 Daily loss cap hit ({change_pct:.2f}% ≤ {DAILY_LOSS_CAP_PCT}%). Pausing new trades."
+            print(msg)
+            try: send_telegram_alert(msg)
+            except Exception: pass
+            _DAILY_PNL_ALERT_STATE["loss"] = datetime.now().date()
+        return False
+
+    return True
+
+
 def _can_trade_symbol_today(symbol: str, entry: float) -> bool:
     today = datetime.now().date()
     record = _symbol_last_trade.get(symbol.upper())
 
     if not record:
         return True
+
+    last_ts = record.get("last_trade_ts")
+    if last_ts:
+        try:
+            last_dt = datetime.fromisoformat(last_ts)
+            if (datetime.now(timezone.utc) - last_dt).total_seconds() < PER_SYMBOL_COOLDOWN_SECONDS:
+                print(f"🚫 Re-entry blocked for {symbol}: cooldown {PER_SYMBOL_COOLDOWN_SECONDS}s not met.")
+                return False
+        except Exception:
+            pass
 
     if record.get("date") == today:
         count = int(record.get("count", 0) or 0)
@@ -276,10 +347,14 @@ _LOG_WRITE_LOCK = threading.Lock()
 _BACKGROUND_WORKERS_LOCK = threading.Lock()
 _BACKGROUND_WORKERS_STARTED = False
 
-# Watchdog thresholds
-WATCHDOG_TRAILING_STOP_PCT = -2.0
+# Watchdog thresholds (percent change on position)
+TRAILING_TRIGGER_PCT = 2.5
+TRAILING_GIVEBACK_PCT = 1.0
 WATCHDOG_TAKE_PROFIT_PCT = 5.0
-WATCHDOG_HARD_STOP_PCT = -3.5
+WATCHDOG_HARD_STOP_PCT = -2.5
+DAILY_GAIN_CAP_PCT = _float_env("DAILY_GAIN_CAP_PCT", 8.0)
+DAILY_LOSS_CAP_PCT = -abs(_float_env("DAILY_LOSS_CAP_PCT", 4.0))
+DAILY_EQUITY_BASELINE_FILE = os.path.join(LOG_DIR, "daily_equity_baseline.txt")
 def _fetch_data_with_fallback(request_function, symbol, feed=_DATA_FEED):
     """Fetches data using the given request function, with fallback to IEX if permission errors occur."""
     try:
@@ -589,16 +664,9 @@ def get_dynamic_max_open_positions():
         account = trading_client.get_account()
         _update_day_trade_status_from_account(account)
         equity = float(account.equity)
-        if equity < 500:
-            return 3   # minimum floor raised
-        elif equity < 1000:
-            return 4
-        elif equity < 2000:
-            return 5
-        elif equity < 5000:
-            return 6
-        else:
-            return MAX_OPEN_POSITIONS_HIGH_EQUITY
+        if equity < 25000:
+            return 3
+        return MAX_OPEN_POSITIONS_HIGH_EQUITY
     except Exception as e:
         print(f"⚠️ Failed to fetch equity for dynamic position cap: {e}")
         return 3  # fallback default, never less than 3
@@ -617,6 +685,22 @@ OPEN_POSITIONS_INTERVAL = int(str(os.getenv("OPEN_POSITIONS_INTERVAL", "90")).st
 # Stray order janitor (cleans SELLs when no position)
 ORDER_JANITOR = str(os.getenv("ORDER_JANITOR", "1")).strip().lower() in ("1","true","yes","y","on")
 ORDER_JANITOR_INTERVAL = int(str(os.getenv("ORDER_JANITOR_INTERVAL", "180")).strip() or "180")
+
+# Monday auto-flush safety layer (prevents carrying unprotected positions into the week)
+WEEKLY_FLUSH_ENABLED = _bool_env("WEEKLY_FLUSH_ENABLED", "1")
+WEEKLY_FLUSH_MODE = (_clean_env(os.getenv("WEEKLY_FLUSH_MODE") or "unprotected") or "unprotected").lower()
+if WEEKLY_FLUSH_MODE not in {"unprotected", "all"}:
+    WEEKLY_FLUSH_MODE = "unprotected"
+WEEKLY_FLUSH_HOUR_UTC = int(str(os.getenv("WEEKLY_FLUSH_HOUR_UTC", "13")).strip() or "13")
+WEEKLY_FLUSH_MINUTE_UTC = int(str(os.getenv("WEEKLY_FLUSH_MINUTE_UTC", "35")).strip() or "35")
+WEEKLY_FLUSH_WHITELIST = {
+    symbol.strip().upper()
+    for symbol in (os.getenv("WEEKLY_FLUSH_WHITELIST") or "").split(",")
+    if symbol.strip()
+}
+WEEKLY_FLUSH_LAST_RUN_FILE = os.path.join(LOG_DIR, "weekly_flush_last_run.txt")
+WEEKLY_FLUSH_HOUR_UTC = max(0, min(23, WEEKLY_FLUSH_HOUR_UTC))
+WEEKLY_FLUSH_MINUTE_UTC = max(0, min(59, WEEKLY_FLUSH_MINUTE_UTC))
 
 # --- SAFE CLOSE HELPERS -------------------------------------------------------
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest
@@ -781,6 +865,7 @@ def close_position_safely(symbol: str, *, session_type: str = "intraday", close_
                     "date": datetime.now().date(),
                     "exit_price": exit_price,
                     "count": current_count,
+                    "last_trade_ts": datetime.now(timezone.utc).isoformat(),
                 }
         except Exception as _fe:
             print(f"⚠️ Could not backfill SELL fill for {symbol}: {_fe}")
@@ -859,6 +944,7 @@ def close_position_safely(symbol: str, *, session_type: str = "intraday", close_
                     "date": datetime.now().date(),
                     "exit_price": exit_price,
                     "count": current_count,
+                    "last_trade_ts": datetime.now(timezone.utc).isoformat(),
                 }
             return True
         except Exception as e2:
@@ -1226,18 +1312,31 @@ def _open_positions_count() -> int:
         print(f"⚠️ count positions failed: {e}")
         return 0
 
+
+def _ema_trend_confirmed(bars) -> bool:
+    try:
+        closes = bars['close'].astype(float)
+    except Exception:
+        closes = pd.Series(dtype=float)
+    if len(closes) < 55:
+        return False
+    ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1]
+    ema50 = closes.ewm(span=50, adjust=False).mean().iloc[-1]
+    price = closes.iloc[-1]
+    return price > ema20 > ema50
+
+
 def _best_candidate_from_watchlist(symbols):
-    """
-    Score each symbol with a simple model:
-      +2 if 15m and 1h Heikin‑Ashi are both bullish
-      +1 if RSI(15m) is in a neutral (35–65) zone
-      −1 if RSI is very extreme (<25 or >75)
-      +1 if avg volume > 1,000,000
-      -1 if volatility > 3%
-    Filters:
-      - skip if avg volume < 100,000 or volatility > 5%
-      - skip if already traded today
-    Returns best symbol or None if nothing scores positive.
+    """Return best watchlist candidate after enforcing risk filters.
+
+    Hard filters:
+      • Average 15m volume ≥ 10,000 shares
+      • 15m volatility between 0.15% and 5%
+      • Price > EMA20 > EMA50
+      • RSI(15m) in [35, 65]
+      • ≥ 10 minutes since this ticker was last traded
+
+    Symbols passing the filters are scored to break ties.
     """
     ranked = []
     today = datetime.now().date()
@@ -1249,35 +1348,47 @@ def _best_candidate_from_watchlist(symbols):
             # --- Skip if already traded today ---
             record = _symbol_last_trade.get(s)
             if record and record.get("date") == today:
+                last_ts = record.get("last_trade_ts")
+                if last_ts:
+                    try:
+                        last_dt = datetime.fromisoformat(last_ts)
+                        if (datetime.now(timezone.utc) - last_dt).total_seconds() < PER_SYMBOL_COOLDOWN_SECONDS:
+                            print(f"🚫 Skipping {s}: traded {int((datetime.now(timezone.utc)-last_dt).total_seconds())}s ago (cooldown active).")
+                            continue
+                    except Exception:
+                        pass
                 print(f"🚫 Skipping {s}: already traded today.")
                 continue
             # --- Fetch bars for volume/volatility filter ---
-            bars = get_bars(s, interval='15m', lookback=20)
+            bars = get_bars(s, interval='15m', lookback=70)
             if bars is None or 'volume' not in bars.columns or len(bars) < 5:
                 print(f"⚠️ Skipping {s}: insufficient volume data.")
                 continue
-            avg_vol = bars['volume'].mean()
-            returns = bars['close'].pct_change().dropna()
+            closes = bars['close'].astype(float)
+            avg_vol = float(bars['volume'].tail(20).mean())
+            returns = closes.pct_change().dropna()
             volatility = returns.std() * 100
-            if avg_vol < 100000 or volatility > 5:
+            if avg_vol < 10000 or volatility > 5 or volatility < 0.15:
                 print(f"🚫 Skipping {s}: volume={avg_vol:.0f}, volatility={volatility:.2f}% — outside safe limits.")
+                continue
+            if not _ema_trend_confirmed(bars.tail(60)):
+                print(f"🚫 Skipping {s}: EMA trend filter failed.")
                 continue
             # --- MTF and RSI scoring ---
             mtf_bull = is_multi_timeframe_confirmed(s)
             rsi = get_rsi_value(s, interval='15m')
+            if rsi is None or rsi < 35 or rsi > 65:
+                print(f"🚫 Skipping {s}: RSI {rsi} outside 35-65.")
+                continue
             score = 0
             if mtf_bull:
                 score += 2
-            if rsi is not None:
-                if 35 <= rsi <= 65:
-                    score += 1
-                elif rsi < 25 or rsi > 75:
-                    score -= 1
+            score += 1  # RSI already validated neutral band
             # --- Volume/volatility scoring ---
             score_mod = 0
-            if avg_vol > 1000000:
+            if avg_vol > 250000:
                 score_mod += 1
-            if volatility > 3:
+            if volatility > 3.5:
                 score_mod -= 1
             score += score_mod
             print(f"🧪 Score {s}: score={score} (mtf_bull={mtf_bull}, rsi={rsi}, vol={avg_vol:.0f}, volat={volatility:.2f}%)")
@@ -1291,7 +1402,7 @@ def _best_candidate_from_watchlist(symbols):
 def _compute_entry_tp_sl(symbol: str):
     """
     Pull live quote; compute a conservative TP/SL if not provided:
-    entry ~ last ask, SL at −2%, TP at +3%.
+    entry ~ last ask, SL at −2.5%, TP at +5%.
     """
     from alpaca.data.requests import StockLatestQuoteRequest
     try:
@@ -1311,8 +1422,8 @@ def _compute_entry_tp_sl(symbol: str):
             print(f"⚠️ quote fetch failed for {symbol}: {e}")
             return None
     entry = round(px, 2)
-    sl    = round(entry * 0.98, 2)
-    tp    = round(entry * 1.03, 2)
+    sl    = round(entry * 0.975, 2)
+    tp    = round(entry * 1.05, 2)
     return entry, sl, tp
 
 def autoscan_once():
@@ -1867,6 +1978,9 @@ def submit_order_with_retries(
     if not _check_daily_trade_cap():
         return False
 
+    if not _daily_pnl_guard_allows_trading():
+        return False
+
     qty = calculate_trade_qty(entry, stop_loss)
     if qty == 0:
         print("❌ Qty is 0 — skipping order.")
@@ -2035,12 +2149,12 @@ def submit_order_with_retries(
 
     abs_tp = float(take_profit)
     abs_sl = float(stop_loss)
-    # If TP is at/below ~market, bump to +3%
-    if abs_tp <= last_px * 0.995:
-        abs_tp = round(last_px * 1.03, 2)
-    # If SL is at/above ~market, cut to -2%
-    if abs_sl >= last_px * 1.005:
-        abs_sl = round(last_px * 0.98, 2)
+    # If TP is at/below ~market, bump to +5%
+    if abs_tp <= last_px * 1.02:
+        abs_tp = round(last_px * 1.05, 2)
+    # If SL is at/above ~market, cut to -2.5%
+    if abs_sl >= last_px * 0.9975:
+        abs_sl = round(last_px * 0.975, 2)
     abs_tp = _quantize_to_tick(abs_tp)
     abs_sl = _quantize_to_tick(abs_sl)
     print(f"🧭 TP/SL sanity → last={last_px:.2f} | TP={abs_tp} | SL={abs_sl}")
@@ -2079,6 +2193,7 @@ def submit_order_with_retries(
         "date": today,
         "exit_price": exit_price,
         "count": count,
+        "last_trade_ts": datetime.now(timezone.utc).isoformat(),
     }
 
     _increment_daily_trade_count()
@@ -2439,22 +2554,28 @@ def start_open_positions_pusher():
 
 
 def start_eod_close_thread():
-    """Automatically close all open positions near market close, unless Smart Hold Check passes."""
+    """Automatically flat positions ~5 minutes before close while equity < $25k."""
     def _loop():
         while True:
             now_utc = datetime.now(timezone.utc)
-            if now_utc.time().hour == 19 and 45 <= now_utc.time().minute <= 50:
+            if now_utc.time().hour == 19 and 55 <= now_utc.time().minute <= 59:
                 try:
+                    account = trading_client.get_account()
+                    equity = float(account.equity)
+                    if equity >= 25000:
+                        time.sleep(60)
+                        continue
                     positions = trading_client.get_all_positions()
+                    if not positions:
+                        print("🌙 EOD flush: no open positions to manage.")
+                        time.sleep(60)
+                        continue
                     for pos in positions:
                         sym = pos.symbol.upper()
-                        if not smart_hold_check(sym):
-                            print(f"🌙 EOD closing {sym} (fails hold check).")
-                            send_telegram_alert(f"🌙 EOD close executed for {sym}")
-                            close_position_safely(sym, close_reason="EOD forced exit")
-                            time.sleep(3)
-                        else:
-                            print(f"✅ Holding {sym} overnight per Smart Hold Check.")
+                        print(f"🌙 EOD review {sym} (equity ${equity:.2f} < $25k).")
+                        send_telegram_alert(f"🌙 EOD flush for {sym} (equity ${equity:.2f} < $25k).")
+                        close_position_safely(sym, close_reason="EOD equity<25k")
+                        time.sleep(2)
                 except Exception as e:
                     print(f"⚠️ EOD close thread error: {e}")
             time.sleep(60)
@@ -2532,12 +2653,184 @@ def start_order_janitor():
             time.sleep(ORDER_JANITOR_INTERVAL)
     threading.Thread(target=_loop, daemon=True).start()
 
+def _weekly_flush_last_run_date():
+    try:
+        if not os.path.exists(WEEKLY_FLUSH_LAST_RUN_FILE):
+            return None
+        with open(WEEKLY_FLUSH_LAST_RUN_FILE, "r") as f:
+            raw = f.read().strip()
+        if not raw:
+            return None
+        return datetime.fromisoformat(raw).date()
+    except Exception:
+        return None
+
+
+def _set_weekly_flush_last_run(day):
+    try:
+        with open(WEEKLY_FLUSH_LAST_RUN_FILE, "w") as f:
+            f.write(day.isoformat())
+    except Exception as e:
+        print(f"⚠️ Could not persist weekly flush run date: {e}")
+
+
+def _run_weekly_flush_once() -> dict:
+    summary = {"closed": [], "failed": [], "skipped": []}
+    print("🧼 Monday auto-flush starting — assessing open positions…")
+    try:
+        positions = trading_client.get_all_positions()
+    except Exception as e:
+        msg = f"⚠️ Weekly flush could not load positions: {e}"
+        print(msg)
+        summary["error"] = msg
+        return summary
+
+    if not positions:
+        print("🧼 No open positions — nothing to flush.")
+        return summary
+
+    try:
+        print_protection_status()
+    except Exception as e:
+        print(f"⚠️ Could not print protection status: {e}")
+
+    for pos in positions:
+        symbol = getattr(pos, "symbol", "").upper()
+        if not symbol:
+            continue
+        if symbol in WEEKLY_FLUSH_WHITELIST:
+            summary["skipped"].append((symbol, "whitelist"))
+            print(f"🛑 Skipping {symbol}: whitelisted.")
+            continue
+
+        tp, sl = get_symbol_tp_sl_open_orders(symbol)
+        has_tp = tp is not None
+        has_sl = sl is not None
+        try:
+            has_tp = has_tp and float(tp) > 0
+        except Exception:
+            has_tp = False
+        try:
+            has_sl = has_sl and float(sl) > 0
+        except Exception:
+            has_sl = False
+
+        protected = has_tp and has_sl
+        should_close = False
+        reason = ""
+
+        if WEEKLY_FLUSH_MODE == "all":
+            should_close = True
+            reason = "mode=all"
+        elif not protected:
+            missing = []
+            if not has_tp:
+                missing.append("TP")
+            if not has_sl:
+                missing.append("SL")
+            reason = "missing " + "/".join(missing) if missing else "unprotected"
+            should_close = True
+        else:
+            summary["skipped"].append((symbol, "protected"))
+            print(f"✅ {symbol} has active protection — skip.")
+            continue
+
+        if not should_close:
+            continue
+
+        print(f"🧼 Weekly flush closing {symbol} ({reason}).")
+        ok = False
+        try:
+            ok = close_position_safely(symbol, close_reason=f"weekly_flush:{reason}")
+        except Exception as e:
+            print(f"❌ Weekly flush close failed for {symbol}: {e}")
+        if ok:
+            summary["closed"].append((symbol, reason))
+        else:
+            summary["failed"].append((symbol, reason))
+
+    return summary
+
+
+def _format_weekly_flush_summary(summary: dict) -> str:
+    lines = [f"🧼 Monday auto-flush complete (mode={WEEKLY_FLUSH_MODE})."]
+    closed = summary.get("closed", [])
+    failed = summary.get("failed", [])
+    skipped = summary.get("skipped", [])
+    error = summary.get("error")
+
+    if error:
+        lines.append(error)
+
+    if closed:
+        details = ", ".join(f"{sym} [{reason}]" for sym, reason in closed)
+        lines.append(f"✅ Closed: {details}")
+    if failed:
+        details = ", ".join(f"{sym} [{reason}]" for sym, reason in failed)
+        lines.append(f"⚠️ Close failures: {details}")
+    if skipped:
+        grouped = {}
+        for sym, why in skipped:
+            grouped.setdefault(why, []).append(sym)
+        for why, symbols in grouped.items():
+            display = ", ".join(symbols[:8])
+            if len(symbols) > 8:
+                display += f" …(+{len(symbols) - 8})"
+            lines.append(f"ℹ️ Skipped ({why}): {display}")
+
+    if not (closed or failed or error):
+        lines.append("ℹ️ No action required — all positions already protected.")
+
+    return "\n".join(lines)
+
+
+def start_weekly_flush_scheduler():
+    if not WEEKLY_FLUSH_ENABLED:
+        print("🧼 Monday auto-flush disabled.")
+        return
+
+    def _loop():
+        print(
+            "🧼 Monday auto-flush scheduler active "
+            f"(mode={WEEKLY_FLUSH_MODE}, whitelist={len(WEEKLY_FLUSH_WHITELIST)} symbols, "
+            f"target={WEEKLY_FLUSH_HOUR_UTC:02d}:{WEEKLY_FLUSH_MINUTE_UTC:02d} UTC)."
+        )
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                if now.weekday() == 0:  # Monday
+                    target_dt = datetime.combine(
+                        now.date(),
+                        dt_time(hour=WEEKLY_FLUSH_HOUR_UTC, minute=WEEKLY_FLUSH_MINUTE_UTC, tzinfo=timezone.utc),
+                    )
+                    last_run = _weekly_flush_last_run_date()
+                    if now >= target_dt and (last_run is None or last_run != now.date()):
+                        summary = _run_weekly_flush_once()
+                        _set_weekly_flush_last_run(now.date())
+                        report = _format_weekly_flush_summary(summary)
+                        print(report)
+                        try:
+                            send_telegram_alert(report)
+                        except Exception as e:
+                            print(f"⚠️ Telegram alert failed for weekly flush: {e}")
+                time.sleep(60)
+            except Exception as e:
+                print(f"⚠️ Weekly flush scheduler error: {e}")
+                time.sleep(60)
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
 def start_auto_sell_monitor():
     def monitor():
         while True:
             try:
                 # Add a timeout to the API call
                 positions = trading_client.get_all_positions()
+                active_symbols = {p.symbol for p in positions}
+                stale_symbols = [sym for sym in list(_symbol_peak_unrealized.keys()) if sym not in active_symbols]
+                for sym in stale_symbols:
+                    _symbol_peak_unrealized.pop(sym, None)
 
                 for position in positions:
                     symbol = position.symbol
@@ -2554,16 +2847,28 @@ def start_auto_sell_monitor():
                     if now_t - last_t < _CLOSE_COOLDOWN_SEC:
                         continue
 
-                    hit_trailing = percent_change <= -2.0
-                    hit_take_profit = percent_change >= 5.0
-                    hit_stop_loss = percent_change <= -3.5
+                    trailing_triggered = False
+                    peak = _symbol_peak_unrealized.get(symbol)
+                    if percent_change >= TRAILING_TRIGGER_PCT:
+                        peak = max(peak or percent_change, percent_change)
+                        _symbol_peak_unrealized[symbol] = peak
+                    elif peak is not None and percent_change < TRAILING_TRIGGER_PCT:
+                        # below trigger again before giveback → reset
+                        _symbol_peak_unrealized.pop(symbol, None)
+                        peak = None
 
-                    if hit_trailing or hit_take_profit or hit_stop_loss:
+                    if peak is not None and (peak - percent_change) >= TRAILING_GIVEBACK_PCT:
+                        trailing_triggered = True
+
+                    hit_take_profit = percent_change >= WATCHDOG_TAKE_PROFIT_PCT
+                    hit_stop_loss = percent_change <= WATCHDOG_HARD_STOP_PCT
+
+                    if trailing_triggered or hit_take_profit or hit_stop_loss:
                         reason = "❗"
                         if hit_take_profit:
                             reason += "Take Profit Hit"
-                        elif hit_trailing:
-                            reason += "Trailing Stop Hit"
+                        elif trailing_triggered:
+                            reason += "Trailing Stop Giveback"
                         elif hit_stop_loss:
                             reason += "Hard Stop Hit"
 
@@ -2571,6 +2876,7 @@ def start_auto_sell_monitor():
                         now_t = monotonic()
                         ok = close_position_safely(symbol)  # cancels SELLs, then closes
                         _last_close_attempt[symbol] = now_t  # start cooldown
+                        _symbol_peak_unrealized.pop(symbol, None)
                         if ok:
                             print(f"✅ Position closed for {symbol}")
                             # Update Performance sheet after a realized SELL is logged
@@ -2899,4 +3205,5 @@ if __name__ == "__main__":
             start_autoscan_thread()
             # Add other background workers here (e.g., watchdog, monitors)
             start_eod_close_thread()
+            start_weekly_flush_scheduler()
     app.run(host="0.0.0.0", port=port, debug=False)
