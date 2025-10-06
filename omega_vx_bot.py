@@ -311,6 +311,43 @@ except Exception:
     _RAW_DATA_CLIENT = None
 
 
+def print_protection_status():
+    """Prints the current protection status (TP and SL) for all open positions."""
+    try:
+        positions = trading_client.get_all_positions()
+        if not positions:
+            print("🛡 No open positions currently under protection.")
+            return
+        print("🛡 Active Protection:")
+        for p in positions:
+            symbol = getattr(p, "symbol", "?")
+            qty = getattr(p, "qty", "?")
+            avg_entry = getattr(p, "avg_entry_price", "?")
+            try:
+                req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+                open_orders = trading_client.get_orders(filter=req)
+                tp = sl = None
+                for o in open_orders:
+                    side = str(getattr(o, "side", "")).lower()
+                    if side != "sell":
+                        continue
+                    otype = str(getattr(o, "order_type", "")).lower()
+                    price = None
+                    try:
+                        price = float(getattr(o, "limit_price") or getattr(o, "stop_price") or 0)
+                    except Exception:
+                        continue
+                    if otype == "limit" and price > 0:
+                        tp = price
+                    elif otype == "stop" and price > 0:
+                        sl = price
+                print(f"   • {symbol:<5} qty={qty} entry={avg_entry} TP={tp or '-'} SL={sl or '-'}")
+            except Exception as e:
+                print(f"⚠️ Could not fetch orders for {symbol}: {e}")
+    except Exception as e:
+        print(f"⚠️ Protection status check failed: {e}")
+
+
 def _bars_df_from_raw_payload(raw_payload):
     if not raw_payload:
         return pd.DataFrame()
