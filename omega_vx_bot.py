@@ -10,7 +10,7 @@ import requests
 import subprocess
 import sys
 import functools
-from typing import Optional
+from typing import Optional, Set, Tuple
 from datetime import datetime, timedelta, time as dt_time
 import numpy as np
 import pandas as pd
@@ -216,7 +216,36 @@ _DAILY_TRADE_DATE = datetime.now().date()
 REENTRY_DIP_PCT = _float_env("REENTRY_DIP_PCT", 2.0)  # % dip required for same-day reentry
 _symbol_last_trade = {}  # {"SNAP": {"date": date, "exit_price": 8.57, "count": 1, "last_trade_ts": iso}}
 _symbol_peak_unrealized = {}  # track peak % gains for trailing logic
+_symbol_last_trade_lock = threading.Lock()
+_symbol_peak_unrealized_lock = threading.Lock()
+# Thread safety for PDT lockouts and PnL alert state
+_pdt_lockouts_lock = threading.Lock()
+_DAILY_PNL_ALERT_STATE_LOCK = threading.Lock()
 _DAILY_PNL_ALERT_STATE = {"gain": None, "loss": None}
+
+
+def _prune_symbol_peak_cache(active_symbols: Set[str]) -> None:
+    """Remove symbols with no active positions from the peak unrealized tracker."""
+    # Thread-safe update to shared state
+    with _symbol_peak_unrealized_lock:
+        stale = [sym for sym in list(_symbol_peak_unrealized) if sym not in active_symbols]
+        for sym in stale:
+            _symbol_peak_unrealized.pop(sym, None)
+
+
+def _get_peak_unrealized(symbol: str) -> Optional[float]:
+    # Thread-safe read from shared state
+    with _symbol_peak_unrealized_lock:
+        return _symbol_peak_unrealized.get(symbol)
+
+
+def _set_peak_unrealized(symbol: str, value: Optional[float]) -> None:
+    # Thread-safe update to shared state
+    with _symbol_peak_unrealized_lock:
+        if value is None:
+            _symbol_peak_unrealized.pop(symbol, None)
+        else:
+            _symbol_peak_unrealized[symbol] = value
 
 def _check_daily_trade_cap():
     global _DAILY_TRADE_COUNT, _DAILY_TRADE_DATE
@@ -256,8 +285,10 @@ def _get_daily_equity_baseline(current_equity: float) -> float:
             f.write(f"{today},{current_equity:.2f}")
     except Exception as e:
         print(f"⚠️ Could not persist daily baseline: {e}")
-    _DAILY_PNL_ALERT_STATE["gain"] = None
-    _DAILY_PNL_ALERT_STATE["loss"] = None
+    # Thread-safe update to shared state
+    with _DAILY_PNL_ALERT_STATE_LOCK:
+        _DAILY_PNL_ALERT_STATE["gain"] = None
+        _DAILY_PNL_ALERT_STATE["loss"] = None
     return current_equity
 
 
@@ -277,29 +308,33 @@ def _daily_pnl_guard_allows_trading() -> bool:
         return True
 
     change_pct = ((equity - baseline) / baseline) * 100.0
-    if change_pct >= DAILY_GAIN_CAP_PCT:
-        if _DAILY_PNL_ALERT_STATE.get("gain") != datetime.now().date():
-            msg = f"🛑 Daily gain cap hit (+{change_pct:.2f}% ≥ {DAILY_GAIN_CAP_PCT}%). Pausing new trades."
-            print(msg)
-            try: send_telegram_alert(msg)
-            except Exception: pass
-            _DAILY_PNL_ALERT_STATE["gain"] = datetime.now().date()
-        return False
-    if change_pct <= DAILY_LOSS_CAP_PCT:
-        if _DAILY_PNL_ALERT_STATE.get("loss") != datetime.now().date():
-            msg = f"🛑 Daily loss cap hit ({change_pct:.2f}% ≤ {DAILY_LOSS_CAP_PCT}%). Pausing new trades."
-            print(msg)
-            try: send_telegram_alert(msg)
-            except Exception: pass
-            _DAILY_PNL_ALERT_STATE["loss"] = datetime.now().date()
-        return False
-
+    # Thread-safe update to shared state
+    with _DAILY_PNL_ALERT_STATE_LOCK:
+        if change_pct >= DAILY_GAIN_CAP_PCT:
+            if _DAILY_PNL_ALERT_STATE.get("gain") != datetime.now().date():
+                msg = f"🛑 Daily gain cap hit (+{change_pct:.2f}% ≥ {DAILY_GAIN_CAP_PCT}%). Pausing new trades."
+                print(msg)
+                try: send_telegram_alert(msg)
+                except Exception: pass
+                _DAILY_PNL_ALERT_STATE["gain"] = datetime.now().date()
+            return False
+        if change_pct <= DAILY_LOSS_CAP_PCT:
+            if _DAILY_PNL_ALERT_STATE.get("loss") != datetime.now().date():
+                msg = f"🛑 Daily loss cap hit ({change_pct:.2f}% ≤ {DAILY_LOSS_CAP_PCT}%). Pausing new trades."
+                print(msg)
+                try: send_telegram_alert(msg)
+                except Exception: pass
+                _DAILY_PNL_ALERT_STATE["loss"] = datetime.now().date()
+            return False
     return True
 
 
 def _can_trade_symbol_today(symbol: str, entry: float) -> bool:
     today = datetime.now().date()
-    record = _symbol_last_trade.get(symbol.upper())
+    # Thread-safe read from shared state
+    with _symbol_last_trade_lock:
+        record = _symbol_last_trade.get(symbol.upper())
+        record = None if record is None else record.copy()
 
     if not record:
         return True
@@ -348,13 +383,64 @@ _BACKGROUND_WORKERS_LOCK = threading.Lock()
 _BACKGROUND_WORKERS_STARTED = False
 
 # Watchdog thresholds (percent change on position)
-TRAILING_TRIGGER_PCT = 2.5
-TRAILING_GIVEBACK_PCT = 1.0
-WATCHDOG_TAKE_PROFIT_PCT = 5.0
-WATCHDOG_HARD_STOP_PCT = -2.5
+TRAILING_TRIGGER_PCT = _float_env("TRAILING_TRIGGER_PCT", 2.5)
+TRAILING_GIVEBACK_PCT = _float_env("TRAILING_GIVEBACK_PCT", 1.0)
+WATCHDOG_TAKE_PROFIT_PCT = _float_env("WATCHDOG_TAKE_PROFIT_PCT", 5.0)
+WATCHDOG_HARD_STOP_PCT = _float_env("WATCHDOG_HARD_STOP_PCT", -2.5)
+if WATCHDOG_HARD_STOP_PCT > 0:
+    WATCHDOG_HARD_STOP_PCT = -WATCHDOG_HARD_STOP_PCT
+FALLBACK_TAKE_PROFIT_PCT = _float_env("FALLBACK_TAKE_PROFIT_PCT", 5.0)
+FALLBACK_STOP_LOSS_PCT = _float_env("FALLBACK_STOP_LOSS_PCT", 2.5)
+WATCHDOG_LOOP_SECONDS = max(5, _int_env("WATCHDOG_LOOP_SECONDS", 30))
+THREAD_AUTH_FAILURE_THRESHOLD = max(1, _int_env("THREAD_AUTH_FAILURE_THRESHOLD", 3))
 DAILY_GAIN_CAP_PCT = _float_env("DAILY_GAIN_CAP_PCT", 8.0)
 DAILY_LOSS_CAP_PCT = -abs(_float_env("DAILY_LOSS_CAP_PCT", 4.0))
 DAILY_EQUITY_BASELINE_FILE = os.path.join(LOG_DIR, "daily_equity_baseline.txt")
+
+_THREAD_ERROR_LOCK = threading.Lock()
+_THREAD_ERROR_COUNTS = {}
+_CRITICAL_THREAD_ERROR_KEYWORDS = (
+    "authentication",
+    "invalid api key",
+    "unauthorized",
+    "forbidden",
+    "access key",
+    "signature verification failed",
+)
+
+
+def _handle_thread_exception(thread_name: str, exc: Exception) -> Tuple[bool, bool]:
+    """
+    Track repeated thread errors and decide whether to stop the loop.
+    Returns (should_stop, alert_already_sent).
+    """
+    message = str(exc).lower()
+    critical = any(keyword in message for keyword in _CRITICAL_THREAD_ERROR_KEYWORDS)
+    key = (thread_name, "critical" if critical else type(exc).__name__)
+
+    with _THREAD_ERROR_LOCK:
+        count = _THREAD_ERROR_COUNTS.get(key, 0) + 1
+        _THREAD_ERROR_COUNTS[key] = count
+
+    alert_sent = False
+    if critical:
+        if count >= THREAD_AUTH_FAILURE_THRESHOLD:
+            alert = f"⛔ {thread_name} halted after repeated authentication failures: {exc}"
+            print(alert)
+            try:
+                send_telegram_alert(alert)
+            except Exception:
+                pass
+            return True, True
+        if count == 1:
+            warn = f"⚠️ {thread_name} authentication error: {exc} (retrying)"
+            print(warn)
+            try:
+                send_telegram_alert(warn)
+            except Exception:
+                pass
+            alert_sent = True
+    return False, alert_sent
 def _fetch_data_with_fallback(request_function, symbol, feed=_DATA_FEED):
     """Fetches data using the given request function, with fallback to IEX if permission errors occur."""
     try:
@@ -486,6 +572,87 @@ def _fetch_bars_df(symbol: str, request: StockBarsRequest) -> Optional[pd.DataFr
             return None
         return sanitized
 
+
+def _normalize_bars_for_symbol(
+    bars: Optional[pd.DataFrame],
+    symbol: str,
+    *,
+    reset_index: bool = False,
+) -> pd.DataFrame:
+    if bars is None or getattr(bars, "empty", True):
+        return pd.DataFrame()
+
+    subset = None
+
+    try:
+        if isinstance(bars.index, pd.MultiIndex) and "symbol" in bars.index.names:
+            subset = bars.xs(symbol, level="symbol")
+    except (KeyError, ValueError):
+        subset = None
+
+    if subset is None:
+        try:
+            if "symbol" in bars.columns:
+                subset = bars[bars["symbol"] == symbol]
+        except AttributeError:
+            subset = None
+
+    if subset is None:
+        try:
+            subset = bars.loc[symbol]
+        except Exception:
+            subset = bars
+
+    if isinstance(subset, pd.Series):
+        subset = subset.to_frame().T
+
+    subset = subset.copy()
+    if reset_index:
+        subset = subset.reset_index()
+    return subset
+
+
+def _fetch_bars_with_daily_fallback(
+    symbol: str,
+    *,
+    primary_tf: TimeFrame,
+    primary_start: datetime,
+    primary_end: datetime,
+    feed: DataFeed = DataFeed.IEX,
+    daily_lookback_days: int = 60,
+    normalize_reset_index: bool = False,
+) -> Tuple[pd.DataFrame, bool]:
+    """Fetch bars for `symbol`, falling back to daily data if intraday is unavailable."""
+
+    def _request(tf: TimeFrame, start_dt: datetime, end_dt: datetime, data_feed: DataFeed):
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=tf,
+            start=start_dt,
+            end=end_dt,
+            feed=data_feed,
+        )
+        return _fetch_bars_df(symbol, req)
+
+    bars = _fetch_data_with_fallback(
+        lambda data_feed: _request(primary_tf, primary_start, primary_end, data_feed),
+        symbol,
+        feed=feed,
+    )
+    used_daily = False
+
+    if bars is None or getattr(bars, "empty", True):
+        daily_start = primary_end - timedelta(days=daily_lookback_days)
+        bars = _fetch_data_with_fallback(
+            lambda data_feed: _request(TimeFrame.Day, daily_start, primary_end, data_feed),
+            symbol,
+            feed=feed,
+        )
+        used_daily = True
+
+    normalized = _normalize_bars_for_symbol(bars, symbol, reset_index=normalize_reset_index)
+    return normalized, used_daily
+
 # === Flask App ===
 
 app = Flask(__name__)
@@ -501,6 +668,18 @@ _last_close_attempt = {}
 _CLOSE_COOLDOWN_SEC = 20  # consider 60–120 during market hours
 _PDT_LOCKOUT_SEC = PDT_SYMBOL_LOCK_SECONDS or 600
 _pdt_lockouts = {}
+_last_close_attempt_lock = threading.Lock()
+_pdt_lockouts_lock = threading.Lock()
+
+
+def _get_last_close_attempt_ts(symbol: str) -> float:
+    with _last_close_attempt_lock:
+        return _last_close_attempt.get(symbol, 0.0)
+
+
+def _set_last_close_attempt_ts(symbol: str, timestamp: float) -> None:
+    with _last_close_attempt_lock:
+        _last_close_attempt[symbol] = timestamp
 
 _PDT_GLOBAL_LOCKOUT_UNTIL = 0.0
 _PDT_LAST_ALERT_MONO = 0.0
@@ -536,17 +715,23 @@ def _is_pattern_day_trading_error(err: Exception) -> bool:
 def _register_pdt_lockout(symbol: str) -> int:
     """Record that PDT blocked the symbol and return the lockout duration (seconds)."""
     until = monotonic() + _PDT_LOCKOUT_SEC
-    _pdt_lockouts[symbol.upper()] = until
+    # Thread-safe update to shared state
+    with _pdt_lockouts_lock:
+        _pdt_lockouts[symbol.upper()] = until
     return _PDT_LOCKOUT_SEC
 
 
 def _pdt_lockout_remaining(symbol: str) -> int:
-    until = _pdt_lockouts.get(symbol.upper())
+    # Thread-safe read from shared state
+    with _pdt_lockouts_lock:
+        until = _pdt_lockouts.get(symbol.upper())
     if not until:
         return 0
     remaining = int(max(0, until - monotonic()))
     if remaining == 0:
-        _pdt_lockouts.pop(symbol.upper(), None)
+        # Thread-safe update to shared state
+        with _pdt_lockouts_lock:
+            _pdt_lockouts.pop(symbol.upper(), None)
     return remaining
 
 
@@ -857,16 +1042,17 @@ def close_position_safely(symbol: str, *, session_type: str = "intraday", close_
                 exit_price = None
             if exit_price is not None:
                 key = symbol.upper()
-                prev = _symbol_last_trade.get(key, {})
-                current_count = int(prev.get("count", 0) or 0)
-                if current_count <= 0:
-                    current_count = 1
-                _symbol_last_trade[key] = {
-                    "date": datetime.now().date(),
-                    "exit_price": exit_price,
-                    "count": current_count,
-                    "last_trade_ts": datetime.now(timezone.utc).isoformat(),
-                }
+                with _symbol_last_trade_lock:
+                    prev = _symbol_last_trade.get(key, {})
+                    current_count = int(prev.get("count", 0) or 0)
+                    if current_count <= 0:
+                        current_count = 1
+                    _symbol_last_trade[key] = {
+                        "date": datetime.now().date(),
+                        "exit_price": exit_price,
+                        "count": current_count,
+                        "last_trade_ts": datetime.now(timezone.utc).isoformat(),
+                    }
         except Exception as _fe:
             print(f"⚠️ Could not backfill SELL fill for {symbol}: {_fe}")
         return True
@@ -936,16 +1122,17 @@ def close_position_safely(symbol: str, *, session_type: str = "intraday", close_
                 exit_price = None
             if exit_price is not None:
                 key = symbol.upper()
-                prev = _symbol_last_trade.get(key, {})
-                current_count = int(prev.get("count", 0) or 0)
-                if current_count <= 0:
-                    current_count = 1
-                _symbol_last_trade[key] = {
-                    "date": datetime.now().date(),
-                    "exit_price": exit_price,
-                    "count": current_count,
-                    "last_trade_ts": datetime.now(timezone.utc).isoformat(),
-                }
+                with _symbol_last_trade_lock:
+                    prev = _symbol_last_trade.get(key, {})
+                    current_count = int(prev.get("count", 0) or 0)
+                    if current_count <= 0:
+                        current_count = 1
+                    _symbol_last_trade[key] = {
+                        "date": datetime.now().date(),
+                        "exit_price": exit_price,
+                        "count": current_count,
+                        "last_trade_ts": datetime.now(timezone.utc).isoformat(),
+                    }
             return True
         except Exception as e2:
             if _is_pattern_day_trading_error(e2):
@@ -1269,74 +1456,40 @@ def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
     Heikin‑Ashi using Alpaca bars. We FORCE IEX. If minute/hour bars are not
     available on your plan, we fall back to DAILY bars and use the last HA candle.
     """
-    from alpaca.data.requests import StockBarsRequest
     tf = TimeFrame.Minute if interval == '15m' else TimeFrame.Hour
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=2)
 
-    def _request(feed, _tf, _start, _end):
-        req = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=_tf,
-            start=_start,
-            end=_end,
-            feed=feed,
-        )
-        return _fetch_bars_df(symbol, req)
-
-    # 1) Try requested timeframe on IEX
-    bars = _fetch_data_with_fallback(
-        lambda feed: _request(feed, tf, start, end), symbol, feed=DataFeed.IEX
+    bars, used_daily = _fetch_bars_with_daily_fallback(
+        symbol,
+        primary_tf=tf,
+        primary_start=start,
+        primary_end=end,
+        feed=DataFeed.IEX,
+        daily_lookback_days=20,
+        normalize_reset_index=True,
     )
 
-    # 2) If missing or empty, fall back to DAILY bars
-    if bars is None or bars.empty:
-        try:
-            d_start = end - timedelta(days=20)
-            d_tf = TimeFrame.Day
-            d_bars = _fetch_data_with_fallback(
-                lambda feed: _request(feed, d_tf, d_start, end), symbol, feed=DataFeed.IEX
-            )
-            if d_bars is None or d_bars.empty:
-                print(f"⚠️ No data returned for {symbol} even on daily.")
-                return None
-            # normalize to single symbol
-            try:
-                if 'symbol' in d_bars.columns:
-                    d_bars = d_bars[d_bars['symbol'] == symbol]
-                else:
-                    d_bars = d_bars.loc[symbol]
-                d_bars = d_bars.reset_index()
-            except Exception:
-                d_bars = d_bars.reset_index()
-            if len(d_bars) < 2:
-                print(f"⚠️ Not enough daily data to compute Heikin Ashi for {symbol}.")
-                return None
-            prev_close = d_bars['close'].iloc[-2]
-            curr_open = d_bars['open'].iloc[-1]
-            ha_open = (curr_open + prev_close) / 2
-            ha_close = (d_bars['open'].iloc[-1] + d_bars['high'].iloc[-1] + d_bars['low'].iloc[-1] + d_bars['close'].iloc[-1]) / 4
-            trend = 'bullish' if ha_close > ha_open else ('bearish' if ha_close < ha_open else 'neutral')
-            print(f"🕊️ Heikin-Ashi DAILY fallback for {symbol}: {trend}")
-            return trend
-        except Exception as e:
-            print(f"❌ Daily HA fallback failed for {symbol}: {e}")
-            return None
+    if bars.empty:
+        print(f"⚠️ No Alpaca data returned for {symbol}")
+        return None
 
-    # normalize minutes/hour data
-    try:
-        if 'symbol' in bars.columns:
-            bars = bars[bars['symbol'] == symbol]
-        else:
-            bars = bars.loc[symbol]
-        bars = bars.reset_index()
-    except Exception:
-        try:
-            bars = bars.reset_index()
-            bars = bars[bars['symbol'] == symbol]
-        except Exception:
-            print(f"⚠️ Unexpected bars shape for {symbol}")
+    if used_daily:
+        if len(bars) < 2:
+            print(f"⚠️ Not enough daily data to compute Heikin Ashi for {symbol}.")
             return None
+        prev_close = float(bars['close'].iloc[-2])
+        curr_open = float(bars['open'].iloc[-1])
+        ha_open = (curr_open + prev_close) / 2
+        ha_close = (
+            float(bars['open'].iloc[-1])
+            + float(bars['high'].iloc[-1])
+            + float(bars['low'].iloc[-1])
+            + float(bars['close'].iloc[-1])
+        ) / 4
+        trend = 'bullish' if ha_close > ha_open else ('bearish' if ha_close < ha_open else 'neutral')
+        print(f"🕊️ Heikin-Ashi DAILY fallback for {symbol}: {trend}")
+        return trend
 
     if len(bars) < lookback + 1:
         print(f"⚠️ Not enough data to compute Heikin Ashi for {symbol}.")
@@ -1344,19 +1497,23 @@ def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
 
     ha_candles = []
     for i in range(1, lookback + 1):
-        prev_close = bars['close'].iloc[-(i + 1)]
-        curr_open = bars['open'].iloc[-i]
+        prev_close = float(bars['close'].iloc[-(i + 1)])
+        curr_open = float(bars['open'].iloc[-i])
         ha_open = (curr_open + prev_close) / 2
-        ha_close = (bars['open'].iloc[-i] + bars['high'].iloc[-i] + bars['low'].iloc[-i] + bars['close'].iloc[-i]) / 4
+        ha_close = (
+            float(bars['open'].iloc[-i])
+            + float(bars['high'].iloc[-i])
+            + float(bars['low'].iloc[-i])
+            + float(bars['close'].iloc[-i])
+        ) / 4
         ha_candles.append({'open': ha_open, 'close': ha_close})
 
     last = ha_candles[-1]
     if last['close'] > last['open']:
         return 'bullish'
-    elif last['close'] < last['open']:
+    if last['close'] < last['open']:
         return 'bearish'
-    else:
-        return 'neutral'
+    return 'neutral'
 
 def is_multi_timeframe_confirmed(symbol):
     trend_15m = get_heikin_ashi_trend(symbol, interval='15m')
@@ -1411,7 +1568,9 @@ def _best_candidate_from_watchlist(symbols):
             if not s:
                 continue
             # --- Skip if already traded today ---
-            record = _symbol_last_trade.get(s)
+            with _symbol_last_trade_lock:
+                record = _symbol_last_trade.get(s)
+                record = None if record is None else record.copy()
             if record and record.get("date") == today:
                 last_ts = record.get("last_trade_ts")
                 if last_ts:
@@ -1466,8 +1625,8 @@ def _best_candidate_from_watchlist(symbols):
 
 def _compute_entry_tp_sl(symbol: str):
     """
-    Pull live quote; compute a conservative TP/SL if not provided:
-    entry ~ last ask, SL at −2.5%, TP at +5%.
+    Pull live quote; compute a conservative TP/SL if not provided using the
+    configured FALLBACK_STOP_LOSS_PCT / FALLBACK_TAKE_PROFIT_PCT offsets.
     """
     from alpaca.data.requests import StockLatestQuoteRequest
     try:
@@ -1487,8 +1646,8 @@ def _compute_entry_tp_sl(symbol: str):
             print(f"⚠️ quote fetch failed for {symbol}: {e}")
             return None
     entry = round(px, 2)
-    sl    = round(entry * 0.975, 2)
-    tp    = round(entry * 1.05, 2)
+    sl = round(entry * (1 - FALLBACK_STOP_LOSS_PCT / 100.0), 2)
+    tp = round(entry * (1 + FALLBACK_TAKE_PROFIT_PCT / 100.0), 2)
     return entry, sl, tp
 
 def autoscan_once():
@@ -1549,6 +1708,14 @@ def start_autoscan_thread():
                 autoscan_once()
             except Exception as e:
                 print(f"⚠️ autoscan loop error: {e}")
+                should_stop, alerted = _handle_thread_exception("Autoscan", e)
+                if not alerted:
+                    try:
+                        send_telegram_alert(f"⚠️ Autoscan loop error: {e}")
+                    except Exception:
+                        pass
+                if should_stop:
+                    return
             time.sleep(OMEGA_SCAN_INTERVAL_SEC)
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
@@ -1937,46 +2104,25 @@ def get_rsi_value(symbol, interval='15m', period=14):
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=5)
 
-    def _request(feed, _tf, _start, _end):
-        req = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=_tf,
-            start=_start,
-            end=_end,
-            feed=feed,
-        )
-        return _fetch_bars_df(symbol, req)
-
-    # 1) Try requested timeframe on IEX
-    bars = _fetch_data_with_fallback(
-        lambda feed: _request(feed, tf, start, end), symbol, feed=DataFeed.IEX
+    bars, used_daily = _fetch_bars_with_daily_fallback(
+        symbol,
+        primary_tf=tf,
+        primary_start=start,
+        primary_end=end,
+        feed=DataFeed.IEX,
+        daily_lookback_days=100,
+        normalize_reset_index=True,
     )
 
-    # 2) Fallback to DAILY if needed
-    used_daily = False
-    if bars is None or bars.empty or ('close' not in getattr(bars, 'columns', [])):
-        try:
-            d_start = end - timedelta(days=100)
-            d_tf = TimeFrame.Day
-            bars = _fetch_data_with_fallback(
-                lambda feed: _request(feed, d_tf, d_start, end), symbol, feed=DataFeed.IEX
-            )
-            used_daily = True
-        except Exception as e2:
-            print(f"❌ Daily RSI fallback failed for {symbol}: {e2}")
-            return None
+    if bars.empty or 'close' not in bars.columns:
+        context = " after daily fallback" if used_daily else ""
+        print(f"⚠️ Not enough data to calculate RSI for {symbol}{context}.")
+        return None
 
-    # Normalize to a single‑symbol frame
-    try:
-        if 'symbol' in bars.columns:
-            bars = bars[bars['symbol'] == symbol]
-        else:
-            bars = bars.loc[symbol]
-    except Exception:
-        pass
-
-    if 'close' not in bars.columns or len(bars) < period + 1:
-        print(f"⚠️ Not enough data to calculate RSI for {symbol}")
+    bars['close'] = pd.to_numeric(bars['close'], errors='coerce')
+    bars = bars.dropna(subset=['close'])
+    if len(bars) < period + 1:
+        print(f"⚠️ Not enough data to calculate RSI for {symbol}.")
         return None
 
     delta = bars['close'].diff()
@@ -2214,12 +2360,12 @@ def submit_order_with_retries(
 
     abs_tp = float(take_profit)
     abs_sl = float(stop_loss)
-    # If TP is at/below ~market, bump to +5%
-    if abs_tp <= last_px * 1.02:
-        abs_tp = round(last_px * 1.05, 2)
-    # If SL is at/above ~market, cut to -2.5%
-    if abs_sl >= last_px * 0.9975:
-        abs_sl = round(last_px * 0.975, 2)
+    min_tp_price = last_px * (1 + FALLBACK_TAKE_PROFIT_PCT / 100.0)
+    min_sl_price = last_px * (1 - FALLBACK_STOP_LOSS_PCT / 100.0)
+    if abs_tp <= min_tp_price:
+        abs_tp = min_tp_price
+    if abs_sl >= min_sl_price:
+        abs_sl = min_sl_price
     abs_tp = _quantize_to_tick(abs_tp)
     abs_sl = _quantize_to_tick(abs_sl)
     print(f"🧭 TP/SL sanity → last={last_px:.2f} | TP={abs_tp} | SL={abs_sl}")
@@ -2253,19 +2399,20 @@ def submit_order_with_retries(
     # Track per-symbol trade count for re-entry guard
     today = datetime.now().date()
     key = symbol.upper()
-    prev = _symbol_last_trade.get(key)
-    if prev and prev.get("date") == today:
-        count = int(prev.get("count", 0) or 0) + 1
-        exit_price = prev.get("exit_price")
-    else:
-        count = 1
-        exit_price = None
-    _symbol_last_trade[key] = {
-        "date": today,
-        "exit_price": exit_price,
-        "count": count,
-        "last_trade_ts": datetime.now(timezone.utc).isoformat(),
-    }
+    with _symbol_last_trade_lock:
+        prev = _symbol_last_trade.get(key)
+        if prev and prev.get("date") == today:
+            count = int(prev.get("count", 0) or 0) + 1
+            exit_price = prev.get("exit_price")
+        else:
+            count = 1
+            exit_price = None
+        _symbol_last_trade[key] = {
+            "date": today,
+            "exit_price": exit_price,
+            "count": count,
+            "last_trade_ts": datetime.now(timezone.utc).isoformat(),
+        }
 
     _increment_daily_trade_count()
     try:
@@ -2620,6 +2767,14 @@ def start_open_positions_pusher():
                 push_open_positions_to_sheet()
             except Exception as e:
                 print(f"⚠️ Pusher error: {e}")
+                should_stop, alerted = _handle_thread_exception("Open Positions Pusher", e)
+                if not alerted:
+                    try:
+                        send_telegram_alert(f"⚠️ Open Positions pusher error: {e}")
+                    except Exception:
+                        pass
+                if should_stop:
+                    return
             time.sleep(OPEN_POSITIONS_INTERVAL)
     threading.Thread(target=_loop, daemon=True).start()
 
@@ -2649,6 +2804,14 @@ def start_eod_close_thread():
                         time.sleep(2)
                 except Exception as e:
                     print(f"⚠️ EOD close thread error: {e}")
+                    should_stop, alerted = _handle_thread_exception("EOD Close", e)
+                    if not alerted:
+                        try:
+                            send_telegram_alert(f"⚠️ EOD close thread error: {e}")
+                        except Exception:
+                            pass
+                    if should_stop:
+                        return
             time.sleep(60)
     threading.Thread(target=_loop, daemon=True).start()
 
@@ -2689,6 +2852,14 @@ def start_eod_summary_scheduler():
                 time.sleep(60)
             except Exception as e:
                 print(f"⚠️ EOD scheduler error: {e}")
+                should_stop, alerted = _handle_thread_exception("EOD Summary", e)
+                if not alerted:
+                    try:
+                        send_telegram_alert(f"⚠️ EOD summary scheduler error: {e}")
+                    except Exception:
+                        pass
+                if should_stop:
+                    return
                 time.sleep(60)
     threading.Thread(target=_loop, daemon=True).start()
 
@@ -2721,6 +2892,14 @@ def start_order_janitor():
                     except Exception: pass
             except Exception as e:
                 print(f"⚠️ Janitor error: {e}")
+                should_stop, alerted = _handle_thread_exception("Order Janitor", e)
+                if not alerted:
+                    try:
+                        send_telegram_alert(f"⚠️ Order janitor error: {e}")
+                    except Exception:
+                        pass
+                if should_stop:
+                    return
             time.sleep(ORDER_JANITOR_INTERVAL)
     threading.Thread(target=_loop, daemon=True).start()
 
@@ -2887,6 +3066,14 @@ def start_weekly_flush_scheduler():
                 time.sleep(60)
             except Exception as e:
                 print(f"⚠️ Weekly flush scheduler error: {e}")
+                should_stop, alerted = _handle_thread_exception("Weekly Flush Scheduler", e)
+                if not alerted:
+                    try:
+                        send_telegram_alert(f"⚠️ Weekly flush scheduler error: {e}")
+                    except Exception:
+                        pass
+                if should_stop:
+                    return
                 time.sleep(60)
 
     threading.Thread(target=_loop, daemon=True).start()
@@ -2899,9 +3086,7 @@ def start_auto_sell_monitor():
                 # Add a timeout to the API call
                 positions = trading_client.get_all_positions()
                 active_symbols = {p.symbol for p in positions}
-                stale_symbols = [sym for sym in list(_symbol_peak_unrealized.keys()) if sym not in active_symbols]
-                for sym in stale_symbols:
-                    _symbol_peak_unrealized.pop(sym, None)
+                _prune_symbol_peak_cache(active_symbols)
 
                 for position in positions:
                     symbol = position.symbol
@@ -2914,18 +3099,18 @@ def start_auto_sell_monitor():
 
                     # Cooldown guard (inserted)
                     now_t = monotonic()
-                    last_t = _last_close_attempt.get(symbol, 0.0)
+                    last_t = _get_last_close_attempt_ts(symbol)
                     if now_t - last_t < _CLOSE_COOLDOWN_SEC:
                         continue
 
                     trailing_triggered = False
-                    peak = _symbol_peak_unrealized.get(symbol)
+                    peak = _get_peak_unrealized(symbol)
                     if percent_change >= TRAILING_TRIGGER_PCT:
                         peak = max(peak or percent_change, percent_change)
-                        _symbol_peak_unrealized[symbol] = peak
+                        _set_peak_unrealized(symbol, peak)
                     elif peak is not None and percent_change < TRAILING_TRIGGER_PCT:
                         # below trigger again before giveback → reset
-                        _symbol_peak_unrealized.pop(symbol, None)
+                        _set_peak_unrealized(symbol, None)
                         peak = None
 
                     if peak is not None and (peak - percent_change) >= TRAILING_GIVEBACK_PCT:
@@ -2946,8 +3131,8 @@ def start_auto_sell_monitor():
                         print(f"💥 {symbol} closing position — {reason}")
                         now_t = monotonic()
                         ok = close_position_safely(symbol)  # cancels SELLs, then closes
-                        _last_close_attempt[symbol] = now_t  # start cooldown
-                        _symbol_peak_unrealized.pop(symbol, None)
+                        _set_last_close_attempt_ts(symbol, now_t)  # start cooldown
+                        _set_peak_unrealized(symbol, None)
                         if ok:
                             print(f"✅ Position closed for {symbol}")
                             # Update Performance sheet after a realized SELL is logged
@@ -2963,9 +3148,16 @@ def start_auto_sell_monitor():
 
             except Exception as monitor_error:
                 print(f"❌ Watchdog error: {monitor_error}")
-                send_telegram_alert(f"⚠️ Watchdog error: {monitor_error}")
+                should_stop, alerted = _handle_thread_exception("Watchdog", monitor_error)
+                if not alerted:
+                    try:
+                        send_telegram_alert(f"⚠️ Watchdog error: {monitor_error}")
+                    except Exception:
+                        pass
+                if should_stop:
+                    return
 
-            time.sleep(30)
+            time.sleep(WATCHDOG_LOOP_SECONDS)
 
     t = threading.Thread(target=monitor, daemon=True)
     t.start()
@@ -3134,10 +3326,6 @@ def log_trade(
     except Exception as perf_e:
         print(f"⚠️ Performance update failed: {perf_e}")
 
-
-_last_close_attempt = {}
-_CLOSE_COOLDOWN_SEC = 20  # seconds between close attempts per symbol
-
 def _get_available_qty(symbol: str) -> float:
     """Return qty_available for an open position, or 0 if none."""
     try:
@@ -3153,7 +3341,7 @@ def _get_available_qty(symbol: str) -> float:
 def close_position_if_needed(symbol: str, reason: str) -> bool:
     """Safely close a position if qty is available. Returns True if order was submitted."""
     now = monotonic()
-    last = _last_close_attempt.get(symbol)
+    last = _get_last_close_attempt_ts(symbol)
     if last is not None and (now - last) < _CLOSE_COOLDOWN_SEC:
         print(f"⏳ Skipping close for {symbol} (cooldown {int(_CLOSE_COOLDOWN_SEC - (now - last))}s).")
         return False
@@ -3172,12 +3360,12 @@ def close_position_if_needed(symbol: str, reason: str) -> bool:
             time_in_force=TimeInForce.GTC
         )
         trading_client.submit_order(order_data=market_order)
-        _last_close_attempt[symbol] = now
+        _set_last_close_attempt_ts(symbol, now)
         send_telegram_alert(f"✅ {symbol} closed at market. Reason: {reason}")
         print(f"✅ {symbol} position close submitted.")
         return True
     except Exception as e:
-        _last_close_attempt[symbol] = now
+        _set_last_close_attempt_ts(symbol, now)
         print(f"❌ Failed to close {symbol}: {e}")
         send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
         return False
