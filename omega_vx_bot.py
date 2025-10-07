@@ -965,6 +965,71 @@ def close_position_safely(symbol: str, *, session_type: str = "intraday", close_
             send_telegram_alert(f"❌ Failed to close {symbol}: {e}")
             return False
 
+def post_trade_protection_audit(symbol, entry_price, tp_price, sl_price):
+    """
+    Verify that both Take-Profit (TP) and Stop-Loss (SL) are active for a symbol.
+    If either is missing, cancel open SELLs and rebuild both orders.
+    """
+    try:
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+        open_orders = trading_client.get_orders(filter=req)
+
+        existing_tp = None
+        existing_sl = None
+
+        for o in open_orders:
+            side = str(getattr(o, "side", "")).lower()
+            if side != "sell":
+                continue
+            otype = str(getattr(o, "order_type", "")).lower()
+            price = float(getattr(o, "limit_price") or getattr(o, "stop_price") or 0)
+            if otype == "limit" and price > 0:
+                existing_tp = price
+            elif otype == "stop" and price > 0:
+                existing_sl = price
+
+        if not existing_tp or not existing_sl:
+            print(f"⚠️ Missing TP or SL for {symbol}. Rebuilding protection set...")
+            cancel_open_sells(symbol)
+            time.sleep(1.0)
+
+            qty = 0
+            try:
+                pos = [p for p in trading_client.get_all_positions() if p.symbol.upper() == symbol.upper()]
+                if pos:
+                    qty = int(float(pos[0].qty))
+            except Exception as e:
+                print(f"⚠️ Could not fetch qty for {symbol}: {e}")
+
+            if qty > 0:
+                tp_order = trading_client.submit_order(
+                    LimitOrderRequest(
+                        symbol=symbol,
+                        qty=qty,
+                        side=OrderSide.SELL,
+                        limit_price=_quantize_to_tick(tp_price),
+                        time_in_force=TimeInForce.DAY,
+                    )
+                )
+                sl_order = trading_client.submit_order(
+                    StopOrderRequest(
+                        symbol=symbol,
+                        qty=qty,
+                        side=OrderSide.SELL,
+                        stop_price=_quantize_to_tick(sl_price),
+                        time_in_force=TimeInForce.DAY,
+                    )
+                )
+                print(f"🛡 Reattached TP={tp_price} / SL={sl_price} for {symbol}.")
+                send_telegram_alert(f"🛡 Reattached protection for {symbol}: TP={tp_price}, SL={sl_price}")
+            else:
+                print(f"⚠️ No active qty found for {symbol} to re-attach protection.")
+        else:
+            print(f"🛡 Protection verified for {symbol}: TP={existing_tp}, SL={existing_sl}")
+
+    except Exception as e:
+        print(f"❌ post_trade_protection_audit failed for {symbol}: {e}")
+
 def smart_hold_check(symbol: str) -> bool:
     """
     Decide whether to hold a position overnight.
@@ -2165,6 +2230,12 @@ def submit_order_with_retries(
         print(f"🛡️ Protection attached for {symbol}: TP={abs_tp}, SL={abs_sl}")
     except Exception as e:
         print(f"⚠️ Immediate protection attach failed for {symbol}: {e} — watchdog will retry.")
+
+    print(f"✅ BUY order placed for {symbol} qty={qty}")
+    try:
+        post_trade_protection_audit(symbol, entry, take_profit, stop_loss)
+    except Exception as e:
+        print(f"⚠️ Protection audit skipped for {symbol}: {e}")
 
     # ---- Notify + log ----
     explanation = generate_trade_explanation(
