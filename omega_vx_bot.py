@@ -635,7 +635,7 @@ def _fetch_bars_with_daily_fallback(
         return _fetch_bars_df(symbol, req)
 
     bars = _fetch_data_with_fallback(
-        lambda data_feed: _request(primary_tf, primary_start, primary_end, data_feed),
+        lambda feed: _request(primary_tf, primary_start, primary_end, feed),
         symbol,
         feed=feed,
     )
@@ -644,7 +644,7 @@ def _fetch_bars_with_daily_fallback(
     if bars is None or getattr(bars, "empty", True):
         daily_start = primary_end - timedelta(days=daily_lookback_days)
         bars = _fetch_data_with_fallback(
-            lambda data_feed: _request(TimeFrame.Day, daily_start, primary_end, data_feed),
+            lambda feed: _request(TimeFrame.Day, daily_start, primary_end, feed),
             symbol,
             feed=feed,
         )
@@ -1540,6 +1540,45 @@ MIN_VOLATILITY_PCT = 0.15
 MAX_VOLATILITY_PCT = 5.0
 
 
+def _get_vix_from_yahoo() -> float:
+    """
+    Fetch latest VIX close from Yahoo Finance as a fallback.
+    Retries once with a short delay if rate-limited.
+    """
+    url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=5d"
+    for attempt in range(2):  # first try + one retry
+        try:
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            result = data.get("chart", {}).get("result") or []
+            if not result:
+                break
+            closes = (
+                result[0]
+                .get("indicators", {})
+                .get("quote", [{}])[0]
+                .get("close", [])
+            )
+            for value in reversed(closes):
+                if value is not None:
+                    vix_value = float(value)
+                    print(f"🌐 Yahoo fallback: VIX={vix_value:.2f} — adaptive filters updated.")
+                    return vix_value
+        except requests.exceptions.HTTPError as err:
+            status = getattr(err.response, "status_code", None)
+            if status == 429 and attempt == 0:
+                print("⚠️ Yahoo rate-limit — retrying in 10 s...")
+                time.sleep(10)
+                continue
+            print(f"⚠️ Yahoo VIX fallback failed: {err}")
+            break
+        except Exception as err:
+            print(f"⚠️ Yahoo VIX fetch exception: {err}")
+            break
+    return 0.0
+
+
 def _ema_trend_confirmed(bars) -> bool:
     try:
         closes = bars['close'].astype(float)
@@ -1561,19 +1600,33 @@ def _auto_adjust_filters_by_vix():
     try:
         vix = get_current_vix()
         if vix <= 0:
-            print("⚠️ Could not fetch VIX; keeping previous thresholds.")
-            return
+            print("⚠️ Could not fetch VIX from Alpaca; attempting Yahoo fallback.")
+            vix = _get_vix_from_yahoo()
+            if vix <= 0:
+                print("⚠️ Could not fetch VIX; keeping previous thresholds.")
+                return
 
-        global MIN_VOLATILITY_PCT, MIN_VOLUME
-        if vix > 25:
-            MIN_VOLATILITY_PCT, MIN_VOLUME = 0.15, 10000
-        elif vix > 15:
-            MIN_VOLATILITY_PCT, MIN_VOLUME = 0.10, 5000
+        global MIN_VOLATILITY_PCT, MIN_VOLUME, FALLBACK_STOP_LOSS_PCT, FALLBACK_TAKE_PROFIT_PCT
+        if vix < 15:
+            MIN_VOLATILITY_PCT = 0.04
+            MIN_VOLUME = 500
+            FALLBACK_STOP_LOSS_PCT = 1.0
+            FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 2.0
+        elif vix <= 25:
+            MIN_VOLATILITY_PCT = 0.08
+            MIN_VOLUME = 1000
+            FALLBACK_STOP_LOSS_PCT = 2.0
+            FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 2.5
         else:
-            MIN_VOLATILITY_PCT, MIN_VOLUME = 0.05, 1000
+            MIN_VOLATILITY_PCT = 0.15
+            MIN_VOLUME = 2000
+            FALLBACK_STOP_LOSS_PCT = 3.0
+            FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 3.0
 
         print(
-            f"🧠 VIX={vix:.2f} → Auto-filters set: volatility≥{MIN_VOLATILITY_PCT}% | volume≥{MIN_VOLUME}"
+            "🧠 VIX="
+            f"{vix:.2f} → filters: volatility≥{MIN_VOLATILITY_PCT}% | volume≥{MIN_VOLUME} | "
+            f"SL={FALLBACK_STOP_LOSS_PCT:.2f}% | TP={FALLBACK_TAKE_PROFIT_PCT:.2f}%"
         )
     except Exception as e:
         print(f"⚠️ Auto-filter calibration failed: {e}")
