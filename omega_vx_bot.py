@@ -1535,6 +1535,11 @@ def _open_positions_count() -> int:
         return 0
 
 
+MIN_VOLUME = 10000
+MIN_VOLATILITY_PCT = 0.15
+MAX_VOLATILITY_PCT = 5.0
+
+
 def _ema_trend_confirmed(bars) -> bool:
     try:
         closes = bars['close'].astype(float)
@@ -1548,12 +1553,38 @@ def _ema_trend_confirmed(bars) -> bool:
     return price > ema20 > ema50
 
 
+def _auto_adjust_filters_by_vix():
+    """
+    Automatically tune volatility/volume filters based on current VIX level.
+    Ensures Omega adapts to calm or turbulent markets autonomously.
+    """
+    try:
+        vix = get_current_vix()
+        if vix <= 0:
+            print("⚠️ Could not fetch VIX; keeping previous thresholds.")
+            return
+
+        global MIN_VOLATILITY_PCT, MIN_VOLUME
+        if vix > 25:
+            MIN_VOLATILITY_PCT, MIN_VOLUME = 0.15, 10000
+        elif vix > 15:
+            MIN_VOLATILITY_PCT, MIN_VOLUME = 0.10, 5000
+        else:
+            MIN_VOLATILITY_PCT, MIN_VOLUME = 0.05, 1000
+
+        print(
+            f"🧠 VIX={vix:.2f} → Auto-filters set: volatility≥{MIN_VOLATILITY_PCT}% | volume≥{MIN_VOLUME}"
+        )
+    except Exception as e:
+        print(f"⚠️ Auto-filter calibration failed: {e}")
+
+
 def _best_candidate_from_watchlist(symbols):
     """Return best watchlist candidate after enforcing risk filters.
 
     Hard filters:
-      • Average 15m volume ≥ 10,000 shares
-      • 15m volatility between 0.15% and 5%
+      • Average 15m volume ≥ MIN_VOLUME (auto-tuned)
+      • 15m volatility between MIN_VOLATILITY_PCT and MAX_VOLATILITY_PCT (auto-tuned)
       • Price > EMA20 > EMA50
       • RSI(15m) in [35, 65]
       • ≥ 10 minutes since this ticker was last traded
@@ -1592,7 +1623,7 @@ def _best_candidate_from_watchlist(symbols):
             avg_vol = float(bars['volume'].tail(20).mean())
             returns = closes.pct_change().dropna()
             volatility = returns.std() * 100
-            if avg_vol < 10000 or volatility > 5 or volatility < 0.15:
+            if avg_vol < MIN_VOLUME or volatility > MAX_VOLATILITY_PCT or volatility < MIN_VOLATILITY_PCT:
                 print(f"🚫 Skipping {s}: volume={avg_vol:.0f}, volatility={volatility:.2f}% — outside safe limits.")
                 continue
             if not _ema_trend_confirmed(bars.tail(60)):
@@ -1662,6 +1693,8 @@ def autoscan_once():
     if not watch:
         print("⚠️ Watchlist empty or not reachable.")
         return False
+
+    _auto_adjust_filters_by_vix()
 
     # pick a candidate
     sym = _best_candidate_from_watchlist(watch)
