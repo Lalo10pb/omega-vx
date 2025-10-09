@@ -10,7 +10,7 @@ import requests
 import subprocess
 import sys
 import functools
-from typing import Optional, Set, Tuple
+from typing import Optional, Set, Tuple, Iterable
 from datetime import datetime, timedelta, time as dt_time
 import numpy as np
 import pandas as pd
@@ -88,6 +88,7 @@ GOOGLE_CREDENTIALS_FILE = "google_credentials.json"
 SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 
 PAPER_MODE = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1", "true", "yes")
+OVERNIGHT_PROTECTION_ENABLED = bool(int(os.getenv("OVERNIGHT_PROTECTION_ENABLED", "1")))
 
 
 # --- Alpaca Data Feed selection (force IEX to avoid SIP permission errors) ---
@@ -1535,6 +1536,41 @@ def _open_positions_count() -> int:
         return 0
 
 
+def has_open_position(symbol: str, positions: Optional[Iterable] = None) -> bool:
+    """
+    Return True if there is an open (non-zero) position for `symbol`.
+    Accepts an optional iterable of positions to avoid redundant API calls.
+    """
+    try:
+        if positions is None:
+            positions = trading_client.get_all_positions()
+    except Exception as e:
+        print(f"⚠️ has_open_position failed for {symbol}: {e}")
+        return False
+
+    symbol_upper = symbol.upper()
+    for pos in positions or []:
+        try:
+            if getattr(pos, "symbol", "").upper() != symbol_upper:
+                continue
+            qty_candidates = (
+                getattr(pos, "qty_available", None),
+                getattr(pos, "qty", None),
+            )
+            for raw_qty in qty_candidates:
+                if raw_qty is None:
+                    continue
+                try:
+                    if abs(float(raw_qty)) > 0:
+                        return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            continue
+    return False
+
+
 MIN_VOLUME = 10000
 MIN_VOLATILITY_PCT = 0.15
 MAX_VOLATILITY_PCT = 5.0
@@ -1646,16 +1682,21 @@ def _best_candidate_from_watchlist(symbols):
     """
     ranked = []
     today = datetime.now().date()
+    try:
+        current_positions = trading_client.get_all_positions()
+    except Exception as e:
+        print(f"⚠️ autoscan position fetch failed: {e}")
+        current_positions = []
     for sym in symbols:
         try:
             s = sym.strip().upper()
             if not s:
                 continue
-            # --- Skip if already traded today ---
+            # --- Skip if already traded today (only when no open position) ---
             with _symbol_last_trade_lock:
                 record = _symbol_last_trade.get(s)
                 record = None if record is None else record.copy()
-            if record and record.get("date") == today:
+            if record and record.get("date") == today and not has_open_position(s, current_positions):
                 last_ts = record.get("last_trade_ts")
                 if last_ts:
                     try:
@@ -3165,6 +3206,39 @@ def start_weekly_flush_scheduler():
     threading.Thread(target=_loop, daemon=True).start()
 
 
+def _check_overnight_protection():
+    """Force-close all open positions before market close to avoid overnight exposure."""
+    try:
+        now_utc = datetime.now(timezone.utc)
+        market_close_utc = datetime.combine(
+            now_utc.date(),
+            dt_time(hour=20, minute=55, tzinfo=timezone.utc),
+        )
+        window_start = market_close_utc - timedelta(minutes=5)
+        if window_start <= now_utc <= market_close_utc:
+            try:
+                positions = trading_client.get_all_positions()
+            except Exception as fetch_err:
+                print(f"⚠️ Overnight protection: position fetch failed: {fetch_err}")
+                return
+            for pos in positions:
+                try:
+                    qty = float(getattr(pos, "qty", 0) or 0)
+                except Exception:
+                    qty = 0.0
+                if abs(qty) == 0:
+                    continue
+                symbol = getattr(pos, "symbol", "").upper()
+                side = "sell" if qty > 0 else "buy"
+                print(f"🌙 [Overnight Protection] Closing {symbol} ({side} {abs(qty)} shares).")
+                try:
+                    close_position_safely(symbol, close_reason="overnight_protection")
+                except Exception as close_err:
+                    print(f"⚠️ Failed to close {symbol} before close: {close_err}")
+    except Exception as e:
+        print(f"⚠️ Overnight protection check failed: {e}")
+
+
 def start_auto_sell_monitor():
     def monitor():
         while True:
@@ -3243,6 +3317,8 @@ def start_auto_sell_monitor():
                 if should_stop:
                     return
 
+            if OVERNIGHT_PROTECTION_ENABLED:
+                _check_overnight_protection()
             time.sleep(WATCHDOG_LOOP_SECONDS)
 
     t = threading.Thread(target=monitor, daemon=True)
