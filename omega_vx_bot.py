@@ -744,6 +744,11 @@ _pdt_lockouts = {}
 _last_close_attempt_lock = threading.Lock()
 _pdt_lockouts_lock = threading.Lock()
 
+_VIX_CACHE = {"value": None, "source": "unknown", "timestamp": 0.0}
+_VIX_CACHE_TTL = max(30, _int_env("VIX_CACHE_SECONDS", 180))
+_VIX_ALPACA_DISABLED = False
+_YAHOO_VIX_BACKOFF_UNTIL = 0.0
+
 
 def _get_last_close_attempt_ts(symbol: str) -> float:
     with _last_close_attempt_lock:
@@ -1651,39 +1656,48 @@ MAX_VOLATILITY_PCT = 5.0
 def _get_vix_from_yahoo() -> float:
     """
     Fetch latest VIX close from Yahoo Finance as a fallback.
-    Retries once with a short delay if rate-limited.
+    Applies a backoff window when rate-limited to avoid repeated 429s.
     """
+    global _YAHOO_VIX_BACKOFF_UNTIL
+
+    if monotonic() < _YAHOO_VIX_BACKOFF_UNTIL:
+        remaining = int(max(0, _YAHOO_VIX_BACKOFF_UNTIL - monotonic()))
+        print(f"⚠️ Yahoo VIX backoff active ({remaining}s remaining); skipping remote fetch.")
+        return 0.0
+
+    if not requests:
+        print("⚠️ Yahoo fallback unavailable (requests missing).")
+        return 0.0
+
     url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=5d"
-    for attempt in range(2):  # first try + one retry
-        try:
-            resp = requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            result = data.get("chart", {}).get("result") or []
-            if not result:
-                break
-            closes = (
-                result[0]
-                .get("indicators", {})
-                .get("quote", [{}])[0]
-                .get("close", [])
-            )
-            for value in reversed(closes):
-                if value is not None:
-                    vix_value = float(value)
-                    print(f"🌐 Yahoo fallback: VIX={vix_value:.2f} — adaptive filters updated.")
-                    return vix_value
-        except requests.exceptions.HTTPError as err:
-            status = getattr(err.response, "status_code", None)
-            if status == 429 and attempt == 0:
-                print("⚠️ Yahoo rate-limit — retrying in 10 s...")
-                time.sleep(10)
-                continue
-            print(f"⚠️ Yahoo VIX fallback failed: {err}")
-            break
-        except Exception as err:
-            print(f"⚠️ Yahoo VIX fetch exception: {err}")
-            break
+    try:
+        resp = requests.get(url, timeout=10, headers={"User-Agent": "OmegaVX/1.0"})
+        resp.raise_for_status()
+        data = resp.json()
+        result = data.get("chart", {}).get("result") or []
+        if not result:
+            return 0.0
+        closes = (
+            result[0]
+            .get("indicators", {})
+            .get("quote", [{}])[0]
+            .get("close", [])
+        )
+        for value in reversed(closes):
+            if value is not None:
+                vix_value = float(value)
+                print(f"🌐 Yahoo fallback: VIX={vix_value:.2f} — adaptive filters updated.")
+                return vix_value
+    except requests.exceptions.HTTPError as err:
+        status = getattr(err.response, "status_code", None)
+        if status == 429:
+            _YAHOO_VIX_BACKOFF_UNTIL = monotonic() + 600
+            remaining = int(max(0, _YAHOO_VIX_BACKOFF_UNTIL - monotonic()))
+            print(f"⚠️ Yahoo VIX rate-limit — backing off for {remaining}s.")
+            return 0.0
+        print(f"⚠️ Yahoo VIX fallback failed: {err}")
+    except Exception as err:
+        print(f"⚠️ Yahoo VIX fetch exception: {err}")
     return 0.0
 
 
@@ -1779,6 +1793,7 @@ def _auto_adjust_filters_by_vix():
     Ensures Omega adapts to calm or turbulent markets autonomously.
     """
     global MIN_VOLATILITY_PCT, MIN_VOLUME, FALLBACK_STOP_LOSS_PCT, FALLBACK_TAKE_PROFIT_PCT
+    global _VIX_CACHE, _VIX_CACHE_TTL, _VIX_ALPACA_DISABLED
 
     thresholds = {
         "volatility": MIN_VOLATILITY_PCT,
@@ -1786,29 +1801,35 @@ def _auto_adjust_filters_by_vix():
         "sl": FALLBACK_STOP_LOSS_PCT,
         "tp": FALLBACK_TAKE_PROFIT_PCT,
     }
+
     vix_value = None
     vix_source = "alpaca"
+    cache_hit = False
 
-    try:
-        vix_value = float(get_current_vix())
-        if vix_value <= 0:
-            print("⚠️ Could not fetch VIX from Alpaca; attempting Yahoo fallback.")
-            raise ValueError("alpaca_vix<=0")
-    except Exception as primary_err:
-        if not isinstance(primary_err, ValueError):
-            print(f"⚠️ Auto-filter calibration failed: {primary_err}")
+    now = monotonic()
+    cache_value = _VIX_CACHE.get("value")
+    cache_age = now - _VIX_CACHE.get("timestamp", 0.0)
+    if cache_value is not None and cache_age < _VIX_CACHE_TTL:
+        vix_value = cache_value
+        vix_source = _VIX_CACHE.get("source", "unknown")
+        cache_hit = True
+    else:
         try:
+            vix_value = float(get_current_vix())
+            if vix_value <= 0:
+                if not _VIX_ALPACA_DISABLED:
+                    print("⚠️ Could not fetch VIX from Alpaca; attempting Yahoo fallback.")
+                raise ValueError("alpaca_vix<=0")
+        except Exception as primary_err:
+            if not isinstance(primary_err, ValueError):
+                print(f"⚠️ Auto-filter calibration failed: {primary_err}")
             yahoo_vix = _get_vix_from_yahoo()
             if yahoo_vix and yahoo_vix > 0:
                 vix_value = float(yahoo_vix)
                 vix_source = "yahoo"
             else:
-                print("⚠️ Could not fetch VIX; keeping previous thresholds.")
                 vix_value = None
-        except Exception as yahoo_err:
-            print(f"⚠️ Yahoo VIX fetch exception: {yahoo_err}")
-            vix_value = None
-    finally:
+
         if not vix_value or vix_value <= 0:
             proxy_value = _compute_vix_proxy()
             if proxy_value > 0:
@@ -1818,45 +1839,43 @@ def _auto_adjust_filters_by_vix():
                 vix_value = 0.0
                 vix_source = "unknown"
 
-        if vix_value > 0:
-            if vix_value < 15:
-                MIN_VOLATILITY_PCT = 0.04
-                MIN_VOLUME = 500
-                FALLBACK_STOP_LOSS_PCT = 1.0
-                FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 2.0
-            elif vix_value <= 25:
-                MIN_VOLATILITY_PCT = 0.08
-                MIN_VOLUME = 1000
-                FALLBACK_STOP_LOSS_PCT = 2.0
-                FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 2.5
-            else:
-                MIN_VOLATILITY_PCT = 0.15
-                MIN_VOLUME = 2000
-                FALLBACK_STOP_LOSS_PCT = 3.0
-                FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 3.0
+        _VIX_CACHE.update({"value": vix_value, "source": vix_source, "timestamp": now})
 
-            thresholds.update({
-                "volatility": MIN_VOLATILITY_PCT,
-                "volume": MIN_VOLUME,
-                "sl": FALLBACK_STOP_LOSS_PCT,
-                "tp": FALLBACK_TAKE_PROFIT_PCT,
-            })
+    if cache_hit:
+        vix_source = f"cache:{vix_source}"
+
+    if vix_value > 0:
+        if vix_value < 15:
+            MIN_VOLATILITY_PCT = 0.04
+            MIN_VOLUME = 500
+            FALLBACK_STOP_LOSS_PCT = 1.0
+            FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 2.0
+        elif vix_value <= 25:
+            MIN_VOLATILITY_PCT = 0.08
+            MIN_VOLUME = 1000
+            FALLBACK_STOP_LOSS_PCT = 2.0
+            FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 2.5
         else:
-            thresholds.update({
-                "volatility": MIN_VOLATILITY_PCT,
-                "volume": MIN_VOLUME,
-                "sl": FALLBACK_STOP_LOSS_PCT,
-                "tp": FALLBACK_TAKE_PROFIT_PCT,
-            })
+            MIN_VOLATILITY_PCT = 0.15
+            MIN_VOLUME = 2000
+            FALLBACK_STOP_LOSS_PCT = 3.0
+            FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 3.0
 
-        _describe_market_and_filters(vix_value, thresholds, source=vix_source)
+    thresholds.update({
+        "volatility": MIN_VOLATILITY_PCT,
+        "volume": MIN_VOLUME,
+        "sl": FALLBACK_STOP_LOSS_PCT,
+        "tp": FALLBACK_TAKE_PROFIT_PCT,
+    })
 
-        try:
-            _ensure_protection_for_all_open_positions()
-        except Exception as guard_err:
-            print(f"⚠️ Protection guardian (post-VIX) error: {guard_err}")
+    _describe_market_and_filters(vix_value, thresholds, source=vix_source)
 
-        return thresholds
+    try:
+        _ensure_protection_for_all_open_positions()
+    except Exception as guard_err:
+        print(f"⚠️ Protection guardian (post-VIX) error: {guard_err}")
+
+    return thresholds
 
 
 def _best_candidate_from_watchlist(symbols):
@@ -2256,6 +2275,11 @@ def calculate_trade_qty(entry_price, stop_loss_price):
         return 0
 
 def get_current_vix():
+    global _VIX_ALPACA_DISABLED
+
+    if _VIX_ALPACA_DISABLED:
+        return 0.0
+
     try:
         req = StockBarsRequest(
             symbol_or_symbols="^VIX",
@@ -2278,12 +2302,19 @@ def get_current_vix():
                 bars = _fetch_bars_df("^VIX", req)
             except Exception as e2:
                 print(f"❌ Failed to get VIX (IEX fallback): {e2}")
+                if "invalid symbol" in str(e2).lower():
+                    _VIX_ALPACA_DISABLED = True
                 return 0
         else:
             print(f"❌ Failed to get VIX: {e}")
+            if "invalid symbol" in str(e).lower():
+                _VIX_ALPACA_DISABLED = True
             return 0
 
     try:
+        if bars is None or getattr(bars, "empty", True):
+            print("⚠️ No VIX data found.")
+            return 0
         if 'symbol' in bars.columns:
             sel = bars[bars['symbol'] == "^VIX"]
         else:
