@@ -290,6 +290,7 @@ _symbol_peak_unrealized = {}  # track peak % gains for trailing logic
 _symbol_last_trade_lock = threading.Lock()
 _symbol_peak_unrealized_lock = threading.Lock()
 # Thread safety for PDT lockouts and PnL alert state
+_protection_guard_lock = threading.Lock()
 _pdt_lockouts_lock = threading.Lock()
 _DAILY_PNL_ALERT_STATE_LOCK = threading.Lock()
 _DAILY_PNL_ALERT_STATE = {"gain": None, "loss": None}
@@ -1697,44 +1698,163 @@ def _ema_trend_confirmed(bars) -> bool:
     return price > ema20 > ema50
 
 
+def _describe_market_and_filters(vix_value: float, thresholds: dict, source: str = "alpaca") -> None:
+    """Emit a human-readable summary of the current market regime and active filters."""
+    value = float(vix_value or 0.0)
+    if value <= 0:
+        regime = "Unknown"
+        display = "n/a"
+    elif value < 15:
+        regime = "Calm"
+        display = f"{value:.2f}"
+    elif value < 25:
+        regime = "Normal"
+        display = f"{value:.2f}"
+    else:
+        regime = "Volatile"
+        display = f"{value:.2f}"
+
+    filters = {
+        "volatility": thresholds.get("volatility", MIN_VOLATILITY_PCT),
+        "volume": thresholds.get("volume", MIN_VOLUME),
+        "sl": thresholds.get("sl", FALLBACK_STOP_LOSS_PCT),
+        "tp": thresholds.get("tp", FALLBACK_TAKE_PROFIT_PCT),
+    }
+    source_label = (source or "unknown").lower()
+    print(
+        "🌍 Market regime: "
+        f"{regime} (VIX≈{display}, source={source_label}) | "
+        f"Filters → Vol≥{filters['volatility']:.2f}%, "
+        f"Volu≥{int(filters['volume'])}, "
+        f"SL={filters['sl']:.2f}%, TP={filters['tp']:.2f}%"
+    )
+
+
+def _compute_vix_proxy(symbol: str = "SPY", period: int = 14) -> float:
+    """
+    Derive a volatility proxy from SPY daily ATR (percent). Falls back to 0 on failure.
+    """
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=period * 4)
+        bars, _ = _fetch_bars_with_daily_fallback(
+            symbol,
+            primary_tf=TimeFrame.Day,
+            primary_start=start,
+            primary_end=end,
+            feed=DataFeed.IEX,
+            daily_lookback_days=period * 6,
+            normalize_reset_index=True,
+        )
+        if bars.empty:
+            return 0.0
+
+        bars = bars.dropna(subset=["high", "low", "close"]).tail(period + 1).copy()
+        if len(bars) < period + 1:
+            return 0.0
+
+        bars["close_prev"] = bars["close"].shift(1)
+        bars["tr_high_low"] = bars["high"] - bars["low"]
+        bars["tr_high_close"] = (bars["high"] - bars["close_prev"]).abs()
+        bars["tr_low_close"] = (bars["low"] - bars["close_prev"]).abs()
+        bars["true_range"] = bars[["tr_high_low", "tr_high_close", "tr_low_close"]].max(axis=1)
+        atr = bars["true_range"].rolling(window=period).mean().iloc[-1]
+        if pd.isna(atr) or atr <= 0:
+            return 0.0
+
+        last_close = float(bars["close"].iloc[-1]) if len(bars["close"]) else 0.0
+        if last_close <= 0:
+            return round(float(atr), 2)
+        return round(float(atr) / last_close * 100.0, 2)
+    except Exception as e:
+        print(f"⚠️ VIX proxy compute failed: {e}")
+        return 0.0
+
+
 def _auto_adjust_filters_by_vix():
     """
     Automatically tune volatility/volume filters based on current VIX level.
     Ensures Omega adapts to calm or turbulent markets autonomously.
     """
+    global MIN_VOLATILITY_PCT, MIN_VOLUME, FALLBACK_STOP_LOSS_PCT, FALLBACK_TAKE_PROFIT_PCT
+
+    thresholds = {
+        "volatility": MIN_VOLATILITY_PCT,
+        "volume": MIN_VOLUME,
+        "sl": FALLBACK_STOP_LOSS_PCT,
+        "tp": FALLBACK_TAKE_PROFIT_PCT,
+    }
+    vix_value = None
+    vix_source = "alpaca"
+
     try:
-        vix = get_current_vix()
-        if vix <= 0:
+        vix_value = float(get_current_vix())
+        if vix_value <= 0:
             print("⚠️ Could not fetch VIX from Alpaca; attempting Yahoo fallback.")
-            vix = _get_vix_from_yahoo()
-            if vix <= 0:
+            raise ValueError("alpaca_vix<=0")
+    except Exception as primary_err:
+        if not isinstance(primary_err, ValueError):
+            print(f"⚠️ Auto-filter calibration failed: {primary_err}")
+        try:
+            yahoo_vix = _get_vix_from_yahoo()
+            if yahoo_vix and yahoo_vix > 0:
+                vix_value = float(yahoo_vix)
+                vix_source = "yahoo"
+            else:
                 print("⚠️ Could not fetch VIX; keeping previous thresholds.")
-                return
+                vix_value = None
+        except Exception as yahoo_err:
+            print(f"⚠️ Yahoo VIX fetch exception: {yahoo_err}")
+            vix_value = None
+    finally:
+        if not vix_value or vix_value <= 0:
+            proxy_value = _compute_vix_proxy()
+            if proxy_value > 0:
+                vix_value = proxy_value
+                vix_source = "proxy"
+            else:
+                vix_value = 0.0
+                vix_source = "unknown"
 
-        global MIN_VOLATILITY_PCT, MIN_VOLUME, FALLBACK_STOP_LOSS_PCT, FALLBACK_TAKE_PROFIT_PCT
-        if vix < 15:
-            MIN_VOLATILITY_PCT = 0.04
-            MIN_VOLUME = 500
-            FALLBACK_STOP_LOSS_PCT = 1.0
-            FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 2.0
-        elif vix <= 25:
-            MIN_VOLATILITY_PCT = 0.08
-            MIN_VOLUME = 1000
-            FALLBACK_STOP_LOSS_PCT = 2.0
-            FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 2.5
+        if vix_value > 0:
+            if vix_value < 15:
+                MIN_VOLATILITY_PCT = 0.04
+                MIN_VOLUME = 500
+                FALLBACK_STOP_LOSS_PCT = 1.0
+                FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 2.0
+            elif vix_value <= 25:
+                MIN_VOLATILITY_PCT = 0.08
+                MIN_VOLUME = 1000
+                FALLBACK_STOP_LOSS_PCT = 2.0
+                FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 2.5
+            else:
+                MIN_VOLATILITY_PCT = 0.15
+                MIN_VOLUME = 2000
+                FALLBACK_STOP_LOSS_PCT = 3.0
+                FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 3.0
+
+            thresholds.update({
+                "volatility": MIN_VOLATILITY_PCT,
+                "volume": MIN_VOLUME,
+                "sl": FALLBACK_STOP_LOSS_PCT,
+                "tp": FALLBACK_TAKE_PROFIT_PCT,
+            })
         else:
-            MIN_VOLATILITY_PCT = 0.15
-            MIN_VOLUME = 2000
-            FALLBACK_STOP_LOSS_PCT = 3.0
-            FALLBACK_TAKE_PROFIT_PCT = FALLBACK_STOP_LOSS_PCT * 3.0
+            thresholds.update({
+                "volatility": MIN_VOLATILITY_PCT,
+                "volume": MIN_VOLUME,
+                "sl": FALLBACK_STOP_LOSS_PCT,
+                "tp": FALLBACK_TAKE_PROFIT_PCT,
+            })
 
-        print(
-            "🧠 VIX="
-            f"{vix:.2f} → filters: volatility≥{MIN_VOLATILITY_PCT}% | volume≥{MIN_VOLUME} | "
-            f"SL={FALLBACK_STOP_LOSS_PCT:.2f}% | TP={FALLBACK_TAKE_PROFIT_PCT:.2f}%"
-        )
-    except Exception as e:
-        print(f"⚠️ Auto-filter calibration failed: {e}")
+        _describe_market_and_filters(vix_value, thresholds, source=vix_source)
+
+        try:
+            _ensure_protection_for_all_open_positions()
+        except Exception as guard_err:
+            print(f"⚠️ Protection guardian (post-VIX) error: {guard_err}")
+
+        return thresholds
 
 
 def _best_candidate_from_watchlist(symbols):
@@ -1845,52 +1965,58 @@ def _compute_entry_tp_sl(symbol: str):
     return entry, sl, tp
 
 def autoscan_once():
-    # stop if too many positions (dynamic cap)
-    print(f"🧮 Open positions: {_open_positions_count()} / Max allowed: {get_dynamic_max_open_positions()}")
-    if _open_positions_count() >= get_dynamic_max_open_positions():
-        print(f"⛔ Position cap reached ({get_dynamic_max_open_positions()}).")
-        return False
+    try:
+        # stop if too many positions (dynamic cap)
+        print(f"🧮 Open positions: {_open_positions_count()} / Max allowed: {get_dynamic_max_open_positions()}")
+        if _open_positions_count() >= get_dynamic_max_open_positions():
+            print(f"⛔ Position cap reached ({get_dynamic_max_open_positions()}).")
+            return False
 
-    # read watchlist
-    watch = get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist")
-    if not watch:
-        print("⚠️ Watchlist empty or not reachable.")
-        return False
+        # read watchlist
+        watch = get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist")
+        if not watch:
+            print("⚠️ Watchlist empty or not reachable.")
+            return False
 
-    _auto_adjust_filters_by_vix()
+        _auto_adjust_filters_by_vix()
 
-    # pick a candidate
-    sym = _best_candidate_from_watchlist(watch)
-    if not sym:
-        print("ℹ️ No positive‑score candidate right now.")
-        return False
+        # pick a candidate
+        sym = _best_candidate_from_watchlist(watch)
+        if not sym:
+            print("ℹ️ No positive‑score candidate right now.")
+            return False
 
-    # compute prices
-    trio = _compute_entry_tp_sl(sym)
-    if not trio:
-        return False
-    entry, sl, tp = trio
+        # compute prices
+        trio = _compute_entry_tp_sl(sym)
+        if not trio:
+            return False
+        entry, sl, tp = trio
 
-    # respect cooldown, hours, and equity guard
-    if is_cooldown_active():
-        print("⏳ Global cooldown active; skipping autoscan trade.")
-        return False
-    if not is_within_trading_hours():
-        print("🕑 Outside trading hours; autoscan skip.")
-        return False
-    if should_block_trading_due_to_equity():
-        print("🛑 Equity guard active; autoscan skip.")
-        return False
+        # respect cooldown, hours, and equity guard
+        if is_cooldown_active():
+            print("⏳ Global cooldown active; skipping autoscan trade.")
+            return False
+        if not is_within_trading_hours():
+            print("🕑 Outside trading hours; autoscan skip.")
+            return False
+        if should_block_trading_due_to_equity():
+            print("🛑 Equity guard active; autoscan skip.")
+            return False
 
-    print(f"🤖 AUTOSCAN candidate {sym}: entry={entry} SL={sl} TP={tp}")
-    return submit_order_with_retries(
-        symbol=sym,
-        entry=entry,
-        stop_loss=sl,
-        take_profit=tp,
-        use_trailing=True,
-        dry_run=OMEGA_AUTOSCAN_DRYRUN
-    )
+        print(f"🤖 AUTOSCAN candidate {sym}: entry={entry} SL={sl} TP={tp}")
+        return submit_order_with_retries(
+            symbol=sym,
+            entry=entry,
+            stop_loss=sl,
+            take_profit=tp,
+            use_trailing=True,
+            dry_run=OMEGA_AUTOSCAN_DRYRUN
+        )
+    finally:
+        try:
+            _ensure_protection_for_all_open_positions()
+        except Exception as guard_err:
+            print(f"⚠️ Protection guardian (autoscan) error: {guard_err}")
 
 def start_autoscan_thread():
     if not OMEGA_AUTOSCAN:
@@ -2085,6 +2211,16 @@ TRADE_LOG_HEADER = [
     "context_equity_change",
 ]
 EQUITY_CURVE_LOG_PATH = os.path.join(LOG_DIR, "equity_curve.log")
+PROTECTION_STATE_PATH = os.path.join(LOG_DIR, "protection_state.csv")
+PROTECTION_STATE_HEADER = [
+    "timestamp",
+    "symbol",
+    "qty",
+    "entry",
+    "stop_loss",
+    "take_profit",
+    "order_id",
+]
 
 def calculate_trade_qty(entry_price, stop_loss_price):
     try:
@@ -2346,10 +2482,9 @@ def submit_order_with_retries(
 ):
     """
     Flow:
-      1) Risk-based qty calc + BP guard (live ask + 2% buffer)
-      2) Pre-cancel SELLs to avoid wash-trade
-      3) Plain market BUY (no bracket)
-      4) Attach split reduce_only TP/SL (with retries if qty_available=0)
+      1) Risk-based qty calc + BP guard (live ask + safety buffer)
+      2) Pre-cancel SELLs to avoid wash-trade rejects
+      3) Submit market bracket BUY with broker-managed TP/SL
     """
     print("📌 About to calculate quantity...")
 
@@ -2517,27 +2652,6 @@ def submit_order_with_retries(
     except Exception as e:
         print(f"⚠️ Pre-cancel error for {symbol}: {e}")
 
-    # ---- BUY leg (no bracket) ----
-    from alpaca.trading.enums import OrderSide, TimeInForce
-    try:
-        print(f"🚀 Submitting BUY {symbol} x{qty} (market, GTC)")
-        buy_order = trading_client.submit_order(MarketOrderRequest(
-            symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC
-        ))
-        buy_fill_price = None
-        try:
-            info = poll_order_fill(buy_order.id, timeout=90, poll_secs=2)
-            buy_fill_price = info.get("filled_avg_price")
-        except Exception as _:
-            buy_fill_price = None
-    except Exception as e:
-        if _is_pattern_day_trading_error(e):
-            _set_pdt_global_lockout(f"BUY denied for {symbol}")
-        print("🧨 BUY submit failed:", e)
-        try: send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
-        except Exception: pass
-        return False
-
     # --- Sanity clamp TP/SL once (avoid nonsensical webhook values) ---
     try:
         req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=_DATA_FEED)
@@ -2566,18 +2680,43 @@ def submit_order_with_retries(
     abs_sl = _quantize_to_tick(abs_sl)
     print(f"🧭 TP/SL sanity → last={last_px:.2f} | TP={abs_tp} | SL={abs_sl}")
 
-    # 🚨 Attach protection immediately (always place TP/SL after buy)
+    # ---- BUY leg via bracket order ----
     try:
-        place_split_protection(symbol, tp_price=abs_tp, sl_price=abs_sl)
-        print(f"🛡️ Protection attached for {symbol}: TP={abs_tp}, SL={abs_sl}")
+        print(f"🚀 Submitting bracket BUY {symbol} x{qty} (market, GTC)")
+        buy_order = trading_client.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            type=OrderType.MARKET,
+            time_in_force=TimeInForce.GTC,
+            order_class="bracket",
+            take_profit={"limit_price": abs_tp},
+            stop_loss={"stop_price": abs_sl},
+        )
+        buy_fill_price = None
+        try:
+            info = poll_order_fill(buy_order.id, timeout=90, poll_secs=2)
+            buy_fill_price = info.get("filled_avg_price")
+        except Exception:
+            buy_fill_price = None
     except Exception as e:
-        print(f"⚠️ Immediate protection attach failed for {symbol}: {e} — watchdog will retry.")
+        if _is_pattern_day_trading_error(e):
+            _set_pdt_global_lockout(f"BUY denied for {symbol}")
+        print("🧨 BUY submit failed:", e)
+        try: send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
+        except Exception: pass
+        return False
 
-    print(f"✅ BUY order placed for {symbol} qty={qty}")
+    print(f"✅ Bracket BUY placed for {symbol} qty={qty} (TP={abs_tp}, SL={abs_sl})")
+
     try:
-        post_trade_protection_audit(symbol, entry, take_profit, stop_loss)
-    except Exception as e:
-        print(f"⚠️ Protection audit skipped for {symbol}: {e}")
+        entry_snapshot = float(buy_fill_price or entry)
+    except Exception:
+        entry_snapshot = float(entry)
+    try:
+        _append_protection_state(symbol, qty, entry_snapshot, abs_sl, abs_tp, getattr(buy_order, "id", None))
+    except Exception as persist_err:
+        print(f"⚠️ Protection guardian: state persistence failed for {symbol}: {persist_err}")
 
     # ---- Notify + log ----
     explanation = generate_trade_explanation(
@@ -2894,6 +3033,250 @@ def update_google_performance_sheet(metrics: dict, sheet_id: str = None, tab_nam
         print(f"⚠️ Failed to update performance sheet: {e}")
 
 # --- Weekend Improvements: Open Positions helpers & EOD/Janitor schedulers ---
+
+def _load_protection_state_map() -> dict:
+    """Return the latest persisted SL/TP values per symbol."""
+    state = {}
+    if not os.path.exists(PROTECTION_STATE_PATH):
+        return state
+    try:
+        with open(PROTECTION_STATE_PATH, mode="r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                symbol = str(row.get("symbol", "")).upper()
+                if not symbol:
+                    continue
+                try:
+                    qty = int(float(row.get("qty") or 0))
+                except Exception:
+                    qty = 0
+                try:
+                    entry = float(row.get("entry") or 0)
+                except Exception:
+                    entry = 0.0
+                try:
+                    sl = float(row.get("stop_loss") or 0)
+                except Exception:
+                    sl = 0.0
+                try:
+                    tp = float(row.get("take_profit") or 0)
+                except Exception:
+                    tp = 0.0
+                state[symbol] = {
+                    "qty": qty,
+                    "entry": entry,
+                    "stop_loss": sl,
+                    "take_profit": tp,
+                    "order_id": row.get("order_id"),
+                    "timestamp": row.get("timestamp"),
+                }
+    except Exception as read_err:
+        print(f"⚠️ Protection guardian: unable to read persisted state: {read_err}")
+    return state
+
+
+def _append_protection_state(symbol: str, qty: int, entry: float, stop_loss: float, take_profit: float, order_id: str) -> None:
+    """Append or update the persisted protection state used for restart recovery."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+    row = [
+        timestamp,
+        symbol.upper(),
+        int(qty),
+        float(entry),
+        float(stop_loss),
+        float(take_profit),
+        order_id or "",
+    ]
+    file_exists = os.path.exists(PROTECTION_STATE_PATH)
+    try:
+        with open(PROTECTION_STATE_PATH, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(PROTECTION_STATE_HEADER)
+            writer.writerow(row)
+    except Exception as write_err:
+        print(f"⚠️ Protection guardian: failed to persist state for {symbol}: {write_err}")
+
+
+def _ensure_protection_for_all_open_positions() -> bool:
+    """
+    Guarantee that every open position has both TP and SL protection attached.
+    Returns True if at least one re-arm was attempted.
+    """
+    if not _protection_guard_lock.acquire(blocking=False):
+        print("⏳ Protection guardian already running; skipping overlapping pass.")
+        return False
+    try:
+        try:
+            positions = trading_client.get_all_positions()
+        except Exception as pos_err:
+            print(f"⚠️ Protection guardian: position fetch failed: {pos_err}")
+            return False
+
+        if not positions:
+            return False
+
+        try:
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            open_orders = trading_client.get_orders(filter=req)
+        except Exception as orders_err:
+            print(f"⚠️ Protection guardian: open orders fetch failed: {orders_err}")
+            open_orders = []
+
+        state_map = _load_protection_state_map()
+
+        protection_map = {}
+        for order in open_orders:
+            try:
+                symbol = str(getattr(order, "symbol", "")).upper()
+            except Exception:
+                symbol = ""
+            if not symbol:
+                continue
+            side = str(getattr(order, "side", "")).lower()
+            if not side.endswith("sell"):
+                continue
+            order_class = str(getattr(order, "order_class", "")).lower()
+            order_type = str(getattr(order, "order_type", getattr(order, "type", ""))).lower()
+            bucket = protection_map.setdefault(symbol, set())
+            if order_class in ("oco", "bracket"):
+                bucket.update({"tp", "sl"})
+                continue
+            if order_type == "limit":
+                bucket.add("tp")
+            elif order_type in ("stop", "stop_limit", "stoplimit"):
+                bucket.add("sl")
+
+        rearmed = False
+
+        for pos in positions:
+            try:
+                symbol = str(getattr(pos, "symbol", "")).upper()
+            except Exception:
+                symbol = ""
+            if not symbol:
+                continue
+            try:
+                qty = abs(int(float(getattr(pos, "qty", 0) or 0)))
+            except Exception:
+                qty = 0
+            if qty <= 0:
+                continue
+
+            existing = protection_map.get(symbol, set())
+            if {"tp", "sl"}.issubset(existing):
+                continue
+
+            stored = state_map.get(symbol, {})
+
+            try:
+                entry_price = float(getattr(pos, "avg_entry_price", 0) or 0)
+            except Exception:
+                entry_price = 0.0
+            if entry_price <= 0:
+                try:
+                    entry_price = float(getattr(pos, "current_price", 0) or 0)
+                except Exception:
+                    entry_price = 0.0
+            if stored:
+                try:
+                    stored_entry = float(stored.get("entry") or 0)
+                    if stored_entry > 0:
+                        entry_price = stored_entry
+                except Exception:
+                    pass
+            if entry_price <= 0:
+                print(f"⚠️ Protection guardian: unable to derive entry price for {symbol}; skipping re-arm.")
+                continue
+
+            try:
+                stored_sl = float(stored.get("stop_loss") or 0)
+            except Exception:
+                stored_sl = 0.0
+            try:
+                stored_tp = float(stored.get("take_profit") or 0)
+            except Exception:
+                stored_tp = 0.0
+
+            if stored_sl > 0:
+                sl_price = _quantize_to_tick(stored_sl)
+            else:
+                sl_price = None
+            if stored_tp > 0:
+                tp_price = _quantize_to_tick(stored_tp)
+            else:
+                tp_price = None
+
+            if not sl_price or not tp_price:
+                sl_raw = entry_price * (1 - FALLBACK_STOP_LOSS_PCT / 100.0)
+                tp_raw = entry_price * (1 + FALLBACK_TAKE_PROFIT_PCT / 100.0)
+                if not sl_price:
+                    sl_price = _quantize_to_tick(sl_raw)
+                if not tp_price:
+                    tp_price = _quantize_to_tick(tp_raw)
+
+            if sl_price is None or tp_price is None or sl_price <= 0 or tp_price <= 0:
+                print(f"⚠️ Protection guardian: invalid computed SL/TP for {symbol}; skipping re-arm.")
+                continue
+
+            if existing:
+                try:
+                    cancelled = cancel_open_sells(symbol)
+                    if cancelled:
+                        print(f"🧹 Protection guardian removed {cancelled} stale SELL order(s) before re-arming {symbol}.")
+                    time.sleep(0.2)
+                except Exception as cancel_err:
+                    print(f"⚠️ Protection guardian: cancel existing orders failed for {symbol}: {cancel_err}")
+
+            try:
+                trading_client.submit_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    type=OrderType.LIMIT,
+                    time_in_force=TimeInForce.GTC,
+                    order_class="oco",
+                    take_profit={"limit_price": tp_price},
+                    stop_loss={"stop_price": sl_price},
+                )
+                print(f"🛡️ Protection guardian re-armed {symbol}: qty={qty} SL={sl_price:.2f} TP={tp_price:.2f}")
+                rearmed = True
+            except Exception as submit_err:
+                print(f"⚠️ Protection guardian: re-arm submit failed for {symbol}: {submit_err}")
+
+        if not rearmed:
+            print("🛡️ Protection guardian: all positions already protected.")
+        return rearmed
+    finally:
+        _protection_guard_lock.release()
+
+
+def start_protection_guardian_scheduler():
+    """Run the protection guardian around market open to catch leftover positions."""
+    def _loop():
+        print("🛡️ Protection guardian scheduler active (daily 13:28 UTC sweep).")
+        last_trigger_key = None
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                key = (now.date(), now.hour, now.minute)
+                if now.hour == 13 and now.minute == 28 and key != last_trigger_key:
+                    _ensure_protection_for_all_open_positions()
+                    last_trigger_key = key
+                time.sleep(20)
+            except Exception as scheduler_err:
+                print(f"⚠️ Protection guardian scheduler error: {scheduler_err}")
+                should_stop, alerted = _handle_thread_exception("Protection Guardian", scheduler_err)
+                if not alerted:
+                    try:
+                        send_telegram_alert(f"⚠️ Protection guardian scheduler error: {scheduler_err}")
+                    except Exception:
+                        pass
+                if should_stop:
+                    return
+                time.sleep(60)
+
+    threading.Thread(target=_loop, daemon=True, name="ProtectionGuardian").start()
 
 def get_symbol_tp_sl_open_orders(symbol: str):
     """Return (tp_limit, sl_stop) from current OPEN SELL orders, if present."""
@@ -3689,6 +4072,10 @@ def place_split_protection(
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
     handle_restart_notification()
+    try:
+        _ensure_protection_for_all_open_positions()
+    except Exception as boot_guard_err:
+        print(f"⚠️ Protection guardian (boot) error: {boot_guard_err}")
     with _BACKGROUND_WORKERS_LOCK:
         if not _BACKGROUND_WORKERS_STARTED:
             _BACKGROUND_WORKERS_STARTED = True
@@ -3696,4 +4083,5 @@ if __name__ == "__main__":
             # Add other background workers here (e.g., watchdog, monitors)
             start_eod_close_thread()
             start_weekly_flush_scheduler()
+            start_protection_guardian_scheduler()
     app.run(host="0.0.0.0", port=port, debug=False)
