@@ -1723,6 +1723,12 @@ def has_open_position(symbol: str, positions: Optional[Iterable] = None) -> bool
 MIN_VOLUME = 10000
 MIN_VOLATILITY_PCT = 0.15
 MAX_VOLATILITY_PCT = 5.0
+EMA_TOLERANCE_BASE = _float_env("EMA_TOLERANCE_BASE", 0.01)
+EMA_TOLERANCE = EMA_TOLERANCE_BASE
+RSI_MIN_BAND = 35
+RSI_MAX_BAND = 65
+LAST_VIX_VALUE = 0.0
+MARKET_REGIME = "Unknown"
 
 
 def _get_vix_from_yahoo() -> float:
@@ -1786,7 +1792,7 @@ def _ema_trend_confirmed(bars) -> bool:
     return price > ema20 > ema50
 
 
-def _describe_market_and_filters(vix_value: float, thresholds: dict, source: str = "alpaca") -> None:
+def _describe_market_and_filters(vix_value: float, thresholds: dict, source: str = "alpaca") -> str:
     """Emit a human-readable summary of the current market regime and active filters."""
     value = float(vix_value or 0.0)
     if value <= 0:
@@ -1816,6 +1822,7 @@ def _describe_market_and_filters(vix_value: float, thresholds: dict, source: str
         f"Volu≥{int(filters['volume'])}, "
         f"SL={filters['sl']:.2f}%, TP={filters['tp']:.2f}%"
     )
+    return regime
 
 
 def _compute_vix_proxy(symbol: str = "SPY", period: int = 14) -> float:
@@ -1859,6 +1866,19 @@ def _compute_vix_proxy(symbol: str = "SPY", period: int = 14) -> float:
         return 0.0
 
 
+def _compute_ema_metrics(bars: pd.DataFrame) -> Tuple[float, float, float]:
+    """
+    Return latest price, short EMA (20), and long EMA (50) for the provided bars.
+    """
+    if bars is None or bars.empty:
+        return 0.0, 0.0, 0.0
+    closes = bars['close'].astype(float)
+    price = float(closes.iloc[-1])
+    ema_short = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
+    ema_long = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+    return price, ema_short, ema_long
+
+
 def _auto_adjust_filters_by_vix():
     """
     Automatically tune volatility/volume filters based on current VIX level.
@@ -1866,6 +1886,7 @@ def _auto_adjust_filters_by_vix():
     """
     global MIN_VOLATILITY_PCT, MIN_VOLUME, FALLBACK_STOP_LOSS_PCT, FALLBACK_TAKE_PROFIT_PCT
     global _VIX_CACHE, _VIX_CACHE_TTL, _VIX_ALPACA_DISABLED
+    global EMA_TOLERANCE, RSI_MIN_BAND, RSI_MAX_BAND, LAST_VIX_VALUE, MARKET_REGIME
 
     thresholds = {
         "volatility": MIN_VOLATILITY_PCT,
@@ -1940,7 +1961,24 @@ def _auto_adjust_filters_by_vix():
         "tp": FALLBACK_TAKE_PROFIT_PCT,
     })
 
-    _describe_market_and_filters(vix_value, thresholds, source=vix_source)
+    ema_tolerance = EMA_TOLERANCE_BASE
+    if vix_value and vix_value < 22:
+        ema_tolerance *= 1.01
+        print(f"🪶 Relax mode active (VIX={vix_value:.2f}) — EMA tolerance widened ±{ema_tolerance*100:.2f}%")
+
+    if vix_value and vix_value < 15:
+        rsi_min, rsi_max = 38, 65
+    elif vix_value and vix_value > 25:
+        rsi_min, rsi_max = 30, 70
+    else:
+        rsi_min, rsi_max = 35, 65
+
+    regime = _describe_market_and_filters(vix_value, thresholds, source=vix_source)
+
+    EMA_TOLERANCE = ema_tolerance
+    RSI_MIN_BAND, RSI_MAX_BAND = rsi_min, rsi_max
+    LAST_VIX_VALUE = float(vix_value or 0.0)
+    MARKET_REGIME = regime or "Unknown"
 
     try:
         _ensure_protection_for_all_open_positions()
@@ -1969,6 +2007,11 @@ def _best_candidate_from_watchlist(symbols):
     except Exception as e:
         print(f"⚠️ autoscan position fetch failed: {e}")
         current_positions = []
+    print(
+        f"🧩 Active Filters → Vol≥{MIN_VOLATILITY_PCT:.2f}% | Volu≥{int(MIN_VOLUME)} | "
+        f"RSI {RSI_MIN_BAND}-{RSI_MAX_BAND} | EMA tol ±{EMA_TOLERANCE*100:.2f}% | "
+        f"Regime={MARKET_REGIME} (VIX≈{LAST_VIX_VALUE:.2f})"
+    )
     for sym in symbols:
         try:
             s = sym.strip().upper()
@@ -2002,14 +2045,25 @@ def _best_candidate_from_watchlist(symbols):
             if avg_vol < MIN_VOLUME or volatility > MAX_VOLATILITY_PCT or volatility < MIN_VOLATILITY_PCT:
                 print(f"🚫 Skipping {s}: volume={avg_vol:.0f}, volatility={volatility:.2f}% — outside safe limits.")
                 continue
-            if not _ema_trend_confirmed(bars.tail(60)):
-                print(f"🚫 Skipping {s}: EMA trend filter failed.")
+            price, ema_short, ema_long = _compute_ema_metrics(bars.tail(60))
+            diff_ratio = 0.0 if ema_long == 0 else (ema_short - ema_long) / ema_long
+            trend_label = "BULLISH" if ema_short >= ema_long else "BEARISH"
+            print(
+                f"🧭 EMA trend check for {s} → short={ema_short:.2f} long={ema_long:.2f} "
+                f"diff={diff_ratio:.2%} → trend={trend_label}"
+            )
+            ema_ok = (
+                ema_short >= ema_long * (1 - EMA_TOLERANCE)
+                and price >= ema_short * (1 - EMA_TOLERANCE)
+            )
+            if not ema_ok:
+                print(f"🚫 Skipping {s}: EMA trend filter failed (tol ±{EMA_TOLERANCE*100:.2f}%).")
                 continue
             # --- MTF and RSI scoring ---
             mtf_bull = is_multi_timeframe_confirmed(s)
             rsi = get_rsi_value(s, interval='15m')
-            if rsi is None or rsi < 35 or rsi > 65:
-                print(f"🚫 Skipping {s}: RSI {rsi} outside 35-65.")
+            if rsi is None or rsi < RSI_MIN_BAND or rsi > RSI_MAX_BAND:
+                print(f"🚫 Skipping {s}: RSI {rsi} outside {RSI_MIN_BAND}-{RSI_MAX_BAND}.")
                 continue
             score = 0
             if mtf_bull:
