@@ -748,6 +748,8 @@ _VIX_CACHE = {"value": None, "source": "unknown", "timestamp": 0.0}
 _VIX_CACHE_TTL = max(30, _int_env("VIX_CACHE_SECONDS", 180))
 _VIX_ALPACA_DISABLED = False
 _YAHOO_VIX_BACKOFF_UNTIL = 0.0
+_ACCOUNT_CACHE = {"data": None, "timestamp": 0.0}
+_ACCOUNT_CACHE_TTL = max(5, _int_env("ACCOUNT_CACHE_SECONDS", 45))
 
 
 def _get_last_close_attempt_ts(symbol: str) -> float:
@@ -821,9 +823,52 @@ def _pdt_lockout_active(symbol: str) -> bool:
 FORCE_WEBHOOK_TEST = str(os.getenv("FORCE_WEBHOOK_TEST", "0")).strip().lower() in ("1", "true", "yes")
 
 
+def _safe_get_account(timeout: float = 6.0):
+    """
+    Retrieve the Alpaca account with a soft timeout. Falls back to the cached copy
+    if the live request fails or exceeds the timeout budget.
+    """
+    holder: dict = {}
+
+    def _worker():
+        try:
+            holder["account"] = trading_client.get_account()
+        except Exception as exc:
+            holder["error"] = exc
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout)
+
+    if t.is_alive():
+        print(f"⚠️ Account fetch timed out after {timeout:.1f}s. Using cached snapshot if available.")
+    elif "error" in holder:
+        print(f"⚠️ Account fetch failed: {holder['error']}. Using cached snapshot if available.")
+    else:
+        account = holder.get("account")
+        if account is not None:
+            _ACCOUNT_CACHE["data"] = account
+            _ACCOUNT_CACHE["timestamp"] = monotonic()
+            return account
+
+    cached = _ACCOUNT_CACHE.get("data")
+    cache_age = monotonic() - _ACCOUNT_CACHE.get("timestamp", 0.0)
+    if cached and cache_age <= _ACCOUNT_CACHE_TTL:
+        print(f"ℹ️ Using cached account snapshot ({cache_age:.1f}s old).")
+        return cached
+
+    print("❌ No usable account snapshot available.")
+    return None
+
+
 def _update_day_trade_status_from_account(account) -> tuple:
     if not PDT_GUARD_ENABLED:
         return (None, None)
+    if account is None:
+        return (
+            _DAY_TRADE_STATUS_CACHE.get("remaining"),
+            _DAY_TRADE_STATUS_CACHE.get("is_pdt"),
+        )
     try:
         remaining = getattr(account, "day_trades_left", None)
     except Exception:
@@ -851,15 +896,14 @@ def _get_day_trade_status() -> tuple:
             _DAY_TRADE_STATUS_CACHE.get("remaining"),
             _DAY_TRADE_STATUS_CACHE.get("is_pdt"),
         )
-    try:
-        account = trading_client.get_account()
-        return _update_day_trade_status_from_account(account)
-    except Exception as e:
-        print(f"⚠️ Failed to refresh day trade status: {e}")
+    account = _safe_get_account(timeout=6.0)
+    if account is None:
+        print("⚠️ Failed to refresh day trade status (no account snapshot).")
         return (
             _DAY_TRADE_STATUS_CACHE.get("remaining"),
             _DAY_TRADE_STATUS_CACHE.get("is_pdt"),
         )
+    return _update_day_trade_status_from_account(account)
 
 
 def _pdt_global_lockout_remaining() -> int:
@@ -2245,7 +2289,9 @@ PROTECTION_STATE_HEADER = [
 
 def calculate_trade_qty(entry_price, stop_loss_price):
     try:
-        account = trading_client.get_account()  # ✅ Updated
+        account = _safe_get_account(timeout=6.0)
+        if account is None:
+            raise RuntimeError("account unavailable")
         _update_day_trade_status_from_account(account)
         equity = float(account.equity)
         max_risk_amount = equity * (MAX_RISK_PER_TRADE_PERCENT / 100)
@@ -2355,7 +2401,9 @@ def update_max_equity(current_equity):
 
 def should_block_trading_due_to_equity():
     try:
-        account = trading_client.get_account()  # ✅ Updated
+        account = _safe_get_account(timeout=6.0)
+        if account is None:
+            raise RuntimeError("account unavailable")
         _update_day_trade_status_from_account(account)
         equity = max(float(account.equity), 0.0)
         if equity <= 0:
@@ -2592,7 +2640,9 @@ def submit_order_with_retries(
 
     # ⚖️ Use an 'effective' buying power for cash accounts where bp may show 0
     try:
-        acct = trading_client.get_account()
+        acct = _safe_get_account(timeout=6.0)
+        if acct is None:
+            raise RuntimeError("account unavailable")
         rem, pattern_flag = _update_day_trade_status_from_account(acct)
         bp = float(getattr(acct, "buying_power", 0) or 0)
         nmbp = float(getattr(acct, "non_marginable_buying_power", 0) or 0)
