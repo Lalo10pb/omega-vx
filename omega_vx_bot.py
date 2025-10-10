@@ -961,6 +961,20 @@ def _maybe_alert_pdt(reason: str, day_trades_left=None, pattern_flag=None):
     _PDT_LAST_ALERT_MONO = now
 
 
+def _log_pdt_status(context: str = "") -> None:
+    if not PDT_GUARD_ENABLED:
+        return
+    acct = _safe_get_account(timeout=5.0)
+    if acct is None:
+        print(f"⚠️ PDT status [{context}] unavailable (no account snapshot).")
+        return
+    rem, flag = _update_day_trade_status_from_account(acct)
+    print(
+        f"ℹ️ PDT status [{context}]: day_trades_left={rem} "
+        f"pattern_day_trader={flag}"
+    )
+
+
 def _set_pdt_global_lockout(reason: str = "", seconds: int = None, day_trades_left=None, pattern_flag=None):
     if not PDT_GUARD_ENABLED:
         return
@@ -972,6 +986,7 @@ def _set_pdt_global_lockout(reason: str = "", seconds: int = None, day_trades_le
     if until > _PDT_GLOBAL_LOCKOUT_UNTIL:
         _PDT_GLOBAL_LOCKOUT_UNTIL = until
         _maybe_alert_pdt(reason, day_trades_left=day_trades_left, pattern_flag=pattern_flag)
+        _log_pdt_status("lockout-set")
 
 # --- Auto‑Scanner flags ---
 OMEGA_AUTOSCAN = str(os.getenv("OMEGA_AUTOSCAN", "0")).strip().lower() in ("1","true","yes","y","on")
@@ -2799,6 +2814,7 @@ def submit_order_with_retries(
     except Exception as e:
         if _is_pattern_day_trading_error(e):
             _set_pdt_global_lockout(f"BUY denied for {symbol}")
+            _log_pdt_status(f"buy-denied:{symbol}")
         print("🧨 BUY submit failed:", e)
         try:
             send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
