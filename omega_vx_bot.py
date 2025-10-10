@@ -914,7 +914,20 @@ def _pdt_global_lockout_remaining() -> int:
 
 
 def _pdt_global_lockout_active() -> bool:
-    return _pdt_global_lockout_remaining() > 0
+    if not PDT_GUARD_ENABLED:
+        return False
+    global _PDT_GLOBAL_LOCKOUT_UNTIL
+    remaining = _pdt_global_lockout_remaining()
+    if remaining <= 0:
+        return False
+
+    rem, pattern_flag = _get_day_trade_status()
+    if rem is not None and rem > PDT_MIN_DAY_TRADES_BUFFER and not pattern_flag:
+        # Day-trade capacity restored; clear the lockout.
+        global _PDT_GLOBAL_LOCKOUT_UNTIL
+        _PDT_GLOBAL_LOCKOUT_UNTIL = 0.0
+        return False
+    return True
 
 
 def _maybe_alert_pdt(reason: str, day_trades_left=None, pattern_flag=None):
