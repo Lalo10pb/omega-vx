@@ -24,8 +24,10 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     StopOrderRequest,
+    TakeProfitRequest,
+    StopLossRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderStatus
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderStatus, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
@@ -2683,16 +2685,17 @@ def submit_order_with_retries(
     # ---- BUY leg via bracket order ----
     try:
         print(f"🚀 Submitting bracket BUY {symbol} x{qty} (market, GTC)")
-        buy_order = trading_client.submit_order(
+        order_request = MarketOrderRequest(
             symbol=symbol,
             qty=qty,
             side=OrderSide.BUY,
             type=OrderType.MARKET,
             time_in_force=TimeInForce.GTC,
-            order_class="bracket",
-            take_profit={"limit_price": abs_tp},
-            stop_loss={"stop_price": abs_sl},
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=abs_tp),
+            stop_loss=StopLossRequest(stop_price=abs_sl),
         )
+        buy_order = trading_client.submit_order(order_request)
         buy_fill_price = None
         try:
             info = poll_order_fill(buy_order.id, timeout=90, poll_secs=2)
@@ -2703,8 +2706,10 @@ def submit_order_with_retries(
         if _is_pattern_day_trading_error(e):
             _set_pdt_global_lockout(f"BUY denied for {symbol}")
         print("🧨 BUY submit failed:", e)
-        try: send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
-        except Exception: pass
+        try:
+            send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
+        except Exception:
+            pass
         return False
 
     print(f"✅ Bracket BUY placed for {symbol} qty={qty} (TP={abs_tp}, SL={abs_sl})")
