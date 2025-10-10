@@ -9,7 +9,6 @@ import threading
 import requests
 import subprocess
 import sys
-import functools
 from typing import Optional, Set, Tuple, Iterable
 from datetime import datetime, timedelta, time as dt_time
 import numpy as np
@@ -18,6 +17,7 @@ from dotenv import load_dotenv
 import json
 import base64
 from decimal import Decimal, ROUND_HALF_UP
+import logging
 
 from alpaca.trading.requests import (
     MarketOrderRequest,
@@ -41,11 +41,101 @@ from email.message import EmailMessage
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
+# === Logging Configuration ===
+LOG_DIR = os.path.expanduser("~/omega-vx/logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+class _UTCFormatter(logging.Formatter):
+    converter = time.gmtime
+
+
+def _configure_logger() -> logging.Logger:
+    logger = logging.getLogger("omega_vx")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    formatter = _UTCFormatter("%(asctime)sZ [%(levelname)s] [%(threadName)s] %(message)s")
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+
+    file_handler = logging.FileHandler(os.path.join(LOG_DIR, "omega_vx_bot.log"))
+    file_handler.setFormatter(formatter)
+
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+    logger.propagate = False
+    return logger
+
+
+LOGGER = _configure_logger()
+
+
+_EMOJI_LEVEL_MAP = {
+    "⚠️": "warning",
+    "❌": "error",
+    "⛔": "error",
+    "🛑": "warning",
+    "🚫": "warning",
+    "❗": "warning",
+    "ℹ️": "info",
+    "✅": "info",
+    "💥": "warning",
+}
+
+
+def _infer_log_level(message: str) -> str:
+    trimmed = message.lstrip()
+    for prefix, level in _EMOJI_LEVEL_MAP.items():
+        if trimmed.startswith(prefix):
+            return level
+    return "info"
+
+
+def _normalize_tag(tag: Optional[str]) -> str:
+    if tag:
+        return str(tag).upper()
+    name = threading.current_thread().name or "CORE"
+    if name.lower() == "mainthread":
+        name = "MAIN"
+    return name.upper()
+
+
+def _log_context(level: str, tag: Optional[str], message: str) -> None:
+    safe_level = str(level or "info").lower()
+    log_fn = getattr(LOGGER, safe_level, LOGGER.info)
+    prefix = f"[{_normalize_tag(tag)}] "
+    log_fn(f"{prefix}{message}")
+
+
+def print(*args, **kwargs):  # type: ignore[override]
+    sep = kwargs.pop("sep", " ")
+    end = kwargs.pop("end", "")
+    level = kwargs.pop("level", None)
+    tag = kwargs.pop("tag", None)
+    kwargs.pop("flush", None)
+    kwargs.pop("file", None)
+    message = sep.join(str(arg) for arg in args)
+    if end and end != "\n":
+        message += end
+    inferred_level = level or _infer_log_level(message)
+    _log_context(inferred_level, tag, message)
+
+
+def _log_boot(message: str, level: str = "info"):
+    _log_context(level, "BOOT", message)
+
+
+_log_boot("Logger initialized with UTC timestamps and thread names.")
+_log_boot("Omega-VX live build 08a8d10 (risk guard + PDT safeguards active).")
+_log_boot("Application started.")
+
 # === Load .env and Set Environment Vars ===
 from pathlib import Path
 ENV_PATH = Path(__file__).parent / ".env"
 if not load_dotenv(ENV_PATH):
-    print(f"⚠️ Could not load .env at {ENV_PATH} — using environment vars only.", flush=True)
+    _log_boot(f"Could not load .env at {ENV_PATH} — using environment vars only.", level="warning")
 
 
 def _float_env(name: str, default: float) -> float:
@@ -93,10 +183,7 @@ OVERNIGHT_PROTECTION_ENABLED = bool(int(os.getenv("OVERNIGHT_PROTECTION_ENABLED"
 
 # --- Alpaca Data Feed selection (force IEX to avoid SIP permission errors) ---
 _DATA_FEED = DataFeed.IEX
-try:
-    print("📡 Alpaca data feed: iex (forced)")
-except Exception:
-    pass
+_log_boot("Alpaca data feed: iex (forced)")
 
 # --- Early env sanitizer (must be defined before any top-level uses) ---
 def _clean_env(s: str) -> str:
@@ -169,24 +256,7 @@ def _get_gspread_client():
         print(f"❌ Google auth error: {type(e).__name__}: {e}")
         raise
 
-# === Logging Configuration ===
-LOG_DIR = os.path.expanduser("~/omega-vx/logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-
-import logging
-
-logging.basicConfig(
-    level=logging.INFO,  # Set the desired log level
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(os.path.join(LOG_DIR, "omega_vx_bot.log")),  # Log to a file
-        logging.StreamHandler(sys.stdout),  # Log to the console
-    ],
-)
-
-# Replace print statements with logging.info, logging.warning, logging.error, etc.
-logging.info("Application started")
-print("✅ Omega-VX live build 08a8d10 (risk guard + PDT safeguards active)")
+# Legacy logging configuration replaced by centralized logger above.
 DAILY_RISK_LIMIT = -10  # optional daily risk guard, currently unused
 TRADE_COOLDOWN_SECONDS = 300
 PER_SYMBOL_COOLDOWN_SECONDS = _int_env("PER_SYMBOL_COOLDOWN_SECONDS", 600)
@@ -459,7 +529,6 @@ def _fetch_data_with_fallback(request_function, symbol, feed=_DATA_FEED):
             return None
 
 # === Logging ===
-print = functools.partial(print, flush=True)
 CRASH_LOG_FILE = os.path.join(LOG_DIR, "last_boot.txt")
 LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
 LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
@@ -1844,7 +1913,7 @@ def start_autoscan_thread():
                 if should_stop:
                     return
             time.sleep(OMEGA_SCAN_INTERVAL_SEC)
-    t = threading.Thread(target=_loop, daemon=True)
+    t = threading.Thread(target=_loop, daemon=True, name="Autoscan")
     t.start()
 
 def log_equity_curve():
@@ -1891,13 +1960,13 @@ def calculate_position_size(entry_price, stop_loss):
 def webhook():
     try:
         data = request.get_json(silent=True) or {}
-        print(f"📥 Webhook received: {data}", flush=True)
+        print(f"📥 Webhook received: {data}", tag="WEBHOOK")
 
         # 🔐 Validate the secret from HEADER
         header_secret = request.headers.get("X-OMEGA-SECRET")
         env_secret = os.getenv("WEBHOOK_SECRET_TOKEN")  # be explicit
         if header_secret != env_secret:
-            print("🚫 Unauthorized webhook attempt blocked.", flush=True)
+            print("🚫 Unauthorized webhook attempt blocked.", tag="WEBHOOK")
             try:
                 send_telegram_alert("🚫 Unauthorized webhook attempt blocked.")
             except Exception:
@@ -1941,7 +2010,7 @@ def webhook():
                 f"🧪 Webhook DRY-RUN for {symbol} "
                 f"(entry {entry}, sl {stop_loss}, tp {take_profit}, trailing {use_trailing})"
             )
-            print(msg, flush=True)
+            print(msg, tag="WEBHOOK")
             try:
                 send_telegram_alert(msg)
             except Exception:
@@ -1952,7 +2021,7 @@ def webhook():
                 "reason": "dry_run"
             }), 200
         # --- end dry-run guard ---
-        print(f"🔄 Calling submit_order_with_retries for {symbol}", flush=True)
+        print(f"🔄 Calling submit_order_with_retries for {symbol}", tag="WEBHOOK")
 
         try:
             success = submit_order_with_retries(
@@ -1966,7 +2035,7 @@ def webhook():
             
         except Exception as trade_error:
             msg = f"💥 submit_order_with_retries error: {trade_error}"
-            print(msg, flush=True)
+            print(msg, tag="WEBHOOK", level="error")
             try:
                 send_telegram_alert(msg)
             except Exception:
@@ -1974,7 +2043,7 @@ def webhook():
             return jsonify({"status": "failed", "reason": "exception", "detail": str(trade_error)}), 200
 
         placed = bool(success)
-        print(f"✅ Webhook processed (trade_placed={placed})", flush=True)
+        print(f"✅ Webhook processed (trade_placed={placed})", tag="WEBHOOK")
         resp = {
             "status": "ok",                      # webhook processed fine
             "trade_placed": placed               # whether an order actually went in
@@ -1985,7 +2054,7 @@ def webhook():
         return jsonify(resp), 200
 
     except Exception as e:
-        print(f"❌ Exception in webhook: {e}", flush=True)
+        print(f"❌ Exception in webhook: {e}", tag="WEBHOOK", level="error")
         return jsonify({"status": "failed", "reason": "handler_exception", "detail": str(e)}), 200
 
 @app.route("/ping", methods=["GET"])
@@ -2903,7 +2972,7 @@ def start_open_positions_pusher():
                 if should_stop:
                     return
             time.sleep(OPEN_POSITIONS_INTERVAL)
-    threading.Thread(target=_loop, daemon=True).start()
+    threading.Thread(target=_loop, daemon=True, name="OpenPositions").start()
 
 
 def start_eod_close_thread():
@@ -2940,7 +3009,7 @@ def start_eod_close_thread():
                     if should_stop:
                         return
             time.sleep(60)
-    threading.Thread(target=_loop, daemon=True).start()
+    threading.Thread(target=_loop, daemon=True, name="EODFlush").start()
 
 
 def start_eod_summary_scheduler():
@@ -2988,7 +3057,7 @@ def start_eod_summary_scheduler():
                 if should_stop:
                     return
                 time.sleep(60)
-    threading.Thread(target=_loop, daemon=True).start()
+    threading.Thread(target=_loop, daemon=True, name="EODSummary").start()
 
 
 def start_order_janitor():
@@ -3028,7 +3097,7 @@ def start_order_janitor():
                 if should_stop:
                     return
             time.sleep(ORDER_JANITOR_INTERVAL)
-    threading.Thread(target=_loop, daemon=True).start()
+    threading.Thread(target=_loop, daemon=True, name="OrderJanitor").start()
 
 def _weekly_flush_last_run_date():
     try:
@@ -3203,7 +3272,7 @@ def start_weekly_flush_scheduler():
                     return
                 time.sleep(60)
 
-    threading.Thread(target=_loop, daemon=True).start()
+    threading.Thread(target=_loop, daemon=True, name="WeeklyFlush").start()
 
 
 def _check_overnight_protection():
@@ -3321,7 +3390,7 @@ def start_auto_sell_monitor():
                 _check_overnight_protection()
             time.sleep(WATCHDOG_LOOP_SECONDS)
 
-    t = threading.Thread(target=monitor, daemon=True)
+    t = threading.Thread(target=monitor, daemon=True, name="Watchdog")
     t.start()
 
 def is_cooldown_active():
