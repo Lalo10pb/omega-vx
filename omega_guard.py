@@ -1,38 +1,118 @@
+from __future__ import annotations
+
+import logging
 import os
-import time
+import shlex
 import subprocess
+import sys
+import time
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Iterable, List
+
 import psutil
-from datetime import datetime
 
-BOT_FILENAME = "omega_vx_bot.py"
-LOG_FILE = "omega_guard.log"
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_BOT_PATH = (REPO_ROOT / "omega_vx_bot.py").resolve()
 
-def log(msg):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    full_msg = f"[{timestamp}] {msg}"
-    print(full_msg)
-    with open(LOG_FILE, "a") as f:
-        f.write(full_msg + "\n")
+BOT_PATH = Path(os.getenv("OMEGA_GUARD_TARGET", DEFAULT_BOT_PATH)).resolve()
+LOG_PATH = Path(os.getenv("OMEGA_GUARD_LOG", REPO_ROOT / "omega_guard.log")).resolve()
+CHECK_INTERVAL = max(10, int(os.getenv("OMEGA_GUARD_CHECK_SECONDS", "60")))
+BACKOFF_BASE = max(15, int(os.getenv("OMEGA_GUARD_BACKOFF_SECONDS", "45")))
+BACKOFF_MAX = max(BACKOFF_BASE, int(os.getenv("OMEGA_GUARD_BACKOFF_MAX_SECONDS", "600")))
+CMD_OVERRIDE = os.getenv("OMEGA_GUARD_COMMAND")
 
-def is_bot_running():
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+
+def _ensure_log_dir() -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _configure_logger() -> logging.Logger:
+    _ensure_log_dir()
+    logger = logging.getLogger("omega_guard")
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(logging.INFO)
+    handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(formatter)
+    logger.addHandler(stream)
+    return logger
+
+
+LOGGER = _configure_logger()
+
+
+def _guarded_command() -> List[str]:
+    if CMD_OVERRIDE:
+        return shlex.split(CMD_OVERRIDE)
+    return [sys.executable, str(BOT_PATH)]
+
+
+def _iter_guarded_processes() -> Iterable[psutil.Process]:
+    for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
-            cmdline = proc.info['cmdline']
-            if cmdline and BOT_FILENAME in ' '.join(cmdline):
-                return True
+            cmdline = proc.info["cmdline"] or []
+            if any(str(BOT_PATH) in part for part in cmdline):
+                yield proc
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-    return False
 
-def start_bot():
-    log("🔁 omega_vx_bot.py not running — attempting to restart...")
-    subprocess.Popen(["python3", BOT_FILENAME])
-    log("✅ omega_vx_bot.py restarted.")
 
-# Main loop
-while True:
-    if not is_bot_running():
-        start_bot()
-    else:
-        log("✅ omega_vx_bot.py is running.")
-    time.sleep(60)  # check every 60 seconds
+def is_bot_running() -> bool:
+    return any(True for _ in _iter_guarded_processes())
+
+
+def start_bot() -> bool:
+    try:
+        cmd = _guarded_command()
+        LOGGER.warning("🔁 omega_vx_bot.py not running — attempting restart via %s", cmd)
+        subprocess.Popen(cmd, cwd=str(REPO_ROOT))
+        LOGGER.info("✅ omega_vx_bot.py restart command issued.")
+        return True
+    except Exception as exc:
+        LOGGER.exception("❌ Failed to launch omega_vx_bot.py: %s", exc)
+        return False
+
+
+def main() -> None:
+    consecutive_failures = 0
+    LOGGER.info("🛡️ Omega Guard monitoring %s (interval=%ss)", BOT_PATH, CHECK_INTERVAL)
+
+    while True:
+        try:
+            if is_bot_running():
+                if consecutive_failures:
+                    LOGGER.info("✅ omega_vx_bot.py recovered.")
+                else:
+                    LOGGER.info("✅ omega_vx_bot.py is running.")
+                consecutive_failures = 0
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            delay = min(BACKOFF_BASE * (2 ** consecutive_failures), BACKOFF_MAX)
+            if consecutive_failures:
+                LOGGER.warning("⚠️ Restart attempt #%s in %ss (backoff active).", consecutive_failures + 1, delay)
+            else:
+                LOGGER.warning("⚠️ omega_vx_bot.py offline; restart in %ss.", delay)
+            time.sleep(delay)
+
+            if start_bot():
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+        except KeyboardInterrupt:
+            LOGGER.info("🛑 Omega Guard interrupted by user; exiting.")
+            break
+        except Exception as exc:
+            LOGGER.exception("❌ Guard loop error: %s", exc)
+            time.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,5 +1,6 @@
-from omega_vx_bot import send_email
 from trade_performance import analyze_trade_performance
+
+from omega_vx.notifications import send_email
 
 # Generate report and read summary
 analyze_trade_performance()

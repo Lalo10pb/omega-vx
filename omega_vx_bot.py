@@ -10,12 +10,9 @@ import requests
 import subprocess
 import sys
 from typing import Optional, Set, Tuple, Iterable
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, time as dt_time, timezone
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
-import json
-import base64
 from decimal import Decimal, ROUND_HALF_UP
 import logging
 
@@ -28,105 +25,29 @@ from alpaca.trading.requests import (
     StopLossRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderStatus, OrderClass
-from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.mappings import BAR_MAPPING
-from alpaca.trading.client import TradingClient
 from alpaca.data.enums import DataFeed
-from datetime import datetime, timedelta, time as dt_time, timezone
-# === Email Reporting ===
-import smtplib
-from email.message import EmailMessage
 
-# === Google Sheets ===
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+# === Omega Core Helpers ===
+from omega_vx import config as omega_config
+from omega_vx.clients import (
+    get_data_client,
+    get_gspread_client,
+    get_raw_data_client,
+    get_trading_client,
+)
+from omega_vx.logging_utils import configure_logger, install_print_bridge
+from omega_vx.notifications import send_email, send_telegram_alert
 
-# === Logging Configuration ===
-LOG_DIR = os.path.expanduser("~/omega-vx/logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-
-
-class _UTCFormatter(logging.Formatter):
-    converter = time.gmtime
-
-
-def _configure_logger() -> logging.Logger:
-    logger = logging.getLogger("omega_vx")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    formatter = _UTCFormatter("%(asctime)sZ [%(levelname)s] [%(threadName)s] %(message)s")
-
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-
-    file_handler = logging.FileHandler(os.path.join(LOG_DIR, "omega_vx_bot.log"))
-    file_handler.setFormatter(formatter)
-
-    logger.addHandler(stream_handler)
-    logger.addHandler(file_handler)
-    logger.propagate = False
-    return logger
-
-
-LOGGER = _configure_logger()
-
-
-_EMOJI_LEVEL_MAP = {
-    "⚠️": "warning",
-    "❌": "error",
-    "⛔": "error",
-    "🛑": "warning",
-    "🚫": "warning",
-    "❗": "warning",
-    "ℹ️": "info",
-    "✅": "info",
-    "💥": "warning",
-}
-
-
-def _infer_log_level(message: str) -> str:
-    trimmed = message.lstrip()
-    for prefix, level in _EMOJI_LEVEL_MAP.items():
-        if trimmed.startswith(prefix):
-            return level
-    return "info"
-
-
-def _normalize_tag(tag: Optional[str]) -> str:
-    if tag:
-        return str(tag).upper()
-    name = threading.current_thread().name or "CORE"
-    if name.lower() == "mainthread":
-        name = "MAIN"
-    return name.upper()
-
-
-def _log_context(level: str, tag: Optional[str], message: str) -> None:
-    safe_level = str(level or "info").lower()
-    log_fn = getattr(LOGGER, safe_level, LOGGER.info)
-    prefix = f"[{_normalize_tag(tag)}] "
-    log_fn(f"{prefix}{message}")
-
-
-def print(*args, **kwargs):  # type: ignore[override]
-    sep = kwargs.pop("sep", " ")
-    end = kwargs.pop("end", "")
-    level = kwargs.pop("level", None)
-    tag = kwargs.pop("tag", None)
-    kwargs.pop("flush", None)
-    kwargs.pop("file", None)
-    message = sep.join(str(arg) for arg in args)
-    if end and end != "\n":
-        message += end
-    inferred_level = level or _infer_log_level(message)
-    _log_context(inferred_level, tag, message)
+LOG_DIR = str(omega_config.LOG_DIR)
+LOGGER = configure_logger()
+_restore_print = install_print_bridge(LOGGER)
 
 
 def _log_boot(message: str, level: str = "info"):
-    _log_context(level, "BOOT", message)
+    LOGGER.log(getattr(logging, level.upper(), logging.INFO), f"[BOOT] {message}")
 
 
 _log_boot("Logger initialized with UTC timestamps and thread names.")
@@ -135,29 +56,20 @@ _log_boot("Application started.")
 
 # === Load .env and Set Environment Vars ===
 from pathlib import Path
+
 ENV_PATH = Path(__file__).parent / ".env"
-if not load_dotenv(ENV_PATH):
+if not omega_config.load_environment(ENV_PATH):
     _log_boot(f"Could not load .env at {ENV_PATH} — using environment vars only.", level="warning")
 
 
 def _float_env(name: str, default: float) -> float:
     """Parse environment variable as float with a safe default."""
-    raw = os.getenv(name, None)
-    try:
-        val = float(str(raw).strip())
-    except (TypeError, ValueError):
-        return float(default)
-    return val
+    return omega_config.get_float(name, default)
 
 
 def _int_env(name: str, default: int) -> int:
     """Parse environment variable as int with a safe default."""
-    raw = os.getenv(name, None)
-    try:
-        val = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return int(default)
-    return val
+    return omega_config.get_int(name, default)
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -165,21 +77,9 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 
 def _bool_env(name: str, default: str = "0") -> bool:
-    raw = os.getenv(name, str(default))
-    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+    return omega_config.get_bool(name, default)
 
 
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("APCA_API_BASE_URL")
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_CREDENTIALS_FILE = "google_credentials.json"
-SCOPE = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-
-PAPER_MODE = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1", "true", "yes")
 OVERNIGHT_PROTECTION_ENABLED = bool(int(os.getenv("OVERNIGHT_PROTECTION_ENABLED", "1")))
 
 
@@ -190,73 +90,7 @@ _log_boot("Alpaca data feed: iex (forced)")
 # --- Early env sanitizer (must be defined before any top-level uses) ---
 def _clean_env(s: str) -> str:
     """Trim whitespace and surrounding quotes from environment variables."""
-    return str(s or "").strip().strip('"').strip("'")
-
-# --- Google Sheets Helper for Flexible Auth ---
-def _get_gspread_client():
-    """
-    Return an authorized gspread client using one of:
-      1) Secret File on disk (supports Render Secret Files and custom GOOGLE_CREDS_PATH)
-      2) Env var GOOGLE_SERVICE_ACCOUNT_JSON (raw JSON)
-      3) Env var GOOGLE_SERVICE_ACCOUNT_JSON_B64 (base64-encoded JSON)
-    """
-    try:
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ]
-
-        # 1) Preferred: a credentials file on disk
-        search_paths = []
-        # custom path override
-        env_path = os.getenv("GOOGLE_CREDS_PATH")
-        if env_path:
-            search_paths.append(env_path)
-        # Render Secret Files default mount
-        search_paths.append("/etc/secrets/google_credentials.json")
-        # repo-local fallback (if the file is committed or copied at build)
-        search_paths.append("google_credentials.json")
-
-        for path in search_paths:
-            if os.path.exists(path):
-                # Print minimal debug to help diagnose 404/403 issues
-                try:
-                    with open(path, "r") as f:
-                        _creds_preview = json.load(f)
-                    print(
-                        f"🔐 Using Google creds file at {path}; service_account={_creds_preview.get('client_email','?')}"
-                    )
-                except Exception:
-                    pass
-                creds = ServiceAccountCredentials.from_json_keyfile_name(path, scope)
-                return gspread.authorize(creds)
-
-        # 2) Raw JSON in env
-        raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-        if raw and raw.strip().startswith("{"):
-            info = json.loads(raw)
-            print(f"🔐 Using GOOGLE_SERVICE_ACCOUNT_JSON; service_account={info.get('client_email','?')}")
-            creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
-            return gspread.authorize(creds)
-
-        # 3) Base64 JSON in env
-        b64 = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
-        if b64:
-            try:
-                decoded = base64.b64decode(b64).decode("utf-8")
-                info = json.loads(decoded)
-                print(f"🔐 Using GOOGLE_SERVICE_ACCOUNT_JSON_B64; service_account={info.get('client_email','?')}")
-                creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
-                return gspread.authorize(creds)
-            except Exception as e:
-                print(f"⚠️ Failed to decode GOOGLE_SERVICE_ACCOUNT_JSON_B64: {e}")
-
-        raise FileNotFoundError(
-            "No Google credentials found (checked GOOGLE_CREDS_PATH, /etc/secrets/google_credentials.json, google_credentials.json, GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SERVICE_ACCOUNT_JSON_B64)."
-        )
-    except Exception as e:
-        print(f"❌ Google auth error: {type(e).__name__}: {e}")
-        raise
+    return omega_config.clean(s)
 
 # Legacy logging configuration replaced by centralized logger above.
 DAILY_RISK_LIMIT = -10  # optional daily risk guard, currently unused
@@ -537,12 +371,9 @@ LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
 LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
 
 # === Alpaca Clients ===
-trading_client = TradingClient(API_KEY, API_SECRET, paper=PAPER_MODE)
-data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
-try:
-    _RAW_DATA_CLIENT = StockHistoricalDataClient(API_KEY, API_SECRET, raw_data=True)
-except Exception:
-    _RAW_DATA_CLIENT = None
+trading_client = get_trading_client()
+data_client = get_data_client()
+_RAW_DATA_CLIENT = get_raw_data_client()
 
 
 def print_protection_status():
@@ -1419,29 +1250,13 @@ def generate_trade_explanation(symbol, entry, stop_loss, take_profit, rsi=None, 
 
     return explanation
 
-def send_telegram_alert(message: str):
-    import requests  # keep local to guarantee availability
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Telegram not configured (missing token/chat id).")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"⚠️ Telegram send failed: {r.status_code} {r.text}")
-    except Exception as e:
-        print(f"❌ Telegram alert error: {e}")
-
 def get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist"):
     """
     Return a list of symbols from the first column of the watchlist tab.
     Prefers GOOGLE_SHEET_ID. Tab name can be overridden via WATCHLIST_SHEET_NAME.
     """
     try:
-        client = _get_gspread_client()
+        client = get_gspread_client()
 
         ss = None
         sheet_id = _clean_env(os.getenv("GOOGLE_SHEET_ID"))
@@ -1723,10 +1538,14 @@ def has_open_position(symbol: str, positions: Optional[Iterable] = None) -> bool
 MIN_VOLUME = 10000
 MIN_VOLATILITY_PCT = 0.15
 MAX_VOLATILITY_PCT = 5.0
-EMA_TOLERANCE_BASE = _float_env("EMA_TOLERANCE_BASE", 0.01)
+EMA_TOLERANCE_BASE = _float_env("EMA_TOLERANCE_BASE", 0.0035)
+EMA_TOLERANCE_RELAX_CAP = _float_env("EMA_TOLERANCE_RELAX_CAP", 0.0060)
 EMA_TOLERANCE = EMA_TOLERANCE_BASE
-RSI_MIN_BAND = 35
-RSI_MAX_BAND = 65
+RSI_BASE_MIN = _float_env("RSI_BASE_MIN", 40.0)
+RSI_BASE_MAX = _float_env("RSI_BASE_MAX", 70.0)
+RSI_ADAPTIVE = _bool_env("RSI_ADAPTIVE", "1")
+RSI_MIN_BAND = RSI_BASE_MIN
+RSI_MAX_BAND = RSI_BASE_MAX
 LAST_VIX_VALUE = 0.0
 MARKET_REGIME = "Unknown"
 
@@ -1792,7 +1611,14 @@ def _ema_trend_confirmed(bars) -> bool:
     return price > ema20 > ema50
 
 
-def _describe_market_and_filters(vix_value: float, thresholds: dict, source: str = "alpaca") -> str:
+def _describe_market_and_filters(
+    vix_value: float,
+    thresholds: dict,
+    *,
+    source: str = "alpaca",
+    ema_tolerance: Optional[float] = None,
+    rsi_bounds: Optional[Tuple[float, float]] = None,
+) -> str:
     """Emit a human-readable summary of the current market regime and active filters."""
     value = float(vix_value or 0.0)
     if value <= 0:
@@ -1815,13 +1641,22 @@ def _describe_market_and_filters(vix_value: float, thresholds: dict, source: str
         "tp": thresholds.get("tp", FALLBACK_TAKE_PROFIT_PCT),
     }
     source_label = (source or "unknown").lower()
-    print(
-        "🌍 Market regime: "
-        f"{regime} (VIX≈{display}, source={source_label}) | "
-        f"Filters → Vol≥{filters['volatility']:.2f}%, "
-        f"Volu≥{int(filters['volume'])}, "
-        f"SL={filters['sl']:.2f}%, TP={filters['tp']:.2f}%"
-    )
+
+    try:
+        rsi_min, rsi_max = rsi_bounds if rsi_bounds else (RSI_MIN_BAND, RSI_MAX_BAND)
+        ema_tol = float(ema_tolerance if ema_tolerance is not None else EMA_TOLERANCE)
+        print(
+            "🌍 Market regime: "
+            f"{regime} (VIX≈{display}, source={source_label}) | "
+            f"Filters → RSI={rsi_min:.1f}-{rsi_max:.1f}, "
+            f"EMA±{ema_tol*100:.2f}%, "
+            f"Vol≥{filters['volatility']:.2f}%, "
+            f"Volu≥{int(filters['volume'])}, "
+            f"SL={filters['sl']:.2f}%, TP={filters['tp']:.2f}%",
+            flush=True,
+        )
+    except Exception as desc_err:
+        print(f"⚠️ Failed to describe market filters: {desc_err}", flush=True)
     return regime
 
 
@@ -1864,6 +1699,25 @@ def _compute_vix_proxy(symbol: str = "SPY", period: int = 14) -> float:
     except Exception as e:
         print(f"⚠️ VIX proxy compute failed: {e}")
         return 0.0
+
+
+def _auto_adjust_rsi_by_vix(vix_value: float) -> Tuple[float, float]:
+    """
+    Adjust RSI bounds based on current VIX level.
+    Higher VIX widens the acceptable range; lower VIX tightens it.
+    """
+    base_min = float(RSI_BASE_MIN)
+    base_max = float(RSI_BASE_MAX)
+
+    if not RSI_ADAPTIVE:
+        return base_min, base_max
+
+    vix_value = float(vix_value or 0.0)
+    vix_norm = min(max((vix_value - 12.0) / (35.0 - 12.0), 0.0), 1.0)
+    low = base_min - (5.0 * vix_norm)
+    high = base_max + (5.0 * vix_norm)
+
+    return max(30.0, low), min(80.0, high)
 
 
 def _compute_ema_metrics(bars: pd.DataFrame) -> Tuple[float, float, float]:
@@ -1963,17 +1817,22 @@ def _auto_adjust_filters_by_vix():
 
     ema_tolerance = EMA_TOLERANCE_BASE
     if vix_value and vix_value < 22:
-        ema_tolerance *= 1.01
+        ema_tolerance = min(EMA_TOLERANCE_RELAX_CAP, EMA_TOLERANCE_BASE * 1.05)
         print(f"🪶 Relax mode active (VIX={vix_value:.2f}) — EMA tolerance widened ±{ema_tolerance*100:.2f}%")
 
-    if vix_value and vix_value < 15:
-        rsi_min, rsi_max = 38, 65
-    elif vix_value and vix_value > 25:
-        rsi_min, rsi_max = 30, 70
-    else:
-        rsi_min, rsi_max = 35, 65
+    rsi_min, rsi_max = _auto_adjust_rsi_by_vix(vix_value or 0.0)
+    print(
+        f"🧠 Adaptive RSI bounds → {rsi_min:.1f}-{rsi_max:.1f} (VIX≈{(vix_value or 0.0):.2f})",
+        flush=True,
+    )
 
-    regime = _describe_market_and_filters(vix_value, thresholds, source=vix_source)
+    regime = _describe_market_and_filters(
+        vix_value,
+        thresholds,
+        source=vix_source,
+        ema_tolerance=ema_tolerance,
+        rsi_bounds=(rsi_min, rsi_max),
+    )
 
     EMA_TOLERANCE = ema_tolerance
     RSI_MIN_BAND, RSI_MAX_BAND = rsi_min, rsi_max
@@ -2548,26 +2407,6 @@ def should_block_trading_due_to_equity():
         send_telegram_alert(f"⚠️ Equity check error: {e}")
         return False
 
-def send_email(subject, body):
-    EMAIL_ADDRESS = os.getenv("EMAIL_USER")
-    EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-
-    msg = EmailMessage()
-    msg['Subject'] = subject
-    msg['From'] = EMAIL_ADDRESS
-    msg['To'] = EMAIL_ADDRESS
-    msg.set_content(body)
-
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-            smtp.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            smtp.send_message(msg)
-        print(f"📧 Email sent: {subject}")
-    except Exception as e:
-        print(f"❌ Email send failed: {e}")  
-        send_telegram_alert(f"❌ Email failure: {e}")
-
-
 def get_equity_slope():
     try:
         path = EQUITY_CURVE_LOG_PATH
@@ -2950,7 +2789,7 @@ def log_portfolio_snapshot():
 
         # ✅ Also log to Google Sheet
         try:
-            client = _get_gspread_client()
+            client = get_gspread_client()
 
             sheet_id = _clean_env(os.getenv("GOOGLE_SHEET_ID"))
             sheet_name = _clean_env(os.getenv("PORTFOLIO_SHEET_NAME") or "Portfolio Log")  # Default fallback
@@ -3126,7 +2965,7 @@ def summarize_realized_pnl_for_day(day: _date = None, path: str = TRADE_LOG_PATH
 def append_daily_performance_row(metrics: dict, sheet_id: str = None, tab_name: str = None) -> None:
     """Append a dated row to a Google Sheet tab (default: 'Performance Daily')."""
     try:
-        client = _get_gspread_client()
+        client = get_gspread_client()
         sid = _clean_env(sheet_id or os.getenv("GOOGLE_SHEET_ID"))
         tab = _clean_env(tab_name or PERF_DAILY_TAB or "Performance Daily")
         if not sid:
@@ -3168,7 +3007,7 @@ def append_daily_performance_row(metrics: dict, sheet_id: str = None, tab_name: 
 def update_google_performance_sheet(metrics: dict, sheet_id: str = None, tab_name: str = None) -> None:
     """Write key P&L metrics to a dedicated Google Sheet tab (default: 'Performance')."""
     try:
-        client = _get_gspread_client()
+        client = get_gspread_client()
         sid = _clean_env(sheet_id or os.getenv("GOOGLE_SHEET_ID"))
         tab = _clean_env(tab_name or os.getenv("PERF_SHEET_NAME") or "Performance")
         if not sid:
@@ -3471,7 +3310,7 @@ def get_symbol_tp_sl_open_orders(symbol: str):
 def push_open_positions_to_sheet():
     """Write current open positions to Google Sheet tab (clears & replaces)."""
     try:
-        client = _get_gspread_client()
+        client = get_gspread_client()
         sid = _clean_env(os.getenv('GOOGLE_SHEET_ID'))
         tab = OPEN_POSITIONS_TAB
         if not sid:
@@ -4085,7 +3924,7 @@ def log_trade(
 
     # ✅ Google Sheet Logging
     try:
-        client = _get_gspread_client()
+        client = get_gspread_client()
 
         sheet_id = _clean_env(os.getenv("GOOGLE_SHEET_ID"))
         sheet_name = _clean_env(os.getenv("TRADE_SHEET_NAME") or "Trade Log")

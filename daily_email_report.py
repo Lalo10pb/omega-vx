@@ -1,24 +1,25 @@
 # daily_email_report.py
-from omega_vx_bot import send_email
-import pandas as pd
 import os
 from datetime import datetime
-from alpaca.trading.client import TradingClient
+
+import pandas as pd
+
+from omega_vx import config as omega_config
+from omega_vx.clients import get_trading_client
+from omega_vx.notifications import send_email
 
 CSV_FILE = os.path.expanduser("~/omega-vx/logs/portfolio_log.csv")
 
 def get_live_account_snapshot():
-    paper = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1","true","yes")
-    c = TradingClient(os.getenv("APCA_API_KEY_ID"),
-                      os.getenv("APCA_API_SECRET_KEY"),
-                      paper=paper)
+    c = get_trading_client()
+    paper_mode = omega_config.get_bool("ALPACA_PAPER", "1")
     a = c.get_account()
     return {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "equity": float(a.equity),
         "cash": float(a.cash),
         "portfolio_value": float(a.portfolio_value),
-        "mode": "PAPER" if paper else "LIVE",
+        "mode": "PAPER" if paper_mode else "LIVE",
     }
 
 def generate_daily_report():

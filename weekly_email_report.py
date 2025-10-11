@@ -1,6 +1,7 @@
-from omega_vx_bot import send_email
 import csv
 from datetime import datetime, timedelta
+
+from omega_vx.notifications import send_email
 
 def analyze_weekly_trades():
     filename = "trade_log.csv"

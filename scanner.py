@@ -98,4 +98,4 @@ def get_watchlist_from_google_sheet() -> list[str]:
         print(f"❌ Failed to fetch watchlist: {e}")
         return []
 
-_debug_log_service_account
+_debug_log_service_account()
