@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from decimal import Decimal, ROUND_HALF_UP
 import logging
+import pytz
 
 from alpaca.trading.requests import (
     MarketOrderRequest,
@@ -1548,6 +1549,7 @@ RSI_MIN_BAND = RSI_BASE_MIN
 RSI_MAX_BAND = RSI_BASE_MAX
 LAST_VIX_VALUE = 0.0
 MARKET_REGIME = "Unknown"
+SLEEP_OFFHOURS_SECONDS = max(60, _int_env("SLEEP_OFFHOURS_MINUTES", 900))
 
 
 def _get_vix_from_yahoo() -> float:
@@ -1718,6 +1720,22 @@ def _auto_adjust_rsi_by_vix(vix_value: float) -> Tuple[float, float]:
     high = base_max + (5.0 * vix_norm)
 
     return max(30.0, low), min(80.0, high)
+
+
+def _is_market_open_now() -> bool:
+    """
+    Return True when US equities regular session (NYSE/NASDAQ) is open.
+    Simple guard to avoid weekend/after-hours autoscan noise.
+    """
+    tz = pytz.timezone("America/New_York")
+    now = datetime.now(tz)
+    if now.weekday() >= 5:
+        return False
+
+    market_open = dt_time(hour=9, minute=30)
+    market_close = dt_time(hour=16, minute=0)
+    current = now.time()
+    return market_open <= current < market_close
 
 
 def _compute_ema_metrics(bars: pd.DataFrame) -> Tuple[float, float, float]:
@@ -2032,6 +2050,14 @@ def start_autoscan_thread():
         print(f"🤖 Autoscan running every {OMEGA_SCAN_INTERVAL_SEC}s "
               f"(dynamic max open positions, dryrun={OMEGA_AUTOSCAN_DRYRUN})")
         while True:
+            if not _is_market_open_now():
+                sleep_minutes = max(1, SLEEP_OFFHOURS_SECONDS // 60)
+                print(
+                    f"🌙 Market closed — sleeping {sleep_minutes} minute(s) before next scan.",
+                    tag="AUTOSCAN"
+                )
+                time.sleep(SLEEP_OFFHOURS_SECONDS)
+                continue
             try:
                 autoscan_once()
             except Exception as e:
