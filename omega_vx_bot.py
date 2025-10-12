@@ -567,6 +567,13 @@ app = Flask(__name__)
 def home():
     return "Omega-VX running", 200
 
+
+@app.route("/robots.txt", methods=["GET"])
+def robots_txt():
+    """Serve a basic robots.txt so external crawlers stop logging 404s."""
+    body = "User-agent: *\nDisallow:\n"
+    return body, 200, {"Content-Type": "text/plain; charset=utf-8"}
+
 # === Watchdog cooldown ===
 from time import monotonic
 _last_close_attempt = {}
