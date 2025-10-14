@@ -2008,7 +2008,7 @@ def _best_candidate_from_watchlist(symbols):
             s = sym.strip().upper()
             if not s:
                 continue
-            metrics_payload = {"symbol": s}
+            metrics_payload: dict = {}
             # --- Skip if already traded today (only when no open position) ---
             with _symbol_last_trade_lock:
                 record = _symbol_last_trade.get(s)
