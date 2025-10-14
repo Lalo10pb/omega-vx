@@ -115,6 +115,24 @@ PDT_GLOBAL_LOCK_SECONDS = max(0, _int_env("PDT_GLOBAL_LOCK_SECONDS", 900))
 PDT_SYMBOL_LOCK_SECONDS = max(0, _int_env("PDT_SYMBOL_LOCK_SECONDS", 600))
 PDT_ALERT_COOLDOWN_SECONDS = max(0, _int_env("PDT_ALERT_COOLDOWN_SECONDS", 300))
 PDT_STATUS_CACHE_SECONDS = max(5, _int_env("PDT_STATUS_CACHE_SECONDS", 60))
+CANDIDATE_LOG_PATH = _clean_env(os.getenv("CANDIDATE_LOG_PATH", ""))
+CANDIDATE_LOG_ENABLED = bool(CANDIDATE_LOG_PATH)
+CANDIDATE_LOG_FIELDS = [
+    "timestamp",
+    "symbol",
+    "stage",
+    "reason",
+    "price",
+    "ema_short",
+    "ema_long",
+    "ema_diff_pct",
+    "avg_volume",
+    "volatility_pct",
+    "mtf_confirmed",
+    "rsi",
+    "score",
+]
+_CANDIDATE_LOG_LOCK = threading.Lock()
 MIN_TRADE_QTY = 1
 
 _DAILY_TRADE_COUNT = 0
@@ -155,6 +173,32 @@ def _set_peak_unrealized(symbol: str, value: Optional[float]) -> None:
             _symbol_peak_unrealized.pop(symbol, None)
         else:
             _symbol_peak_unrealized[symbol] = value
+
+
+def _log_candidate_event(symbol: str, stage: str, reason: str = "", **metrics) -> None:
+    """Append candidate evaluation details to the configured CSV log."""
+    if not CANDIDATE_LOG_ENABLED:
+        return
+    try:
+        path = Path(CANDIDATE_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {field: "" for field in CANDIDATE_LOG_FIELDS}
+        row["timestamp"] = datetime.now(timezone.utc).isoformat()
+        row["symbol"] = symbol
+        row["stage"] = stage
+        row["reason"] = reason
+        for key, value in metrics.items():
+            if key in row and value is not None:
+                row[key] = value
+        with _CANDIDATE_LOG_LOCK:
+            need_header = not path.exists()
+            with path.open("a", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=CANDIDATE_LOG_FIELDS)
+                if need_header:
+                    writer.writeheader()
+                writer.writerow(row)
+    except Exception as log_err:
+        print(f"⚠️ Candidate log write failed for {symbol}: {log_err}")
 
 def _check_daily_trade_cap():
     global _DAILY_TRADE_COUNT, _DAILY_TRADE_DATE
@@ -1609,11 +1653,11 @@ def has_open_position(symbol: str, positions: Optional[Iterable] = None) -> bool
 MIN_VOLUME = 10000
 MIN_VOLATILITY_PCT = 0.15
 MAX_VOLATILITY_PCT = 5.0
-EMA_TOLERANCE_BASE = _float_env("EMA_TOLERANCE_BASE", 0.0035)
-EMA_TOLERANCE_RELAX_CAP = _float_env("EMA_TOLERANCE_RELAX_CAP", 0.0060)
+EMA_TOLERANCE_BASE = _float_env("EMA_TOLERANCE_BASE", 0.0050)
+EMA_TOLERANCE_RELAX_CAP = _float_env("EMA_TOLERANCE_RELAX_CAP", 0.0080)
 EMA_TOLERANCE = EMA_TOLERANCE_BASE
-RSI_BASE_MIN = _float_env("RSI_BASE_MIN", 40.0)
-RSI_BASE_MAX = _float_env("RSI_BASE_MAX", 70.0)
+RSI_BASE_MIN = _float_env("RSI_BASE_MIN", 38.0)
+RSI_BASE_MAX = _float_env("RSI_BASE_MAX", 75.0)
 RSI_ADAPTIVE = _bool_env("RSI_ADAPTIVE", "1")
 RSI_MIN_BAND = RSI_BASE_MIN
 RSI_MAX_BAND = RSI_BASE_MAX
@@ -1964,6 +2008,7 @@ def _best_candidate_from_watchlist(symbols):
             s = sym.strip().upper()
             if not s:
                 continue
+            metrics_payload = {"symbol": s}
             # --- Skip if already traded today (only when no open position) ---
             with _symbol_last_trade_lock:
                 record = _symbol_last_trade.get(s)
@@ -1975,15 +2020,18 @@ def _best_candidate_from_watchlist(symbols):
                         last_dt = datetime.fromisoformat(last_ts)
                         if (datetime.now(timezone.utc) - last_dt).total_seconds() < PER_SYMBOL_COOLDOWN_SECONDS:
                             print(f"🚫 Skipping {s}: traded {int((datetime.now(timezone.utc)-last_dt).total_seconds())}s ago (cooldown active).")
+                            _log_candidate_event(s, "skip", "cooldown_active")
                             continue
                     except Exception:
                         pass
                 print(f"🚫 Skipping {s}: already traded today.")
+                _log_candidate_event(s, "skip", "already_traded_today")
                 continue
             # --- Fetch bars for volume/volatility filter ---
             bars = get_bars(s, interval='15m', lookback=70)
             if bars is None or 'volume' not in bars.columns or len(bars) < 5:
                 print(f"⚠️ Skipping {s}: insufficient volume data.")
+                _log_candidate_event(s, "skip", "insufficient_volume_data")
                 continue
             closes = bars['close'].astype(float)
             avg_vol = float(bars['volume'].tail(20).mean())
@@ -1991,6 +2039,13 @@ def _best_candidate_from_watchlist(symbols):
             volatility = returns.std() * 100
             if avg_vol < MIN_VOLUME or volatility > MAX_VOLATILITY_PCT or volatility < MIN_VOLATILITY_PCT:
                 print(f"🚫 Skipping {s}: volume={avg_vol:.0f}, volatility={volatility:.2f}% — outside safe limits.")
+                _log_candidate_event(
+                    s,
+                    "skip",
+                    "volume_volatility_filter",
+                    avg_volume=int(avg_vol),
+                    volatility_pct=round(volatility, 3),
+                )
                 continue
             price, ema_short, ema_long = _compute_ema_metrics(bars.tail(60))
             diff_ratio = 0.0 if ema_long == 0 else (ema_short - ema_long) / ema_long
@@ -1999,18 +2054,32 @@ def _best_candidate_from_watchlist(symbols):
                 f"🧭 EMA trend check for {s} → short={ema_short:.2f} long={ema_long:.2f} "
                 f"diff={diff_ratio:.2%} → trend={trend_label}"
             )
+            metrics_payload.update(
+                {
+                    "price": round(price, 4),
+                    "ema_short": round(ema_short, 4),
+                    "ema_long": round(ema_long, 4),
+                    "ema_diff_pct": round(diff_ratio * 100, 3),
+                    "avg_volume": int(avg_vol),
+                    "volatility_pct": round(volatility, 3),
+                }
+            )
             ema_ok = (
                 ema_short >= ema_long * (1 - EMA_TOLERANCE)
                 and price >= ema_short * (1 - EMA_TOLERANCE)
             )
             if not ema_ok:
                 print(f"🚫 Skipping {s}: EMA trend filter failed (tol ±{EMA_TOLERANCE*100:.2f}%).")
+                _log_candidate_event(s, "skip", "ema_filter", **metrics_payload)
                 continue
             # --- MTF and RSI scoring ---
             mtf_bull = is_multi_timeframe_confirmed(s)
+            metrics_payload["mtf_confirmed"] = bool(mtf_bull)
             rsi = get_rsi_value(s, interval='15m')
+            metrics_payload["rsi"] = rsi
             if rsi is None or rsi < RSI_MIN_BAND or rsi > RSI_MAX_BAND:
                 print(f"🚫 Skipping {s}: RSI {rsi} outside {RSI_MIN_BAND}-{RSI_MAX_BAND}.")
+                _log_candidate_event(s, "skip", "rsi_filter", **metrics_payload)
                 continue
             score = 0
             if mtf_bull:
@@ -2024,12 +2093,22 @@ def _best_candidate_from_watchlist(symbols):
                 score_mod -= 1
             score += score_mod
             print(f"🧪 Score {s}: score={score} (mtf_bull={mtf_bull}, rsi={rsi}, vol={avg_vol:.0f}, volat={volatility:.2f}%)")
-            ranked.append((score, s))
+            metrics_payload["score"] = score
+            _log_candidate_event(s, "scored", "", **metrics_payload)
+            ranked.append((score, s, metrics_payload.copy()))
         except Exception as e:
             print(f"⚠️ scoring {sym} failed: {e}")
+            try:
+                _log_candidate_event(s, "error", str(e))
+            except Exception:
+                pass
             continue
-    ranked.sort(reverse=True)
-    return ranked[0][1] if ranked and ranked[0][0] > 0 else None
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    if ranked and ranked[0][0] > 0:
+        top_score, top_symbol, top_payload = ranked[0]
+        _log_candidate_event(top_symbol, "selected", "", **top_payload)
+        return top_symbol
+    return None
 
 def _compute_entry_tp_sl(symbol: str):
     """
