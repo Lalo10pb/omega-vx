@@ -605,6 +605,7 @@ _PDT_LAST_ALERT_MONO = 0.0
 _DAY_TRADE_STATUS_CACHE = {"expires": 0.0, "remaining": None, "is_pdt": None}
 _PDT_LAST_RESET_DATE = None
 _PDT_RESET_LOCK = threading.Lock()
+_PDT_MISSING_DAY_TRADES_WARNED = False
 
 
 def _quantize_to_tick(price):
@@ -711,6 +712,26 @@ def _safe_get_account(timeout: float = 6.0):
     return None
 
 
+def _normalize_day_trades_left(value):
+    """Ensure day-trades-left is an int; treat missing values as zero."""
+    global _PDT_MISSING_DAY_TRADES_WARNED
+    if value is None:
+        if not _PDT_MISSING_DAY_TRADES_WARNED:
+            print("⚠️ PDT day-trade count unavailable; treating as 0 to enforce guard pre-emptively.")
+            _PDT_MISSING_DAY_TRADES_WARNED = True
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            if not _PDT_MISSING_DAY_TRADES_WARNED:
+                print("⚠️ PDT day-trade count unreadable; treating as 0 to enforce guard pre-emptively.")
+                _PDT_MISSING_DAY_TRADES_WARNED = True
+            return 0
+
+
 def _update_day_trade_status_from_account(account) -> tuple:
     if not PDT_GUARD_ENABLED:
         return (None, None)
@@ -720,9 +741,10 @@ def _update_day_trade_status_from_account(account) -> tuple:
             _DAY_TRADE_STATUS_CACHE.get("is_pdt"),
         )
     try:
-        remaining = getattr(account, "day_trades_left", None)
+        raw_remaining = getattr(account, "day_trades_left", None)
     except Exception:
-        remaining = None
+        raw_remaining = None
+    remaining = _normalize_day_trades_left(raw_remaining)
     try:
         is_pdt = bool(getattr(account, "pattern_day_trader", False))
     except Exception:
@@ -2571,7 +2593,8 @@ def submit_order_with_retries(
         _maybe_alert_pdt(msg)
         return False
 
-    # 🚦 Extra PDT guard: block BUY if we likely can't close safely
+    # 🚦 Extra PDT guard: block BUY if we likely can't close safely.
+    # Missing broker day-trade counts are normalized to 0; see _normalize_day_trades_left.
     if _should_run_pdt_checks() and not dry_run:
         rem, pattern_flag = _get_day_trade_status()
         if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
