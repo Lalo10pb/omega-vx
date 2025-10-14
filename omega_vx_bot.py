@@ -3318,16 +3318,17 @@ def _ensure_protection_for_all_open_positions() -> bool:
                     print(f"⚠️ Protection guardian: cancel existing orders failed for {symbol}: {cancel_err}")
 
             try:
-                trading_client.submit_order(
+                oco_request = LimitOrderRequest(
                     symbol=symbol,
                     qty=qty,
                     side=OrderSide.SELL,
-                    type=OrderType.LIMIT,
                     time_in_force=TimeInForce.GTC,
-                    order_class="oco",
-                    take_profit={"limit_price": tp_price},
-                    stop_loss={"stop_price": sl_price},
+                    order_class=OrderClass.OCO,
+                    limit_price=tp_price,
+                    take_profit=TakeProfitRequest(limit_price=tp_price),
+                    stop_loss=StopLossRequest(stop_price=sl_price),
                 )
+                trading_client.submit_order(order_data=oco_request)
                 print(f"🛡️ Protection guardian re-armed {symbol}: qty={qty} SL={sl_price:.2f} TP={tp_price:.2f}")
                 rearmed = True
             except Exception as submit_err:
