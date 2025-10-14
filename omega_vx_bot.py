@@ -603,6 +603,8 @@ def _set_last_close_attempt_ts(symbol: str, timestamp: float) -> None:
 _PDT_GLOBAL_LOCKOUT_UNTIL = 0.0
 _PDT_LAST_ALERT_MONO = 0.0
 _DAY_TRADE_STATUS_CACHE = {"expires": 0.0, "remaining": None, "is_pdt": None}
+_PDT_LAST_RESET_DATE = None
+_PDT_RESET_LOCK = threading.Lock()
 
 
 def _quantize_to_tick(price):
@@ -629,6 +631,15 @@ def _is_pattern_day_trading_error(err: Exception) -> bool:
     if code and str(code) == "40310100":
         return True
     return False
+
+
+def _should_run_pdt_checks() -> bool:
+    """Return True when PDT guard should enforce trading restrictions."""
+    if not PDT_GUARD_ENABLED:
+        return False
+    if not _is_market_open_now():
+        return False
+    return True
 
 
 def _register_pdt_lockout(symbol: str) -> int:
@@ -753,7 +764,7 @@ def _pdt_global_lockout_remaining() -> int:
 
 
 def _pdt_global_lockout_active() -> bool:
-    if not PDT_GUARD_ENABLED:
+    if not _should_run_pdt_checks():
         return False
     global _PDT_GLOBAL_LOCKOUT_UNTIL
     remaining = _pdt_global_lockout_remaining()
@@ -770,7 +781,7 @@ def _pdt_global_lockout_active() -> bool:
 
 
 def _maybe_alert_pdt(reason: str, day_trades_left=None, pattern_flag=None):
-    if not PDT_GUARD_ENABLED:
+    if not _should_run_pdt_checks():
         return
     global _PDT_LAST_ALERT_MONO
     now = monotonic()
@@ -801,7 +812,7 @@ def _maybe_alert_pdt(reason: str, day_trades_left=None, pattern_flag=None):
 
 
 def _log_pdt_status(context: str = "") -> None:
-    if not PDT_GUARD_ENABLED:
+    if not _should_run_pdt_checks():
         return
     acct = _safe_get_account(timeout=5.0)
     if acct is None:
@@ -815,7 +826,7 @@ def _log_pdt_status(context: str = "") -> None:
 
 
 def _set_pdt_global_lockout(reason: str = "", seconds: int = None, day_trades_left=None, pattern_flag=None):
-    if not PDT_GUARD_ENABLED:
+    if not _should_run_pdt_checks():
         return
     global _PDT_GLOBAL_LOCKOUT_UNTIL
     duration = seconds if seconds is not None else PDT_GLOBAL_LOCK_SECONDS
@@ -826,6 +837,30 @@ def _set_pdt_global_lockout(reason: str = "", seconds: int = None, day_trades_le
         _PDT_GLOBAL_LOCKOUT_UNTIL = until
         _maybe_alert_pdt(reason, day_trades_left=day_trades_left, pattern_flag=pattern_flag)
         _log_pdt_status("lockout-set")
+
+
+def _maybe_reset_pdt_state() -> None:
+    """
+    Reset PDT lockouts once per day before pre-market to avoid overnight carry-over.
+    """
+    if not PDT_GUARD_ENABLED:
+        return
+    tz = pytz.timezone("US/Eastern")
+    now_et = datetime.now(tz)
+    if now_et.hour != 3 or now_et.minute != 59:
+        return
+    today = now_et.date()
+    global _PDT_LAST_RESET_DATE, _PDT_GLOBAL_LOCKOUT_UNTIL, _PDT_LAST_ALERT_MONO
+    with _PDT_RESET_LOCK:
+        if _PDT_LAST_RESET_DATE == today:
+            return
+        _PDT_LAST_RESET_DATE = today
+        _PDT_GLOBAL_LOCKOUT_UNTIL = 0.0
+        _PDT_LAST_ALERT_MONO = 0.0
+        with _pdt_lockouts_lock:
+            _pdt_lockouts.clear()
+        _DAY_TRADE_STATUS_CACHE["expires"] = 0.0
+        print("🔄 Daily PDT lockout reset (03:59 ET).")
 
 # --- Auto‑Scanner flags ---
 OMEGA_AUTOSCAN = str(os.getenv("OMEGA_AUTOSCAN", "0")).strip().lower() in ("1","true","yes","y","on")
@@ -1047,6 +1082,9 @@ def close_position_safely(symbol: str, *, session_type: str = "intraday", close_
         return True
     except Exception as e:
         if _is_pattern_day_trading_error(e):
+            if not _is_market_open_now():
+                print(f"⚠️ Close denied for {symbol}: market closed (ignoring PDT lockout).")
+                return False
             cooldown = _register_pdt_lockout(symbol)
             remaining = _pdt_lockout_remaining(symbol)
             minutes = max(1, remaining // 60) if remaining else max(1, cooldown // 60)
@@ -1125,6 +1163,9 @@ def close_position_safely(symbol: str, *, session_type: str = "intraday", close_
             return True
         except Exception as e2:
             if _is_pattern_day_trading_error(e2):
+                if not _is_market_open_now():
+                    print(f"⚠️ Fallback close denied for {symbol}: market closed (ignoring PDT lockout).")
+                    return False
                 cooldown = _register_pdt_lockout(symbol)
                 remaining = _pdt_lockout_remaining(symbol)
                 minutes = max(1, remaining // 60) if remaining else max(1, cooldown // 60)
@@ -2057,6 +2098,7 @@ def start_autoscan_thread():
         print(f"🤖 Autoscan running every {OMEGA_SCAN_INTERVAL_SEC}s "
               f"(dynamic max open positions, dryrun={OMEGA_AUTOSCAN_DRYRUN})")
         while True:
+            _maybe_reset_pdt_state()
             if not _is_market_open_now():
                 sleep_minutes = max(1, SLEEP_OFFHOURS_SECONDS // 60)
                 print(
@@ -2523,14 +2565,14 @@ def submit_order_with_retries(
     """
     print("📌 About to calculate quantity...")
 
-    if PDT_GUARD_ENABLED and _pdt_global_lockout_active() and not dry_run:
+    if not dry_run and _pdt_global_lockout_active():
         remaining = _pdt_global_lockout_remaining()
         msg = f"⏳ PDT lockout active ({remaining}s) — skipping BUY {symbol}."
         _maybe_alert_pdt(msg)
         return False
 
     # 🚦 Extra PDT guard: block BUY if we likely can't close safely
-    if PDT_GUARD_ENABLED and not dry_run:
+    if _should_run_pdt_checks() and not dry_run:
         rem, pattern_flag = _get_day_trade_status()
         if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
             msg = f"🚫 Skipping BUY {symbol} — insufficient day trades left to safely exit later (rem={rem})."
@@ -2604,7 +2646,7 @@ def submit_order_with_retries(
         cash_avail = float(getattr(acct, "cash", 0) or 0)
         multiplier = float(getattr(acct, "multiplier", 1) or 1)
 
-        if PDT_GUARD_ENABLED and not dry_run:
+        if _should_run_pdt_checks() and not dry_run:
             if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
                 msg = f"🛑 Abort {symbol} — remaining day trades {rem} at/under buffer."
                 print(msg)
@@ -2738,14 +2780,20 @@ def submit_order_with_retries(
         except Exception:
             buy_fill_price = None
     except Exception as e:
+        alert_needed = True
         if _is_pattern_day_trading_error(e):
-            _set_pdt_global_lockout(f"BUY denied for {symbol}")
-            _log_pdt_status(f"buy-denied:{symbol}")
+            if not _is_market_open_now():
+                print(f"⚠️ BUY rejected for {symbol}: market closed (ignoring PDT lockout). Error: {e}")
+                alert_needed = False
+            else:
+                _set_pdt_global_lockout(f"BUY denied for {symbol}")
+                _log_pdt_status(f"buy-denied:{symbol}")
         print("🧨 BUY submit failed:", e)
-        try:
-            send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
-        except Exception:
-            pass
+        if alert_needed:
+            try:
+                send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
+            except Exception:
+                pass
         return False
 
     print(f"✅ Bracket BUY placed for {symbol} qty={qty} (TP={abs_tp}, SL={abs_sl})")
@@ -3403,6 +3451,7 @@ def start_eod_close_thread():
     """Automatically flat positions ~5 minutes before close while equity < $25k."""
     def _loop():
         while True:
+            _maybe_reset_pdt_state()
             now_utc = datetime.now(timezone.utc)
             if now_utc.time().hour == 19 and 55 <= now_utc.time().minute <= 59:
                 try:
