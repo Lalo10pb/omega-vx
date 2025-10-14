@@ -180,6 +180,8 @@ def _log_candidate_event(symbol: str, stage: str, reason: str = "", **metrics) -
     if not CANDIDATE_LOG_ENABLED:
         return
     try:
+        metrics = dict(metrics)
+        metrics.pop("symbol", None)
         path = Path(CANDIDATE_LOG_PATH)
         path.parent.mkdir(parents=True, exist_ok=True)
         row = {field: "" for field in CANDIDATE_LOG_FIELDS}
