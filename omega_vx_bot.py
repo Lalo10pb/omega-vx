@@ -26,6 +26,7 @@ from alpaca.trading.requests import (
     StopLossRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, QueryOrderStatus, OrderClass
+from alpaca.common.exceptions import APIError
 from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.mappings import BAR_MAPPING
@@ -117,6 +118,7 @@ PDT_ALERT_COOLDOWN_SECONDS = max(0, _int_env("PDT_ALERT_COOLDOWN_SECONDS", 300))
 PDT_STATUS_CACHE_SECONDS = max(5, _int_env("PDT_STATUS_CACHE_SECONDS", 60))
 CANDIDATE_LOG_PATH = _clean_env(os.getenv("CANDIDATE_LOG_PATH", ""))
 CANDIDATE_LOG_ENABLED = bool(CANDIDATE_LOG_PATH)
+GUARDIAN_REARM_DELAY = max(0, _int_env("GUARDIAN_REARM_DELAY", 5))
 CANDIDATE_LOG_FIELDS = [
     "timestamp",
     "symbol",
@@ -3472,6 +3474,9 @@ def _ensure_protection_for_all_open_positions() -> bool:
                     print(f"⚠️ Protection guardian: cancel existing orders failed for {symbol}: {cancel_err}")
 
             try:
+                if GUARDIAN_REARM_DELAY > 0:
+                    print(f"🕒 Waiting {GUARDIAN_REARM_DELAY}s before re-arm to ensure fill settled...")
+                    time.sleep(GUARDIAN_REARM_DELAY)
                 oco_request = LimitOrderRequest(
                     symbol=symbol,
                     qty=qty,
@@ -3485,6 +3490,11 @@ def _ensure_protection_for_all_open_positions() -> bool:
                 trading_client.submit_order(order_data=oco_request)
                 print(f"🛡️ Protection guardian re-armed {symbol}: qty={qty} SL={sl_price:.2f} TP={tp_price:.2f}")
                 rearmed = True
+            except APIError as api_err:
+                if "insufficient qty" in str(api_err).lower():
+                    print(f"⚠️ Protection guardian: skip re-arm — position already protected ({symbol}).")
+                    continue
+                print(f"⚠️ Protection guardian: re-arm submit failed for {symbol}: {api_err}")
             except Exception as submit_err:
                 print(f"⚠️ Protection guardian: re-arm submit failed for {symbol}: {submit_err}")
 
