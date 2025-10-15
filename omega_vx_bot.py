@@ -652,6 +652,8 @@ _DAY_TRADE_STATUS_CACHE = {"expires": 0.0, "remaining": None, "is_pdt": None}
 _PDT_LAST_RESET_DATE = None
 _PDT_RESET_LOCK = threading.Lock()
 _PDT_MISSING_DAY_TRADES_WARNED = False
+_PDT_BYPASS_ACTIVE = False
+_PDT_BYPASS_LOGGED = False
 
 
 def _quantize_to_tick(price):
@@ -682,7 +684,12 @@ def _is_pattern_day_trading_error(err: Exception) -> bool:
 
 def _should_run_pdt_checks() -> bool:
     """Return True when PDT guard should enforce trading restrictions."""
+    global _PDT_BYPASS_ACTIVE, _PDT_BYPASS_LOGGED
     if not PDT_GUARD_ENABLED:
+        if not _PDT_BYPASS_LOGGED:
+            print("⚙️ PDT guard disabled via environment override.")
+        _PDT_BYPASS_ACTIVE = True
+        _PDT_BYPASS_LOGGED = True
         return False
     if not _is_market_open_now():
         return False
@@ -691,6 +698,8 @@ def _should_run_pdt_checks() -> bool:
 
 def _register_pdt_lockout(symbol: str) -> int:
     """Record that PDT blocked the symbol and return the lockout duration (seconds)."""
+    if _PDT_BYPASS_ACTIVE:
+        return 0
     until = monotonic() + _PDT_LOCKOUT_SEC
     # Thread-safe update to shared state
     with _pdt_lockouts_lock:
@@ -713,6 +722,8 @@ def _pdt_lockout_remaining(symbol: str) -> int:
 
 
 def _pdt_lockout_active(symbol: str) -> bool:
+    if _PDT_BYPASS_ACTIVE:
+        return False
     return _pdt_lockout_remaining(symbol) > 0
 
 # === Dev flags ===
@@ -779,22 +790,53 @@ def _normalize_day_trades_left(value):
 
 
 def _update_day_trade_status_from_account(account) -> tuple:
-    if not PDT_GUARD_ENABLED:
-        return (None, None)
+    global _PDT_BYPASS_ACTIVE, _PDT_BYPASS_LOGGED, _PDT_GLOBAL_LOCKOUT_UNTIL
     if account is None:
         return (
             _DAY_TRADE_STATUS_CACHE.get("remaining"),
             _DAY_TRADE_STATUS_CACHE.get("is_pdt"),
         )
     try:
-        raw_remaining = getattr(account, "day_trades_left", None)
+        margin_mult = float(getattr(account, "multiplier", 1) or 1)
     except Exception:
-        raw_remaining = None
-    remaining = _normalize_day_trades_left(raw_remaining)
+        margin_mult = 1.0
     try:
-        is_pdt = bool(getattr(account, "pattern_day_trader", False))
+        raw_pattern_flag = bool(getattr(account, "pattern_day_trader", False))
     except Exception:
-        is_pdt = None
+        raw_pattern_flag = False
+
+    is_cash_account = (margin_mult <= 1) or (not raw_pattern_flag)
+
+    if not PDT_GUARD_ENABLED:
+        remaining = 99
+        is_pdt = False
+        if not _PDT_BYPASS_LOGGED:
+            print("⚙️ PDT guard disabled via environment override.")
+        _PDT_BYPASS_ACTIVE = True
+        _PDT_BYPASS_LOGGED = True
+        _PDT_GLOBAL_LOCKOUT_UNTIL = 0.0
+        with _pdt_lockouts_lock:
+            _pdt_lockouts.clear()
+    elif is_cash_account:
+        remaining = 99
+        is_pdt = False
+        if not _PDT_BYPASS_ACTIVE or not _PDT_BYPASS_LOGGED:
+            print("💡 Cash account detected — PDT guard bypass active (no margin leverage).")
+        _PDT_BYPASS_ACTIVE = True
+        _PDT_BYPASS_LOGGED = True
+        _PDT_GLOBAL_LOCKOUT_UNTIL = 0.0
+        with _pdt_lockouts_lock:
+            _pdt_lockouts.clear()
+    else:
+        _PDT_BYPASS_ACTIVE = False
+        _PDT_BYPASS_LOGGED = False
+        try:
+            raw_remaining = getattr(account, "day_trades_left", None)
+        except Exception:
+            raw_remaining = None
+        remaining = _normalize_day_trades_left(raw_remaining)
+        is_pdt = raw_pattern_flag
+
     _DAY_TRADE_STATUS_CACHE.update(
         {
             "remaining": remaining,
@@ -827,6 +869,8 @@ def _get_day_trade_status() -> tuple:
 def _pdt_global_lockout_remaining() -> int:
     if not PDT_GUARD_ENABLED:
         return 0
+    if _PDT_BYPASS_ACTIVE:
+        return 0
     remaining = int(max(0.0, _PDT_GLOBAL_LOCKOUT_UNTIL - monotonic()))
     return remaining
 
@@ -835,6 +879,8 @@ def _pdt_global_lockout_active() -> bool:
     if not _should_run_pdt_checks():
         return False
     global _PDT_GLOBAL_LOCKOUT_UNTIL
+    if _PDT_BYPASS_ACTIVE:
+        return False
     remaining = _pdt_global_lockout_remaining()
     if remaining <= 0:
         return False
@@ -850,6 +896,8 @@ def _pdt_global_lockout_active() -> bool:
 
 def _maybe_alert_pdt(reason: str, day_trades_left=None, pattern_flag=None):
     if not _should_run_pdt_checks():
+        return
+    if _PDT_BYPASS_ACTIVE:
         return
     global _PDT_LAST_ALERT_MONO
     now = monotonic()
@@ -895,6 +943,8 @@ def _log_pdt_status(context: str = "") -> None:
 
 def _set_pdt_global_lockout(reason: str = "", seconds: int = None, day_trades_left=None, pattern_flag=None):
     if not _should_run_pdt_checks():
+        return
+    if _PDT_BYPASS_ACTIVE:
         return
     global _PDT_GLOBAL_LOCKOUT_UNTIL
     duration = seconds if seconds is not None else PDT_GLOBAL_LOCK_SECONDS
