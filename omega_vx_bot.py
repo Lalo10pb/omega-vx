@@ -807,7 +807,7 @@ def _update_day_trade_status_from_account(account) -> tuple:
     except Exception:
         raw_pattern_flag = False
 
-    is_cash_account = (margin_mult <= 1) or (not raw_pattern_flag)
+    is_cash_account = margin_mult <= 1
 
     if not PDT_GUARD_ENABLED:
         remaining = 99
@@ -836,6 +836,8 @@ def _update_day_trade_status_from_account(account) -> tuple:
             raw_remaining = getattr(account, "day_trades_left", None)
         except Exception:
             raw_remaining = None
+        if raw_remaining is None and not raw_pattern_flag:
+            print("⚠️ PDT guard: broker returned null day_trades_left for margin account; treating as 0 until refreshed.")
         remaining = _normalize_day_trades_left(raw_remaining)
         is_pdt = raw_pattern_flag
 
