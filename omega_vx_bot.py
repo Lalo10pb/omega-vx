@@ -389,30 +389,8 @@ def _can_trade_symbol_today(symbol: str, entry: float) -> bool:
     if not record:
         return True
 
-    last_ts = record.get("last_trade_ts")
-    if last_ts:
-        try:
-            last_dt = datetime.fromisoformat(last_ts)
-            if (datetime.now(timezone.utc) - last_dt).total_seconds() < PER_SYMBOL_COOLDOWN_SECONDS:
-                print(f"🚫 Re-entry blocked for {symbol}: cooldown {PER_SYMBOL_COOLDOWN_SECONDS}s not met.")
-                return False
-        except Exception:
-            pass
-
     if record.get("date") == today:
-        count = int(record.get("count", 0) or 0)
-        if count >= 2:
-            print(f"🚫 Re-entry blocked for {symbol}: max daily trades reached ({count}).")
-            return False
-        last_exit = record.get("exit_price")
-        if last_exit is None:
-            print(f"🚫 Re-entry blocked for {symbol}: exit price unavailable for dip check.")
-            return False
-        dip_threshold = last_exit * (1 - REENTRY_DIP_PCT / 100.0)
-        if entry < dip_threshold:
-            print(f"🔄 Re-entry allowed for {symbol}: entry {entry} < dip threshold {dip_threshold:.2f}")
-            return True
-        print(f"🚫 Re-entry blocked for {symbol}: entry {entry} not below dip threshold {dip_threshold:.2f}")
+        print(f"🚫 Entry blocked for {symbol}: already traded today (single-entry mode).")
         return False
     return True
 
@@ -2187,17 +2165,7 @@ def _best_candidate_from_watchlist(symbols):
                 record = _symbol_last_trade.get(s)
                 record = None if record is None else record.copy()
             if record and record.get("date") == today and not has_open_position(s, current_positions):
-                last_ts = record.get("last_trade_ts")
-                if last_ts:
-                    try:
-                        last_dt = datetime.fromisoformat(last_ts)
-                        if (datetime.now(timezone.utc) - last_dt).total_seconds() < PER_SYMBOL_COOLDOWN_SECONDS:
-                            print(f"🚫 Skipping {s}: traded {int((datetime.now(timezone.utc)-last_dt).total_seconds())}s ago (cooldown active).")
-                            _log_candidate_event(s, "skip", "cooldown_active")
-                            continue
-                    except Exception:
-                        pass
-                print(f"🚫 Skipping {s}: already traded today.")
+                print(f"🚫 Skipping {s}: already traded today (single-entry mode).")
                 _log_candidate_event(s, "skip", "already_traded_today")
                 continue
             # --- Fetch bars for volume/volatility filter ---
