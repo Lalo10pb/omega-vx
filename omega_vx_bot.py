@@ -2234,7 +2234,43 @@ def _best_candidate_from_watchlist(symbols):
             if volatility > 3.5:
                 score_mod -= 1
             score += score_mod
-            print(f"🧪 Score {s}: score={score} (mtf_bull={mtf_bull}, rsi={rsi}, vol={avg_vol:.0f}, volat={volatility:.2f}%)")
+
+            # --- 1h trend slope bonus/penalty ---
+            slope_pct = None
+            try:
+                bars_1h = get_bars(s, interval='1h', lookback=30)
+                if bars_1h is not None and len(bars_1h) >= 6:
+                    closes_1h = bars_1h['close'].astype(float)
+                    window = closes_1h.tail(6)
+                    if len(window) >= 2 and window.iloc[0] > 0:
+                        slope_pct = ((window.iloc[-1] / window.iloc[0]) - 1) * 100.0
+                        if slope_pct > 0.5:
+                            score += 1
+                        elif slope_pct < -0.5:
+                            score -= 1
+            except Exception as slope_err:
+                print(f"⚠️ Unable to compute 1h slope for {s}: {slope_err}")
+            if slope_pct is not None:
+                metrics_payload["slope_1h_pct"] = round(slope_pct, 3)
+
+            # --- Volume-only sideways penalty ---
+            volume_only_penalty = False
+            if (
+                score_mod > 0
+                and not mtf_bull
+                and slope_pct is not None
+                and abs(slope_pct) < 0.15
+                and abs(diff_ratio) < 0.001
+            ):
+                score -= 0.5
+                volume_only_penalty = True
+                metrics_payload["volume_only_penalty"] = True
+
+            print(
+                f"🧪 Score {s}: score={score} (mtf_bull={mtf_bull}, rsi={rsi}, vol={avg_vol:.0f}, "
+                f"volat={volatility:.2f}%, slope_1h={None if slope_pct is None else round(slope_pct,3)}"
+                f"{' penalty:volume-only' if volume_only_penalty else ''})"
+            )
             metrics_payload["score"] = score
             _log_candidate_event(s, "scored", "", **metrics_payload)
             ranked.append((score, s, metrics_payload.copy()))
