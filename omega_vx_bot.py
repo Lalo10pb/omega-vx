@@ -137,6 +137,92 @@ CANDIDATE_LOG_FIELDS = [
 _CANDIDATE_LOG_LOCK = threading.Lock()
 MIN_TRADE_QTY = 1
 
+# --- Patch 4.16-D: Dynamic PDT Utilization ---
+DAYTRADE_LOG_PATH = os.getenv("DAYTRADE_LOG_PATH", "logs/daytrade_log.csv")
+PDT_MAX_DAYTRADES = int(os.getenv("PDT_MAX_DAYTRADES", "3"))
+PDT_LOCAL_TRACKER = os.getenv("PDT_LOCAL_TRACKER", "1") == "1"
+
+
+def record_day_trade(symbol: str) -> None:
+    """Append a day-trade event with UTC timestamp for local tracking."""
+    if not PDT_LOCAL_TRACKER:
+        return
+    try:
+        directory = os.path.dirname(DAYTRADE_LOG_PATH)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        timestamp = datetime.utcnow().isoformat()
+        with open(DAYTRADE_LOG_PATH, "a", newline="") as handle:
+            csv.writer(handle).writerow([timestamp, symbol])
+    except Exception as err:
+        LOGGER.error(f"Failed to record day trade for {symbol}: {err}")
+
+
+def count_recent_day_trades() -> int:
+    """Count day trades recorded within the last 5 calendar days."""
+    if not PDT_LOCAL_TRACKER or not os.path.exists(DAYTRADE_LOG_PATH):
+        return 0
+    cutoff = datetime.utcnow() - timedelta(days=5)
+    total = 0
+    try:
+        with open(DAYTRADE_LOG_PATH, newline="") as handle:
+            for ts, sym in csv.reader(handle):
+                try:
+                    if datetime.fromisoformat(ts) > cutoff:
+                        total += 1
+                except Exception:
+                    continue
+    except Exception as err:
+        LOGGER.error(f"Failed to read day-trade log: {err}")
+    return total
+
+
+def _should_mark_day_trade(symbol: str, timestamp_str: str) -> bool:
+    """Determine whether a SELL event completes a same-day round trip."""
+    if not PDT_LOCAL_TRACKER or not os.path.exists(TRADE_LOG_PATH):
+        return False
+    try:
+        close_ts = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return False
+
+    last_unmatched_buy: Optional[datetime] = None
+    try:
+        with open(TRADE_LOG_PATH, newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if str(row.get("symbol", "")).upper() != symbol.upper():
+                    continue
+                ts_str = row.get("timestamp")
+                if not ts_str:
+                    continue
+                try:
+                    ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    continue
+                action = str(row.get("action", "")).upper()
+                if action == "BUY":
+                    last_unmatched_buy = ts
+                elif action == "SELL" and last_unmatched_buy:
+                    # Previously logged SELL closes the outstanding BUY.
+                    last_unmatched_buy = None
+    except Exception as err:
+        LOGGER.error(f"Failed to analyze trade history for {symbol}: {err}")
+        return False
+
+    if not last_unmatched_buy:
+        return False
+    return last_unmatched_buy.date() == close_ts.date()
+
+
+def _log_day_trade_if_applicable(symbol: str, timestamp_str: str) -> None:
+    """Record a day trade when a SELL closes a same-day position."""
+    try:
+        if _should_mark_day_trade(symbol, timestamp_str):
+            record_day_trade(symbol)
+    except Exception as err:
+        LOGGER.error(f"Day-trade tracker error for {symbol}: {err}")
+
 _DAILY_TRADE_COUNT = 0
 _DAILY_TRADE_DATE = datetime.now().date()
 
@@ -2731,17 +2817,37 @@ def submit_order_with_retries(
     # 🚦 Extra PDT guard: block BUY if we likely can't close safely.
     # Missing broker day-trade counts are normalized to 0; see _normalize_day_trades_left.
     if _should_run_pdt_checks() and not dry_run:
-        rem, pattern_flag = _get_day_trade_status()
-        if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
-            msg = f"🚫 Skipping BUY {symbol} — insufficient day trades left to safely exit later (rem={rem})."
-            print(msg)
-            _maybe_alert_pdt(msg, day_trades_left=rem, pattern_flag=pattern_flag)
-            try:
-                send_telegram_alert(msg)
-                send_telegram_alert(f"📊 PDT Status: {rem} day trades left | PDT flag={pattern_flag}")
-            except Exception:
-                pass
-            return False
+        if PDT_LOCAL_TRACKER:
+            recent_trades = count_recent_day_trades()
+            if recent_trades >= PDT_MAX_DAYTRADES:
+                LOGGER.warning(
+                    f"🚫 PDT local limit reached ({recent_trades}/{PDT_MAX_DAYTRADES} in 5 days). Skipping new buys."
+                )
+                msg = (
+                    f"🚫 PDT guard active — {recent_trades}/{PDT_MAX_DAYTRADES} local day trades used in last 5 days. "
+                    f"Skipping BUY {symbol}."
+                )
+                try:
+                    send_telegram_alert(msg)
+                except Exception:
+                    pass
+                return False
+            else:
+                LOGGER.info(
+                    f"🧮 PDT local tracker → {recent_trades}/{PDT_MAX_DAYTRADES} used (5-day window). Proceeding."
+                )
+        else:
+            rem, pattern_flag = _get_day_trade_status()
+            if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
+                msg = f"🚫 Skipping BUY {symbol} — insufficient day trades left to safely exit later (rem={rem})."
+                print(msg)
+                _maybe_alert_pdt(msg, day_trades_left=rem, pattern_flag=pattern_flag)
+                try:
+                    send_telegram_alert(msg)
+                    send_telegram_alert(f"📊 PDT Status: {rem} day trades left | PDT flag={pattern_flag}")
+                except Exception:
+                    pass
+                return False
 
     # --- Per-symbol daily trade guard ---
     if not _can_trade_symbol_today(symbol, entry):
@@ -2804,7 +2910,7 @@ def submit_order_with_retries(
         cash_avail = float(getattr(acct, "cash", 0) or 0)
         multiplier = float(getattr(acct, "multiplier", 1) or 1)
 
-        if _should_run_pdt_checks() and not dry_run:
+        if _should_run_pdt_checks() and not dry_run and not PDT_LOCAL_TRACKER:
             if rem is not None and rem <= PDT_MIN_DAY_TRADES_BUFFER:
                 msg = f"🛑 Abort {symbol} — remaining day trades {rem} at/under buffer."
                 print(msg)
@@ -2946,6 +3052,9 @@ def submit_order_with_retries(
             else:
                 _set_pdt_global_lockout(f"BUY denied for {symbol}")
                 _log_pdt_status(f"buy-denied:{symbol}")
+                if "pattern day trading" in str(e).lower() or "40310100" in str(e):
+                    LOGGER.warning("⚠️ Broker PDT rejection detected — marking as temporary lock.")
+                    record_day_trade(symbol)
         print("🧨 BUY submit failed:", e)
         if alert_needed:
             try:
@@ -4133,6 +4242,9 @@ def log_trade(
 
     # 🕰 Timestamp
     timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    if str(action).upper() == "SELL":
+        _log_day_trade_if_applicable(symbol, timestamp_str)
 
     if status == "executed":
         with open(LAST_TRADE_FILE, 'w') as f:
