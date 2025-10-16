@@ -3069,9 +3069,6 @@ def submit_order_with_retries(
             else:
                 _set_pdt_global_lockout(f"BUY denied for {symbol}")
                 _log_pdt_status(f"buy-denied:{symbol}")
-                if "pattern day trading" in str(e).lower() or "40310100" in str(e):
-                    LOGGER.warning("⚠️ Broker PDT rejection detected — marking as temporary lock.")
-                    record_day_trade(symbol)
         print("🧨 BUY submit failed:", e)
         if alert_needed:
             try:
