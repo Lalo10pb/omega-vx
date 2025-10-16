@@ -162,16 +162,22 @@ def count_recent_day_trades() -> int:
     """Count day trades recorded within the last 5 calendar days."""
     if not PDT_LOCAL_TRACKER or not os.path.exists(DAYTRADE_LOG_PATH):
         return 0
-    cutoff = datetime.utcnow() - timedelta(days=5)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=5)
     total = 0
     try:
         with open(DAYTRADE_LOG_PATH, newline="") as handle:
             for ts, sym in csv.reader(handle):
                 try:
-                    if datetime.fromisoformat(ts) > cutoff:
-                        total += 1
+                    parsed = datetime.fromisoformat(ts)
                 except Exception:
-                    continue
+                    try:
+                        parsed = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S")
+                    except Exception:
+                        continue
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                if parsed > cutoff:
+                    total += 1
     except Exception as err:
         LOGGER.error(f"Failed to read day-trade log: {err}")
     return total
