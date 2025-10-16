@@ -151,7 +151,7 @@ def record_day_trade(symbol: str) -> None:
         directory = os.path.dirname(DAYTRADE_LOG_PATH)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         with open(DAYTRADE_LOG_PATH, "a", newline="") as handle:
             csv.writer(handle).writerow([timestamp, symbol])
     except Exception as err:
@@ -862,7 +862,10 @@ def _normalize_day_trades_left(value):
     global _PDT_MISSING_DAY_TRADES_WARNED
     if value is None:
         if not _PDT_MISSING_DAY_TRADES_WARNED:
-            print("⚠️ PDT day-trade count unavailable; treating as 0 to enforce guard pre-emptively.")
+            if PDT_LOCAL_TRACKER:
+                LOGGER.info("ℹ️ Broker did not report day_trades_left; falling back to local PDT tracker.")
+            else:
+                print("⚠️ PDT day-trade count unavailable; treating as 0 to enforce guard pre-emptively.")
             _PDT_MISSING_DAY_TRADES_WARNED = True
         return 0
     try:
@@ -872,7 +875,10 @@ def _normalize_day_trades_left(value):
             return int(float(value))
         except (TypeError, ValueError):
             if not _PDT_MISSING_DAY_TRADES_WARNED:
-                print("⚠️ PDT day-trade count unreadable; treating as 0 to enforce guard pre-emptively.")
+                if PDT_LOCAL_TRACKER:
+                    LOGGER.info("ℹ️ Broker day_trades_left payload unreadable; using local PDT tracker.")
+                else:
+                    print("⚠️ PDT day-trade count unreadable; treating as 0 to enforce guard pre-emptively.")
                 _PDT_MISSING_DAY_TRADES_WARNED = True
             return 0
 
@@ -923,7 +929,12 @@ def _update_day_trade_status_from_account(account) -> tuple:
         except Exception:
             raw_remaining = None
         if raw_remaining is None and not raw_pattern_flag:
-            print("⚠️ PDT guard: broker returned null day_trades_left for margin account; treating as 0 until refreshed.")
+            if PDT_LOCAL_TRACKER:
+                LOGGER.debug(
+                    "PDT tracker: broker day_trades_left missing; relying on local 5-day counter."
+                )
+            else:
+                print("⚠️ PDT guard: broker returned null day_trades_left for margin account; treating as 0 until refreshed.")
         remaining = _normalize_day_trades_left(raw_remaining)
         is_pdt = raw_pattern_flag
 
