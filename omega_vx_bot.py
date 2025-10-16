@@ -116,6 +116,7 @@ PDT_GLOBAL_LOCK_SECONDS = max(0, _int_env("PDT_GLOBAL_LOCK_SECONDS", 900))
 PDT_SYMBOL_LOCK_SECONDS = max(0, _int_env("PDT_SYMBOL_LOCK_SECONDS", 600))
 PDT_ALERT_COOLDOWN_SECONDS = max(0, _int_env("PDT_ALERT_COOLDOWN_SECONDS", 300))
 PDT_STATUS_CACHE_SECONDS = max(5, _int_env("PDT_STATUS_CACHE_SECONDS", 60))
+PDT_LOCAL_LOCK_SECONDS = max(0, _int_env("PDT_LOCAL_LOCK_SECONDS", 120))
 CANDIDATE_LOG_PATH = _clean_env(os.getenv("CANDIDATE_LOG_PATH", ""))
 CANDIDATE_LOG_ENABLED = bool(CANDIDATE_LOG_PATH)
 GUARDIAN_REARM_DELAY = max(0, _int_env("GUARDIAN_REARM_DELAY", 5))
@@ -934,14 +935,16 @@ def _update_day_trade_status_from_account(account) -> tuple:
             raw_remaining = getattr(account, "day_trades_left", None)
         except Exception:
             raw_remaining = None
-        if raw_remaining is None and not raw_pattern_flag:
-            if PDT_LOCAL_TRACKER:
-                LOGGER.debug(
-                    "PDT tracker: broker day_trades_left missing; relying on local 5-day counter."
-                )
-            else:
+        if PDT_LOCAL_TRACKER:
+            if raw_remaining is not None:
+                LOGGER.debug(f"PDT tracker: ignoring broker-reported day_trades_left={raw_remaining}; using local counter.")
+            elif not raw_pattern_flag:
+                LOGGER.debug("PDT tracker: broker day_trades_left missing; relying on local 5-day counter.")
+            remaining = None
+        else:
+            if raw_remaining is None and not raw_pattern_flag:
                 print("⚠️ PDT guard: broker returned null day_trades_left for margin account; treating as 0 until refreshed.")
-        remaining = _normalize_day_trades_left(raw_remaining)
+            remaining = _normalize_day_trades_left(raw_remaining)
         is_pdt = raw_pattern_flag
 
     _DAY_TRADE_STATUS_CACHE.update(
@@ -1021,6 +1024,8 @@ def _maybe_alert_pdt(reason: str, day_trades_left=None, pattern_flag=None):
         msg += f": {reason}"
     if day_trades_left is not None:
         msg += f" | day_trades_left={day_trades_left}"
+    elif PDT_LOCAL_TRACKER:
+        msg += " | day_trades_left=local-tracker"
     if pattern_flag is not None:
         msg += f" | pattern_day_trader={pattern_flag}"
     remaining = _pdt_global_lockout_remaining()
@@ -1042,8 +1047,12 @@ def _log_pdt_status(context: str = "") -> None:
         print(f"⚠️ PDT status [{context}] unavailable (no account snapshot).")
         return
     rem, flag = _update_day_trade_status_from_account(acct)
+    if rem is None and PDT_LOCAL_TRACKER:
+        remaining_display = "local-tracker"
+    else:
+        remaining_display = rem
     print(
-        f"ℹ️ PDT status [{context}]: day_trades_left={rem} "
+        f"ℹ️ PDT status [{context}]: day_trades_left={remaining_display} "
         f"pattern_day_trader={flag}"
     )
 
@@ -1054,7 +1063,12 @@ def _set_pdt_global_lockout(reason: str = "", seconds: int = None, day_trades_le
     if _PDT_BYPASS_ACTIVE:
         return
     global _PDT_GLOBAL_LOCKOUT_UNTIL
-    duration = seconds if seconds is not None else PDT_GLOBAL_LOCK_SECONDS
+    if seconds is not None:
+        duration = seconds
+    elif PDT_LOCAL_TRACKER and PDT_LOCAL_LOCK_SECONDS >= 0:
+        duration = PDT_LOCAL_LOCK_SECONDS
+    else:
+        duration = PDT_GLOBAL_LOCK_SECONDS
     if duration <= 0:
         return
     until = monotonic() + duration
