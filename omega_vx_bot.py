@@ -117,6 +117,7 @@ PDT_SYMBOL_LOCK_SECONDS = max(0, _int_env("PDT_SYMBOL_LOCK_SECONDS", 600))
 PDT_ALERT_COOLDOWN_SECONDS = max(0, _int_env("PDT_ALERT_COOLDOWN_SECONDS", 300))
 PDT_STATUS_CACHE_SECONDS = max(5, _int_env("PDT_STATUS_CACHE_SECONDS", 60))
 PDT_LOCAL_LOCK_SECONDS = max(0, _int_env("PDT_LOCAL_LOCK_SECONDS", 120))
+ALLOW_PLAIN_BUY_FALLBACK = _bool_env("ALLOW_PLAIN_BUY_FALLBACK", "1")
 CANDIDATE_LOG_PATH = _clean_env(os.getenv("CANDIDATE_LOG_PATH", ""))
 CANDIDATE_LOG_ENABLED = bool(CANDIDATE_LOG_PATH)
 GUARDIAN_REARM_DELAY = max(0, _int_env("GUARDIAN_REARM_DELAY", 5))
@@ -2795,6 +2796,61 @@ def get_rsi_value(symbol, interval='15m', period=14):
         print(f"📈 RSI ({interval}) for {symbol}: {latest_rsi}")
     return latest_rsi
 
+
+def _submit_plain_buy_with_manual_protection(
+    symbol: str,
+    qty: int,
+    entry_price: float,
+    stop_loss_price: float,
+    take_profit_price: float,
+    use_trailing: bool = False,
+) -> tuple:
+    """
+    Submit a standalone market BUY (no bracket) and manually attach TP/SL.
+
+    Returns (order, fill_price) on success, (None, None) on failure.
+    """
+    try:
+        order_req = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            type=OrderType.MARKET,
+            time_in_force=TimeInForce.GTC,
+        )
+        print(f"🛠️ Fallback: submitting plain BUY {symbol} x{qty} (no bracket).")
+        order = trading_client.submit_order(order_req)
+    except Exception as err:
+        print(f"❌ Plain BUY fallback failed for {symbol}: {err}")
+        try:
+            send_telegram_alert(f"❌ Plain BUY fallback failed for {symbol}: {err}")
+        except Exception:
+            pass
+        return None, None
+
+    fill_price = None
+    try:
+        info = poll_order_fill(order.id, timeout=90, poll_secs=2)
+        fill_price = info.get("filled_avg_price")
+    except Exception as err:
+        print(f"⚠️ Plain BUY fill polling failed for {symbol}: {err}")
+
+    # Attach TP/SL manually using split orders.
+    try:
+        attached = place_split_protection(
+            symbol,
+            tp_price=take_profit_price,
+            sl_price=stop_loss_price,
+        )
+        if attached:
+            print(f"🛡️ Manual protection attached for {symbol} (TP={take_profit_price}, SL={stop_loss_price}).")
+        else:
+            print(f"⚠️ Manual protection not attached immediately for {symbol}; will rely on guardian retry.")
+    except Exception as err:
+        print(f"⚠️ Manual protection setup failed for {symbol}: {err}")
+
+    return order, fill_price
+
 def submit_order_with_retries(
     symbol, entry, stop_loss, take_profit, use_trailing,
     max_retries=3, dry_run=False
@@ -3023,6 +3079,7 @@ def submit_order_with_retries(
     print(f"🧭 TP/SL sanity → last={last_px:.2f} | TP={abs_tp} | SL={abs_sl}")
 
     # ---- BUY leg via bracket order ----
+    plain_fallback_used = False
     try:
         print(f"🚀 Submitting bracket BUY {symbol} x{qty} (market, GTC)")
         order_request = MarketOrderRequest(
@@ -3044,6 +3101,7 @@ def submit_order_with_retries(
             buy_fill_price = None
     except Exception as e:
         alert_needed = True
+        fallback_attempted = False
         if _is_pattern_day_trading_error(e):
             if not _is_market_open_now():
                 print(f"⚠️ BUY rejected for {symbol}: market closed (ignoring PDT lockout). Error: {e}")
@@ -3051,15 +3109,33 @@ def submit_order_with_retries(
             else:
                 _set_pdt_global_lockout(f"BUY denied for {symbol}")
                 _log_pdt_status(f"buy-denied:{symbol}")
-        print("🧨 BUY submit failed:", e)
-        if alert_needed:
-            try:
-                send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
-            except Exception:
-                pass
-        return False
-
-    print(f"✅ Bracket BUY placed for {symbol} qty={qty} (TP={abs_tp}, SL={abs_sl})")
+                if ALLOW_PLAIN_BUY_FALLBACK:
+                    fallback_attempted = True
+                    buy_order, buy_fill_price = _submit_plain_buy_with_manual_protection(
+                        symbol,
+                        qty,
+                        entry,
+                        abs_sl,
+                        abs_tp,
+                        use_trailing=use_trailing,
+                    )
+                    if buy_order:
+                        plain_fallback_used = True
+                        alert_needed = False
+        if plain_fallback_used:
+            print(f"✅ Plain BUY fallback succeeded for {symbol}.")
+        else:
+            print("🧨 BUY submit failed:", e)
+            if alert_needed:
+                try:
+                    send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
+                except Exception:
+                    pass
+            return False
+    if plain_fallback_used:
+        print(f"✅ BUY placed for {symbol} via plain order (manual TP/SL).")
+    else:
+        print(f"✅ Bracket BUY placed for {symbol} qty={qty} (TP={abs_tp}, SL={abs_sl})")
 
     try:
         entry_snapshot = float(buy_fill_price or entry)
