@@ -1536,7 +1536,7 @@ def post_trade_protection_audit(symbol, entry_price, tp_price, sl_price):
 
             qty = 0
             try:
-            pos = [p for p in _broker_get_all_positions() if getattr(p, "symbol", "").upper() == symbol.upper()]
+                pos = [p for p in _broker_get_all_positions() if getattr(p, "symbol", "").upper() == symbol.upper()]
                 if pos:
                     qty = int(float(pos[0].qty))
             except Exception as e:
