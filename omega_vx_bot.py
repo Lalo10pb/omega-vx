@@ -3960,7 +3960,7 @@ def start_eod_close_thread():
                     if equity >= 25000:
                         time.sleep(60)
                         continue
-    positions = _broker_get_all_positions()
+                    positions = _broker_get_all_positions()
                     if not positions:
                         print("🌙 EOD flush: no open positions to manage.")
                         time.sleep(60)
