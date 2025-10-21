@@ -8,12 +8,18 @@ services:
     startCommand: python omega_vx_bot.py
     envVars:
       - key: APCA_API_KEY_ID
-        value: your_key_here
+        sync: false
       - key: APCA_API_SECRET_KEY
-        value: your_secret_here
+        sync: false
       - key: APCA_API_BASE_URL
         value: https://paper-api.alpaca.markets
+      - key: ALPACA_PAPER
+        value: "true"
+      - key: ALPACA_DATA_FEED
+        value: iex
+      - key: ALLOW_PLAIN_BUY_FALLBACK
+        value: "1"
       - key: TELEGRAM_BOT_TOKEN
-        value: your_token_here
+        sync: false
       - key: TELEGRAM_CHAT_ID
-        value: your_chat_id_here
+        sync: false

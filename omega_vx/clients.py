@@ -34,6 +34,21 @@ def _resolve_paper_mode() -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "paper"}
 
 
+def _resolve_data_url_override() -> Optional[str]:
+    """
+    Determine the appropriate base URL for Alpaca market data calls.
+
+    Prefers an explicit APCA_DATA_BASE_URL env var, falling back to the sandbox
+    endpoint automatically when we are operating in paper mode.
+    """
+    override = config.get_env("APCA_DATA_BASE_URL")
+    if override:
+        return override
+    if _resolve_paper_mode():
+        return "https://data.sandbox.alpaca.markets"
+    return None
+
+
 @lru_cache(maxsize=1)
 def get_trading_client() -> TradingClient:
     config.load_environment()
@@ -55,7 +70,10 @@ def get_data_client() -> StockHistoricalDataClient:
     secret = config.get_env("APCA_API_SECRET_KEY")
     if not key or not secret:
         raise RuntimeError("Missing APCA_API_KEY_ID / APCA_API_SECRET_KEY environment variables.")
-    return StockHistoricalDataClient(key, secret)
+    data_url = _resolve_data_url_override()
+    if data_url:
+        LOGGER.info("Using Alpaca data endpoint %s", data_url)
+    return StockHistoricalDataClient(key, secret, url_override=data_url)
 
 
 @lru_cache(maxsize=1)
@@ -66,7 +84,8 @@ def get_raw_data_client() -> Optional[StockHistoricalDataClient]:
         secret = config.get_env("APCA_API_SECRET_KEY")
         if not key or not secret:
             return None
-        return StockHistoricalDataClient(key, secret, raw_data=True)
+        data_url = _resolve_data_url_override()
+        return StockHistoricalDataClient(key, secret, raw_data=True, url_override=data_url)
     except Exception:
         return None
 

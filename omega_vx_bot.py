@@ -10,6 +10,7 @@ import requests
 import subprocess
 import sys
 from typing import Optional, Set, Tuple, Iterable
+from types import SimpleNamespace
 from datetime import datetime, timedelta, time as dt_time, timezone
 import numpy as np
 import pandas as pd
@@ -42,6 +43,8 @@ from omega_vx.clients import (
 )
 from omega_vx.logging_utils import configure_logger, install_print_bridge
 from omega_vx.notifications import send_email, send_telegram_alert
+
+from api.ibkr_adapter import IBKRAdapter
 
 LOG_DIR = str(omega_config.LOG_DIR)
 LOGGER = configure_logger()
@@ -93,6 +96,11 @@ _log_boot("Alpaca data feed: iex (forced)")
 def _clean_env(s: str) -> str:
     """Trim whitespace and surrounding quotes from environment variables."""
     return omega_config.clean(s)
+
+# --- Broker selection ---
+BROKER = (_clean_env(os.getenv("BROKER", "ALPACA") or "ALPACA") or "ALPACA").upper()
+IS_IBKR = BROKER == "IBKR"
+ACCOUNT_SOURCE = "IBKR" if IS_IBKR else "ALPACA"
 
 # Legacy logging configuration replaced by centralized logger above.
 DAILY_RISK_LIMIT = -10  # optional daily risk guard, currently unused
@@ -491,16 +499,32 @@ CRASH_LOG_FILE = os.path.join(LOG_DIR, "last_boot.txt")
 LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
 LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
 
-# === Alpaca Clients ===
-trading_client = get_trading_client()
+# === Broker Clients ===
+if IS_IBKR:
+    broker = IBKRAdapter(
+        host=os.getenv("IBKR_HOST", "127.0.0.1"),
+        port=int(os.getenv("IBKR_PORT", "7497") or "7497"),
+        client_id=int(os.getenv("IBKR_CLIENT_ID", "1") or "1"),
+    )
+    broker.connect()
+    trading_client = None
+    _log_boot("Broker mode: IBKR adapter active.")
+else:
+    broker = None
+    trading_client = get_trading_client()
+    _log_boot("Broker mode: Alpaca trading client active.")
+
 data_client = get_data_client()
 _RAW_DATA_CLIENT = get_raw_data_client()
 
 
 def print_protection_status():
     """Prints the current protection status (TP and SL) for all open positions."""
+    if IS_IBKR:
+        print("⚠️ Protection status inspection is not yet available for IBKR accounts.")
+        return
     try:
-        positions = trading_client.get_all_positions()
+        positions = _broker_get_all_positions()
         if not positions:
             print("🛡 No open positions currently under protection.")
             return
@@ -800,6 +824,30 @@ def _pdt_lockout_active(symbol: str) -> bool:
         return False
     return _pdt_lockout_remaining(symbol) > 0
 
+
+def _ibkr_account_namespace(summary: dict) -> Optional[SimpleNamespace]:
+    if not summary:
+        return None
+    return SimpleNamespace(
+        buying_power=summary.get("buying_power", 0.0),
+        cash=summary.get("cash", 0.0),
+        equity=summary.get("equity", 0.0),
+        portfolio_value=summary.get("equity", 0.0),
+        multiplier=summary.get("multiplier", 1.0),
+        non_marginable_buying_power=summary.get("cash", 0.0),
+        regt_buying_power=summary.get("buying_power", 0.0),
+        pattern_day_trader=False,
+        day_trades_left=None,
+    )
+
+
+def _broker_get_all_positions():
+    if IS_IBKR:
+        if not broker:
+            return []
+        return [broker.build_position_namespace(p) for p in broker.positions()]
+    return trading_client.get_all_positions()
+
 # === Dev flags ===
 
 FORCE_WEBHOOK_TEST = str(os.getenv("FORCE_WEBHOOK_TEST", "0")).strip().lower() in ("1", "true", "yes")
@@ -810,6 +858,21 @@ def _safe_get_account(timeout: float = 6.0):
     Retrieve the Alpaca account with a soft timeout. Falls back to the cached copy
     if the live request fails or exceeds the timeout budget.
     """
+    if IS_IBKR:
+        summary = broker.get_account_summary() if broker else {}
+        account = _ibkr_account_namespace(summary)
+        if account:
+            _ACCOUNT_CACHE["data"] = account
+            _ACCOUNT_CACHE["timestamp"] = monotonic()
+            return account
+        cached = _ACCOUNT_CACHE.get("data")
+        cache_age = monotonic() - _ACCOUNT_CACHE.get("timestamp", 0.0)
+        if cached and cache_age <= _ACCOUNT_CACHE_TTL:
+            print(f"ℹ️ Using cached IBKR account snapshot ({cache_age:.1f}s old).")
+            return cached
+        print("❌ No usable IBKR account snapshot available.")
+        return None
+
     holder: dict = {}
 
     def _worker():
@@ -1168,6 +1231,9 @@ def find_recent_sell_fill(symbol: str, lookback_sec: int = 240):
     Find the most recent CLOSED SELL order for `symbol` within `lookback_sec`
     and return its filled qty/avg price.
     """
+    if IS_IBKR:
+        # IBKR adapter does not expose historical order fills via account summary.
+        return {"filled_qty": 0.0, "filled_avg_price": None}
     try:
         since = datetime.now(timezone.utc) - timedelta(seconds=lookback_sec)
         req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol])
@@ -1199,6 +1265,9 @@ def find_recent_sell_fill(symbol: str, lookback_sec: int = 240):
 
 def cancel_open_sells(symbol: str) -> int:
     """Cancel all OPEN sell orders (limit/stop) for symbol to avoid wash-trade rejects."""
+    if IS_IBKR:
+        print(f"ℹ️ IBKR: cancel_open_sells is a no-op for {symbol} (manual TP/SL orders).")
+        return 0
     n = 0
     try:
         req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
@@ -1221,13 +1290,50 @@ def close_position_safely(symbol: str, *, session_type: str = "intraday", close_
       2) Wait briefly for cancels to settle
       3) Close position with a single market SELL (reduce‑only via close_position)
     """
+    if IS_IBKR:
+        pre_qty = 0
+        pre_avg = None
+        try:
+            pos = [p for p in _broker_get_all_positions() if getattr(p, "symbol", "").upper() == symbol.upper()]
+            if pos:
+                pre_qty = int(float(getattr(pos[0], "qty", 0) or 0))
+                pre_avg = float(getattr(pos[0], "avg_entry_price", 0) or 0)
+        except Exception:
+            pass
+        success = broker.close_position(symbol) if broker else False
+        if success:
+            print(f"✅ Requested IBKR close for {symbol} (market).")
+            try:
+                send_telegram_alert(f"✅ Closed {symbol} (IBKR market close).")
+            except Exception:
+                pass
+            try:
+                log_trade(
+                    symbol,
+                    pre_qty,
+                    pre_avg if pre_avg is not None else 0.0,
+                    None,
+                    None,
+                    status="closed",
+                    action="SELL",
+                    fill_price=None,
+                    realized_pnl=None,
+                    session_type=session_type,
+                    close_reason=close_reason,
+                )
+            except Exception as _le:
+                print(f"⚠️ Trade log (SELL) failed: {_le}")
+            return True
+        print(f"⚠️ IBKR close failed for {symbol}.")
+        return False
+
     if PDT_GUARD_ENABLED and _pdt_global_lockout_active():
         return False
     # Capture pre-close position details
     pre_qty = 0
     pre_avg = None
     try:
-        pos = [p for p in trading_client.get_all_positions() if p.symbol.upper() == symbol.upper()]
+        pos = [p for p in _broker_get_all_positions() if p.symbol.upper() == symbol.upper()]
         if pos:
             pre_qty = int(float(pos[0].qty))
             pre_avg = float(pos[0].avg_entry_price)
@@ -1317,7 +1423,7 @@ def close_position_safely(symbol: str, *, session_type: str = "intraday", close_
             return False
         # Fallback: explicit market SELL sized to position
         try:
-            pos = [p for p in trading_client.get_all_positions() if p.symbol.upper()==symbol.upper()]
+            pos = [p for p in _broker_get_all_positions() if p.symbol.upper()==symbol.upper()]
             if not pos:
                 print(f"ℹ️ No {symbol} position found; nothing to close.")
                 return True
@@ -1430,7 +1536,7 @@ def post_trade_protection_audit(symbol, entry_price, tp_price, sl_price):
 
             qty = 0
             try:
-                pos = [p for p in trading_client.get_all_positions() if p.symbol.upper() == symbol.upper()]
+            pos = [p for p in _broker_get_all_positions() if getattr(p, "symbol", "").upper() == symbol.upper()]
                 if pos:
                     qty = int(float(pos[0].qty))
             except Exception as e:
@@ -1761,7 +1867,7 @@ def is_multi_timeframe_confirmed(symbol):
 # === AUTOSCAN ENGINE =========================================================
 def _open_positions_count() -> int:
     try:
-        return len(trading_client.get_all_positions())
+        return len(_broker_get_all_positions())
     except Exception as e:
         print(f"⚠️ count positions failed: {e}")
         return 0
@@ -1774,7 +1880,7 @@ def has_open_position(symbol: str, positions: Optional[Iterable] = None) -> bool
     """
     try:
         if positions is None:
-            positions = trading_client.get_all_positions()
+            positions = _broker_get_all_positions()
     except Exception as e:
         print(f"⚠️ has_open_position failed for {symbol}: {e}")
         return False
@@ -2146,7 +2252,7 @@ def _best_candidate_from_watchlist(symbols):
     ranked = []
     today = datetime.now().date()
     try:
-        current_positions = trading_client.get_all_positions()
+        current_positions = _broker_get_all_positions()
     except Exception as e:
         print(f"⚠️ autoscan position fetch failed: {e}")
         current_positions = []
@@ -3114,28 +3220,40 @@ def submit_order_with_retries(
     abs_sl = _quantize_to_tick(abs_sl)
     print(f"🧭 TP/SL sanity → last={last_px:.2f} | TP={abs_tp} | SL={abs_sl}")
 
-    # ---- BUY leg via bracket order ----
+    # ---- BUY leg (bracket on Alpaca, manual on IBKR) ----
     plain_fallback_used = False
-    try:
-        print(f"🚀 Submitting bracket BUY {symbol} x{qty} (market, GTC)")
-        order_request = MarketOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            type=OrderType.MARKET,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=abs_tp),
-            stop_loss=StopLossRequest(stop_price=abs_sl),
-        )
-        buy_order = trading_client.submit_order(order_request)
-        buy_fill_price = None
+    buy_order = None
+    buy_fill_price = None
+    if IS_IBKR:
+        trade = broker.place_order(symbol, qty, side="buy", order_type="market", tp=abs_tp, sl=abs_sl)
+        if not trade:
+            print(f"❌ IBKR BUY failed for {symbol}.")
+            try:
+                send_telegram_alert(f"❌ BUY failed for {symbol}: IBKR order rejected.")
+            except Exception:
+                pass
+            return False
+        plain_fallback_used = True
+    else:
         try:
-            info = poll_order_fill(buy_order.id, timeout=90, poll_secs=2)
-            buy_fill_price = info.get("filled_avg_price")
-        except Exception:
-            buy_fill_price = None
-    except Exception as e:
+            print(f"🚀 Submitting bracket BUY {symbol} x{qty} (market, GTC)")
+            order_request = MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                type=OrderType.MARKET,
+                time_in_force=TimeInForce.GTC,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=abs_tp),
+                stop_loss=StopLossRequest(stop_price=abs_sl),
+            )
+            buy_order = trading_client.submit_order(order_request)
+            try:
+                info = poll_order_fill(buy_order.id, timeout=90, poll_secs=2)
+                buy_fill_price = info.get("filled_avg_price")
+            except Exception:
+                buy_fill_price = None
+        except Exception as e:
         alert_needed = True
         fallback_attempted = False
         if _is_pattern_day_trading_error(e):
@@ -3572,7 +3690,7 @@ def _ensure_protection_for_all_open_positions() -> bool:
         return False
     try:
         try:
-            positions = trading_client.get_all_positions()
+            positions = _broker_get_all_positions()
         except Exception as pos_err:
             print(f"⚠️ Protection guardian: position fetch failed: {pos_err}")
             return False
@@ -3788,7 +3906,7 @@ def push_open_positions_to_sheet():
             ws = ss.add_worksheet(title=tab, rows=200, cols=10)
         header = ["symbol","qty","avg_entry","current","pnl_pct","tp","sl","updated_at"]
         rows = [header]
-        positions = trading_client.get_all_positions()
+        positions = _broker_get_all_positions()
         now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         for p in positions:
             symbol = p.symbol
@@ -3844,7 +3962,7 @@ def start_eod_close_thread():
                     if equity >= 25000:
                         time.sleep(60)
                         continue
-                    positions = trading_client.get_all_positions()
+    positions = _broker_get_all_positions()
                     if not positions:
                         print("🌙 EOD flush: no open positions to manage.")
                         time.sleep(60)
@@ -3925,7 +4043,7 @@ def start_order_janitor():
         print(f"🧹 Order janitor running every {ORDER_JANITOR_INTERVAL}s …")
         while True:
             try:
-                pos_symbols = {p.symbol for p in trading_client.get_all_positions()}
+                pos_symbols = {getattr(p, "symbol", "") for p in _broker_get_all_positions()}
                 req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
                 open_orders = trading_client.get_orders(filter=req)
                 cancelled = 0
@@ -3981,7 +4099,7 @@ def _run_weekly_flush_once() -> dict:
     summary = {"closed": [], "failed": [], "skipped": []}
     print("🧼 Monday auto-flush starting — assessing open positions…")
     try:
-        positions = trading_client.get_all_positions()
+        positions = _broker_get_all_positions()
     except Exception as e:
         msg = f"⚠️ Weekly flush could not load positions: {e}"
         print(msg)
@@ -4143,7 +4261,7 @@ def _check_overnight_protection():
         window_start = market_close_utc - timedelta(minutes=5)
         if window_start <= now_utc <= market_close_utc:
             try:
-                positions = trading_client.get_all_positions()
+                positions = _broker_get_all_positions()
             except Exception as fetch_err:
                 print(f"⚠️ Overnight protection: position fetch failed: {fetch_err}")
                 return
@@ -4166,11 +4284,14 @@ def _check_overnight_protection():
 
 
 def start_auto_sell_monitor():
+    if IS_IBKR:
+        print("ℹ️ Auto-sell monitor is not enabled for IBKR broker mode.")
+        return
     def monitor():
         while True:
             try:
                 # Add a timeout to the API call
-                positions = trading_client.get_all_positions()
+                positions = _broker_get_all_positions()
                 active_symbols = {p.symbol for p in positions}
                 _prune_symbol_peak_cache(active_symbols)
 
@@ -4342,8 +4463,8 @@ def log_trade(
 
                 if "equity" in recent_df.columns:
                     prev_equity = float(recent_df.iloc[-1].get("equity", 0))
-                    account = trading_client.get_account()
-                    current_equity = float(account.equity)
+                    account = _safe_get_account(timeout=2.0)
+                    current_equity = float(getattr(account, "equity", getattr(account, "portfolio_value", 0)) or 0)
                     context_equity_change = "gain" if current_equity > prev_equity else "loss"
     except Exception as e:
         print("⚠️ Failed to fetch recent outcome context:", e)
@@ -4420,10 +4541,11 @@ def log_trade(
 def _get_available_qty(symbol: str) -> float:
     """Return qty_available for an open position, or 0 if none."""
     try:
-        positions = trading_client.get_all_positions()
+        positions = _broker_get_all_positions()
         for p in positions:
-            if p.symbol.upper() == symbol.upper():
-                return float(getattr(p, "qty_available", getattr(p, "qty", "0")))
+            if getattr(p, "symbol", "").upper() == symbol.upper():
+                qty_attr = getattr(p, "qty_available", getattr(p, "qty", "0"))
+                return float(qty_attr or 0)
         return 0.0
     except Exception as e:
         print(f"⚠️ Could not fetch positions: {e}")
@@ -4431,6 +4553,9 @@ def _get_available_qty(symbol: str) -> float:
 
 def close_position_if_needed(symbol: str, reason: str) -> bool:
     """Safely close a position if qty is available. Returns True if order was submitted."""
+    if IS_IBKR:
+        return close_position_safely(symbol, close_reason=reason)
+
     now = monotonic()
     last = _get_last_close_attempt_ts(symbol)
     if last is not None and (now - last) < _CLOSE_COOLDOWN_SEC:
@@ -4474,6 +4599,10 @@ def place_split_protection(
     If qty_available is not yet free (e.g., BUY leg still settling), return False so
     callers can retry shortly.
     """
+    if IS_IBKR:
+        print(f"ℹ️ IBKR: split protection handled via adapter for {symbol}.")
+        return True
+
     # 0) Cancel any existing SELLs to avoid qty conflicts
     try:
         n = cancel_open_sells(symbol)
@@ -4498,7 +4627,7 @@ def place_split_protection(
     except Exception:
         # Fallback to position price if available
         try:
-            pos = [p for p in trading_client.get_all_positions() if p.symbol.upper() == symbol.upper()]
+            pos = [p for p in _broker_get_all_positions() if p.symbol.upper() == symbol.upper()]
             if pos:
                 last_px = float(pos[0].current_price)
         except Exception:
