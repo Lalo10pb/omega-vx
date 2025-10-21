@@ -57,6 +57,11 @@ def get_trading_client() -> TradingClient:
     base_url = config.get_env("APCA_API_BASE_URL")
     if base_url:
         kwargs["url_override"] = base_url
+    LOGGER.info(
+        "Creating trading client (paper=%s) with key prefix %s…",
+        kwargs.get("paper"),
+        key[:6] + "***" if key else "none",
+    )
     return TradingClient(key, secret, **kwargs)
 
 
@@ -70,6 +75,7 @@ def get_data_client() -> StockHistoricalDataClient:
     data_url = _resolve_data_url_override()
     if data_url:
         LOGGER.info("Using Alpaca data endpoint %s", data_url)
+    LOGGER.info("Creating data client with key prefix %s…", key[:6] + "***" if key else "none")
     return StockHistoricalDataClient(key, secret, url_override=data_url)
 
 
