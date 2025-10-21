@@ -3254,38 +3254,36 @@ def submit_order_with_retries(
             except Exception:
                 buy_fill_price = None
         except Exception as e:
-        alert_needed = True
-        fallback_attempted = False
-        if _is_pattern_day_trading_error(e):
-            if not _is_market_open_now():
-                print(f"⚠️ BUY rejected for {symbol}: market closed (ignoring PDT lockout). Error: {e}")
-                alert_needed = False
+            alert_needed = True
+            if _is_pattern_day_trading_error(e):
+                if not _is_market_open_now():
+                    print(f"⚠️ BUY rejected for {symbol}: market closed (ignoring PDT lockout). Error: {e}")
+                    alert_needed = False
+                else:
+                    _set_pdt_global_lockout(f"BUY denied for {symbol}")
+                    _log_pdt_status(f"buy-denied:{symbol}")
+                    if ALLOW_PLAIN_BUY_FALLBACK:
+                        buy_order, buy_fill_price = _submit_plain_buy_with_manual_protection(
+                            symbol,
+                            qty,
+                            entry,
+                            abs_sl,
+                            abs_tp,
+                            use_trailing=use_trailing,
+                        )
+                        if buy_order:
+                            plain_fallback_used = True
+                            alert_needed = False
+            if plain_fallback_used:
+                print(f"✅ Plain BUY fallback succeeded for {symbol}.")
             else:
-                _set_pdt_global_lockout(f"BUY denied for {symbol}")
-                _log_pdt_status(f"buy-denied:{symbol}")
-                if ALLOW_PLAIN_BUY_FALLBACK:
-                    fallback_attempted = True
-                    buy_order, buy_fill_price = _submit_plain_buy_with_manual_protection(
-                        symbol,
-                        qty,
-                        entry,
-                        abs_sl,
-                        abs_tp,
-                        use_trailing=use_trailing,
-                    )
-                    if buy_order:
-                        plain_fallback_used = True
-                        alert_needed = False
-        if plain_fallback_used:
-            print(f"✅ Plain BUY fallback succeeded for {symbol}.")
-        else:
-            print("🧨 BUY submit failed:", e)
-            if alert_needed:
-                try:
-                    send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
-                except Exception:
-                    pass
-            return False
+                print("🧨 BUY submit failed:", e)
+                if alert_needed:
+                    try:
+                        send_telegram_alert(f"❌ BUY failed for {symbol}: {e}")
+                    except Exception:
+                        pass
+                return False
     if plain_fallback_used:
         print(f"✅ BUY placed for {symbol} via plain order (manual TP/SL).")
     else:
