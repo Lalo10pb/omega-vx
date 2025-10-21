@@ -38,14 +38,11 @@ def _resolve_data_url_override() -> Optional[str]:
     """
     Determine the appropriate base URL for Alpaca market data calls.
 
-    Prefers an explicit APCA_DATA_BASE_URL env var, falling back to the sandbox
-    endpoint automatically when we are operating in paper mode.
+    Prefers an explicit APCA_DATA_BASE_URL env var.
     """
     override = config.get_env("APCA_DATA_BASE_URL")
     if override:
         return override
-    if _resolve_paper_mode():
-        return "https://data.sandbox.alpaca.markets"
     return None
 
 
