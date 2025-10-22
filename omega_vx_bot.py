@@ -9,7 +9,7 @@ import threading
 import requests
 import subprocess
 import sys
-from typing import Optional, Set, Tuple, Iterable
+from typing import Optional, Set, Tuple, Iterable, Dict, List
 from types import SimpleNamespace
 from datetime import datetime, timedelta, time as dt_time, timezone
 import numpy as np
@@ -125,6 +125,9 @@ PDT_SYMBOL_LOCK_SECONDS = max(0, _int_env("PDT_SYMBOL_LOCK_SECONDS", 600))
 PDT_ALERT_COOLDOWN_SECONDS = max(0, _int_env("PDT_ALERT_COOLDOWN_SECONDS", 300))
 PDT_STATUS_CACHE_SECONDS = max(5, _int_env("PDT_STATUS_CACHE_SECONDS", 60))
 PDT_LOCAL_LOCK_SECONDS = max(0, _int_env("PDT_LOCAL_LOCK_SECONDS", 120))
+PDT_REARM_MAX_ATTEMPTS = max(1, _int_env("PDT_REARM_MAX_ATTEMPTS", 2))
+PDT_REARM_BLOCK_SECONDS = max(60, _int_env("PDT_REARM_BLOCK_SECONDS", 900))
+PDT_REARM_ALERT_COOLDOWN = max(60, _int_env("PDT_REARM_ALERT_COOLDOWN", 1800))
 ALLOW_PLAIN_BUY_FALLBACK = _bool_env("ALLOW_PLAIN_BUY_FALLBACK", "1")
 CANDIDATE_LOG_PATH = _clean_env(os.getenv("CANDIDATE_LOG_PATH", ""))
 CANDIDATE_LOG_ENABLED = bool(CANDIDATE_LOG_PATH)
@@ -146,6 +149,13 @@ CANDIDATE_LOG_FIELDS = [
 ]
 _CANDIDATE_LOG_LOCK = threading.Lock()
 MIN_TRADE_QTY = 1
+AUTOSCAN_DEBUG_TAB = _clean_env(os.getenv("AUTOSCAN_DEBUG_TAB", "Autoscan Debug"))
+AUTOSCAN_DEBUG_MAX_ROWS = max(5, _int_env("AUTOSCAN_DEBUG_MAX_ROWS", 25))
+
+DATA_RETRY_MAX_ATTEMPTS = max(1, _int_env("DATA_RETRY_MAX_ATTEMPTS", 3))
+DATA_RETRY_BASE_DELAY = max(0.1, _float_env("DATA_RETRY_BASE_DELAY", 0.75))
+SHEETS_RETRY_MAX_ATTEMPTS = max(1, _int_env("SHEETS_RETRY_MAX_ATTEMPTS", 3))
+SHEETS_RETRY_BASE_DELAY = max(0.2, _float_env("SHEETS_RETRY_BASE_DELAY", 1.0))
 
 # --- Patch 4.16-D: Dynamic PDT Utilization ---
 DAYTRADE_LOG_PATH = os.getenv("DAYTRADE_LOG_PATH", "logs/daytrade_log.csv")
@@ -305,6 +315,19 @@ def _log_candidate_event(symbol: str, stage: str, reason: str = "", **metrics) -
                 writer.writerow(row)
     except Exception as log_err:
         print(f"⚠️ Candidate log write failed for {symbol}: {log_err}")
+
+
+def _with_sheet_retry(description: str, func, default=None):
+    try:
+        return _retry_operation(
+            description,
+            func,
+            max_attempts=SHEETS_RETRY_MAX_ATTEMPTS,
+            base_delay=SHEETS_RETRY_BASE_DELAY,
+        )
+    except Exception as exc:
+        print(f"⚠️ {description} failed: {exc}")
+        return default
 
 def _check_daily_trade_cap():
     global _DAILY_TRADE_COUNT, _DAILY_TRADE_DATE
@@ -478,21 +501,57 @@ def _handle_thread_exception(thread_name: str, exc: Exception) -> Tuple[bool, bo
                 pass
             alert_sent = True
     return False, alert_sent
+
+
+def _retry_operation(
+    description: str,
+    func,
+    max_attempts: int,
+    base_delay: float,
+    exceptions: Tuple[type, ...] = (Exception,),
+    log: bool = True,
+):
+    """
+    Execute `func` with exponential backoff. Raises the last exception if all attempts fail.
+    """
+    attempt = 1
+    while True:
+        try:
+            return func()
+        except exceptions as exc:
+            if attempt >= max_attempts:
+                if log:
+                    print(f"❌ {description} failed after {attempt} attempt(s): {exc}")
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            if log:
+                print(f"⚠️ {description} attempt {attempt} failed: {exc} — retrying in {delay:.1f}s")
+            time.sleep(delay)
+            attempt += 1
 def _fetch_data_with_fallback(request_function, symbol, feed=_DATA_FEED):
     """Fetches data using the given request function, with fallback to IEX if permission errors occur."""
+
+    def _call(target_feed):
+        label = getattr(target_feed, "value", str(target_feed))
+        return _retry_operation(
+            f"{symbol} data fetch ({label})",
+            lambda: request_function(feed=target_feed),
+            max_attempts=DATA_RETRY_MAX_ATTEMPTS,
+            base_delay=DATA_RETRY_BASE_DELAY,
+        )
+
     try:
-        return request_function(feed=feed)
+        return _call(feed)
     except Exception as e:
         if "subscription does not permit" in str(e).lower() and feed != DataFeed.IEX:
             print(f"ℹ️ Falling back to IEX for {symbol} due to feed permission.")
             try:
-                return request_function(feed=DataFeed.IEX)
+                return _call(DataFeed.IEX)
             except Exception as e2:
                 print(f"❌ Data fetch failed for {symbol} (IEX fallback): {e2}")
                 return None
-        else:
-            print(f"❌ Data fetch failed for {symbol}: {e}")
-            return None
+        print(f"❌ Data fetch failed for {symbol}: {e}")
+        return None
 
 # === Logging ===
 CRASH_LOG_FILE = os.path.join(LOG_DIR, "last_boot.txt")
@@ -726,6 +785,10 @@ _PDT_LOCKOUT_SEC = PDT_SYMBOL_LOCK_SECONDS or 600
 _pdt_lockouts = {}
 _last_close_attempt_lock = threading.Lock()
 _pdt_lockouts_lock = threading.Lock()
+_PDT_REARM_LOCK = threading.Lock()
+_PDT_REARM_BLOCKS: Dict[str, Dict[str, float]] = {}
+_DIGEST_LOCK = threading.Lock()
+_DIGEST_STATS: Dict[str, int] = {}
 
 _VIX_CACHE = {"value": None, "source": "unknown", "timestamp": 0.0}
 _VIX_CACHE_TTL = max(30, _int_env("VIX_CACHE_SECONDS", 180))
@@ -743,6 +806,99 @@ def _get_last_close_attempt_ts(symbol: str) -> float:
 def _set_last_close_attempt_ts(symbol: str, timestamp: float) -> None:
     with _last_close_attempt_lock:
         _last_close_attempt[symbol] = timestamp
+
+
+def _digest_increment(field: str, amount: int = 1) -> None:
+    if amount <= 0:
+        return
+    with _DIGEST_LOCK:
+        _DIGEST_STATS[field] = _DIGEST_STATS.get(field, 0) + amount
+
+
+def _digest_snapshot(reset: bool = False) -> Dict[str, int]:
+    with _DIGEST_LOCK:
+        snapshot = dict(_DIGEST_STATS)
+        if reset:
+            _DIGEST_STATS.clear()
+        return snapshot
+
+
+def _format_daily_digest_message(date_label: str, stats: Dict[str, int]) -> Optional[str]:
+    if not stats:
+        return None
+    trades = stats.get("trades_executed", 0)
+    pdt_blocks = stats.get("pdt_guard_blocks", 0)
+    rearm_blocks = stats.get("pdt_rearm_blocks", 0)
+    cap_skips = stats.get("position_cap_skips", 0)
+    if not any([trades, pdt_blocks, rearm_blocks, cap_skips]):
+        return None
+    lines = [
+        f"📝 Omega daily digest ({date_label})",
+        f"• Trades executed: {trades}",
+        f"• PDT guard blocks: {pdt_blocks}",
+        f"• PDT re-arm blocks: {rearm_blocks}",
+        f"• Position-cap skips: {cap_skips}",
+    ]
+    return "\n".join(lines)
+
+
+def _pdt_rearm_block_active(symbol: str) -> bool:
+    """Return True when a PDT re-arm cooldown is active for the given symbol."""
+    key = symbol.upper()
+    now = monotonic()
+    with _PDT_REARM_LOCK:
+        data = _PDT_REARM_BLOCKS.get(key)
+        if not data:
+            return False
+        blocked_until = float(data.get("blocked_until", 0.0) or 0.0)
+        if now >= blocked_until:
+            data["attempts"] = 0
+            data["blocked_until"] = 0.0
+            data["next_alert"] = 0.0
+            return False
+        if now >= float(data.get("next_alert", 0.0) or 0.0):
+            remaining = int(max(0.0, blocked_until - now))
+            msg = f"⚠️ Protection guardian: PDT cooldown active for {key} ({remaining}s)."
+            print(msg)
+            _digest_increment("pdt_rearm_blocks")
+            try:
+                send_telegram_alert(msg)
+            except Exception:
+                pass
+            data["next_alert"] = now + PDT_REARM_ALERT_COOLDOWN
+        return True
+
+
+def _pdt_rearm_register_fail(symbol: str) -> None:
+    """Track repeated PDT re-arm failures and activate cooldown when threshold reached."""
+    key = symbol.upper()
+    now = monotonic()
+    trigger_cooldown = False
+    with _PDT_REARM_LOCK:
+        data = _PDT_REARM_BLOCKS.setdefault(
+            key,
+            {"attempts": 0, "blocked_until": 0.0, "next_alert": 0.0},
+        )
+        data["attempts"] = int(data.get("attempts", 0) or 0) + 1
+        _digest_increment("pdt_rearm_blocks")
+        if data["attempts"] >= PDT_REARM_MAX_ATTEMPTS:
+            data["attempts"] = 0
+            data["blocked_until"] = now + PDT_REARM_BLOCK_SECONDS
+            data["next_alert"] = now
+            trigger_cooldown = True
+            remaining = int(PDT_REARM_BLOCK_SECONDS)
+    if trigger_cooldown:
+        msg = f"⚠️ Protection guardian: PDT denied re-arm for {key}. Cooling down {remaining}s."
+        print(msg)
+        try:
+            send_telegram_alert(msg)
+        except Exception:
+            pass
+
+
+def _pdt_rearm_clear(symbol: str) -> None:
+    with _PDT_REARM_LOCK:
+        _PDT_REARM_BLOCKS.pop(symbol.upper(), None)
 
 _PDT_GLOBAL_LOCKOUT_UNTIL = 0.0
 _PDT_LAST_ALERT_MONO = 0.0
@@ -1664,7 +1820,11 @@ def get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchl
                 f"Worksheet '{tab_name}' not found. Available tabs: {tabs}. Error: {type(e_ws).__name__}: {e_ws}"
             )
 
-        symbols = ws.col_values(1)
+        symbols = _with_sheet_retry(
+            f"fetch watchlist column '{tab_name}'",
+            lambda: ws.col_values(1),
+            default=[],
+        )
         out = []
         for s in symbols:
             s = (s or "").strip().upper()
@@ -2250,6 +2410,7 @@ def _best_candidate_from_watchlist(symbols):
     Symbols passing the filters are scored to break ties.
     """
     ranked = []
+    diagnostics: List[Dict[str, object]] = []
     today = datetime.now().date()
     try:
         current_positions = _broker_get_all_positions()
@@ -2274,12 +2435,23 @@ def _best_candidate_from_watchlist(symbols):
             if record and record.get("date") == today and not has_open_position(s, current_positions):
                 print(f"🚫 Skipping {s}: already traded today (single-entry mode).")
                 _log_candidate_event(s, "skip", "already_traded_today")
+                diagnostics.append(
+                    {"symbol": s, "stage": "skip", "reason": "already_traded_today", "metrics": {}}
+                )
                 continue
             # --- Fetch bars for volume/volatility filter ---
             bars = get_bars(s, interval='15m', lookback=70)
             if bars is None or 'volume' not in bars.columns or len(bars) < 5:
                 print(f"⚠️ Skipping {s}: insufficient volume data.")
                 _log_candidate_event(s, "skip", "insufficient_volume_data")
+                diagnostics.append(
+                    {
+                        "symbol": s,
+                        "stage": "skip",
+                        "reason": "insufficient_volume_data",
+                        "metrics": {},
+                    }
+                )
                 continue
             closes = bars['close'].astype(float)
             avg_vol = float(bars['volume'].tail(20).mean())
@@ -2293,6 +2465,17 @@ def _best_candidate_from_watchlist(symbols):
                     "volume_volatility_filter",
                     avg_volume=int(avg_vol),
                     volatility_pct=round(volatility, 3),
+                )
+                diagnostics.append(
+                    {
+                        "symbol": s,
+                        "stage": "skip",
+                        "reason": "volume_volatility_filter",
+                        "metrics": {
+                            "avg_volume": int(avg_vol),
+                            "volatility_pct": round(volatility, 3),
+                        },
+                    }
                 )
                 continue
             price, ema_short, ema_long = _compute_ema_metrics(bars.tail(60))
@@ -2319,6 +2502,14 @@ def _best_candidate_from_watchlist(symbols):
             if not ema_ok:
                 print(f"🚫 Skipping {s}: EMA trend filter failed (tol ±{EMA_TOLERANCE*100:.2f}%).")
                 _log_candidate_event(s, "skip", "ema_filter", **metrics_payload)
+                diagnostics.append(
+                    {
+                        "symbol": s,
+                        "stage": "skip",
+                        "reason": "ema_filter",
+                        "metrics": metrics_payload.copy(),
+                    }
+                )
                 continue
             # --- MTF and RSI scoring ---
             mtf_bull = is_multi_timeframe_confirmed(s)
@@ -2328,6 +2519,14 @@ def _best_candidate_from_watchlist(symbols):
             if rsi is None or rsi < RSI_MIN_BAND or rsi > RSI_MAX_BAND:
                 print(f"🚫 Skipping {s}: RSI {rsi} outside {RSI_MIN_BAND}-{RSI_MAX_BAND}.")
                 _log_candidate_event(s, "skip", "rsi_filter", **metrics_payload)
+                diagnostics.append(
+                    {
+                        "symbol": s,
+                        "stage": "skip",
+                        "reason": "rsi_filter",
+                        "metrics": metrics_payload.copy(),
+                    }
+                )
                 continue
             score = 0
             if mtf_bull:
@@ -2379,6 +2578,15 @@ def _best_candidate_from_watchlist(symbols):
             )
             metrics_payload["score"] = score
             _log_candidate_event(s, "scored", "", **metrics_payload)
+            diagnostics.append(
+                {
+                    "symbol": s,
+                    "stage": "scored",
+                    "reason": "",
+                    "metrics": metrics_payload.copy(),
+                    "notes": "penalty:volume-only" if volume_only_penalty else "",
+                }
+            )
             ranked.append((score, s, metrics_payload.copy()))
         except Exception as e:
             print(f"⚠️ scoring {sym} failed: {e}")
@@ -2386,13 +2594,29 @@ def _best_candidate_from_watchlist(symbols):
                 _log_candidate_event(s, "error", str(e))
             except Exception:
                 pass
+            diagnostics.append(
+                {
+                    "symbol": s,
+                    "stage": "error",
+                    "reason": str(e),
+                    "metrics": {},
+                }
+            )
             continue
     ranked.sort(key=lambda x: x[0], reverse=True)
     if ranked and ranked[0][0] > 0:
         top_score, top_symbol, top_payload = ranked[0]
         _log_candidate_event(top_symbol, "selected", "", **top_payload)
-        return top_symbol
-    return None
+        diagnostics.append(
+            {
+                "symbol": top_symbol,
+                "stage": "selected",
+                "reason": "",
+                "metrics": top_payload.copy(),
+            }
+        )
+        return top_symbol, diagnostics
+    return None, diagnostics
 
 def _compute_entry_tp_sl(symbol: str):
     """
@@ -2427,6 +2651,7 @@ def autoscan_once():
         print(f"🧮 Open positions: {_open_positions_count()} / Max allowed: {get_dynamic_max_open_positions()}")
         if _open_positions_count() >= get_dynamic_max_open_positions():
             print(f"⛔ Position cap reached ({get_dynamic_max_open_positions()}).")
+            _digest_increment("position_cap_skips")
             return False
 
         # read watchlist
@@ -2438,7 +2663,11 @@ def autoscan_once():
         _auto_adjust_filters_by_vix()
 
         # pick a candidate
-        sym = _best_candidate_from_watchlist(watch)
+        sym, diagnostics = _best_candidate_from_watchlist(watch)
+        try:
+            push_autoscan_debug_to_sheet(diagnostics)
+        except Exception as diag_err:
+            print(f"⚠️ Autoscan diagnostics push failed: {diag_err}")
         if not sym:
             print("ℹ️ No positive‑score candidate right now.")
             return False
@@ -3009,6 +3238,7 @@ def submit_order_with_retries(
         remaining = _pdt_global_lockout_remaining()
         msg = f"⏳ PDT lockout active ({remaining}s) — skipping BUY {symbol}."
         _maybe_alert_pdt(msg)
+        _digest_increment("pdt_guard_blocks")
         return False
 
     # 🚦 Extra PDT guard: block BUY if we likely can't close safely.
@@ -3028,6 +3258,7 @@ def submit_order_with_retries(
                     send_telegram_alert(msg)
                 except Exception:
                     pass
+                _digest_increment("pdt_guard_blocks")
                 return False
             else:
                 LOGGER.info(
@@ -3044,6 +3275,7 @@ def submit_order_with_retries(
                     send_telegram_alert(f"📊 PDT Status: {rem} day trades left | PDT flag={pattern_flag}")
                 except Exception:
                     pass
+                _digest_increment("pdt_guard_blocks")
                 return False
 
     # --- Per-symbol daily trade guard ---
@@ -3112,6 +3344,7 @@ def submit_order_with_retries(
                 msg = f"🛑 Abort {symbol} — remaining day trades {rem} at/under buffer."
                 print(msg)
                 _maybe_alert_pdt(msg, day_trades_left=rem, pattern_flag=pattern_flag)
+                _digest_increment("pdt_guard_blocks")
                 return False
 
         # If margin account, prefer broker-reported BP; otherwise take the max available cash-like field.
@@ -3310,6 +3543,7 @@ def submit_order_with_retries(
     except Exception: pass
 
     print(f"✅ Order + protection finished for {symbol}.")
+    _digest_increment("trades_executed")
 
     # Track per-symbol trade count for re-entry guard
     today = datetime.now().date()
@@ -3370,7 +3604,10 @@ def log_portfolio_snapshot():
                 raise ValueError("Missing GOOGLE_SHEET_ID or PORTFOLIO_SHEET_NAME environment variable.")
 
             sheet = client.open_by_key(sheet_id).worksheet(sheet_name)
-            sheet.append_row(row)
+            _with_sheet_retry(
+                f"append snapshot row to '{sheet_name}'",
+                lambda: sheet.append_row(row),
+            )
             print("✅ Snapshot logged to Google Sheet.")
 
         except Exception as gs_error:
@@ -3552,12 +3789,18 @@ def append_daily_performance_row(metrics: dict, sheet_id: str = None, tab_name: 
             "Date","Total Realized PnL","Trades Closed","Wins","Losses",
             "Win Rate %","Avg Win","Avg Loss","Best","Worst"
         ]
-        try:
-            existing = ws.get_all_values()[:1]
-        except Exception:
-            existing = []
+        existing = _with_sheet_retry(
+            f"fetch header for sheet '{tab}'",
+            ws.get_all_values,
+            default=[],
+        )
+        if existing:
+            existing = existing[:1]
         if not existing:
-            ws.update(values=[header], range_name='A1')
+            _with_sheet_retry(
+                f"initialize sheet '{tab}' header",
+                lambda: ws.update(values=[header], range_name='A1'),
+            )
         row = [
             metrics.get('date'),
             f"{metrics.get('total_realized_pnl', 0.0):.2f}",
@@ -3570,7 +3813,10 @@ def append_daily_performance_row(metrics: dict, sheet_id: str = None, tab_name: 
             f"{metrics.get('best', 0.0):.2f}",
             f"{metrics.get('worst', 0.0):.2f}",
         ]
-        ws.append_row(row)
+        _with_sheet_retry(
+            f"append daily performance row to '{tab}'",
+            lambda: ws.append_row(row),
+        )
         print("✅ Appended daily performance row.")
     except Exception as e:
         print(f"⚠️ Failed to append performance row: {e}")
@@ -3603,11 +3849,11 @@ def update_google_performance_sheet(metrics: dict, sheet_id: str = None, tab_nam
             ["Best Trade", f"{metrics.get('best', 0.0):.2f}"],
             ["Worst Trade", f"{metrics.get('worst', 0.0):.2f}"],
         ]
-        try:
-            ws.clear()
-        except Exception:
-            pass
-        ws.update(values=rows, range_name='A1')
+        _with_sheet_retry(f"clear sheet '{tab}'", ws.clear)
+        _with_sheet_retry(
+            f"update sheet '{tab}'",
+            lambda: ws.update(values=rows, range_name='A1'),
+        )
         print("✅ Performance sheet updated.")
     except Exception as e:
         print(f"⚠️ Failed to update performance sheet: {e}")
@@ -3799,6 +4045,9 @@ def _ensure_protection_for_all_open_positions() -> bool:
                 print(f"⚠️ Protection guardian: invalid computed SL/TP for {symbol}; skipping re-arm.")
                 continue
 
+            if _pdt_rearm_block_active(symbol):
+                continue
+
             if existing:
                 try:
                     cancelled = cancel_open_sells(symbol)
@@ -3824,13 +4073,18 @@ def _ensure_protection_for_all_open_positions() -> bool:
                 )
                 trading_client.submit_order(order_data=oco_request)
                 print(f"🛡️ Protection guardian re-armed {symbol}: qty={qty} SL={sl_price:.2f} TP={tp_price:.2f}")
+                _pdt_rearm_clear(symbol)
                 rearmed = True
             except APIError as api_err:
                 if "insufficient qty" in str(api_err).lower():
                     print(f"⚠️ Protection guardian: skip re-arm — position already protected ({symbol}).")
                     continue
+                if _is_pattern_day_trading_error(api_err):
+                    _pdt_rearm_register_fail(symbol)
                 print(f"⚠️ Protection guardian: re-arm submit failed for {symbol}: {api_err}")
             except Exception as submit_err:
+                if _is_pattern_day_trading_error(submit_err):
+                    _pdt_rearm_register_fail(symbol)
                 print(f"⚠️ Protection guardian: re-arm submit failed for {symbol}: {submit_err}")
 
         if not rearmed:
@@ -3914,14 +4168,75 @@ def push_open_positions_to_sheet():
             pnl_pct = float(p.unrealized_plpc) * 100.0
             tp, sl = get_symbol_tp_sl_open_orders(symbol)
             rows.append([symbol, qty, round(avg_entry,2), round(current,2), round(pnl_pct,2), tp, sl, now])
-        try:
-            ws.clear()
-        except Exception:
-            pass
-        ws.update(values=rows, range_name='A1')
+        _with_sheet_retry(f"clear sheet '{tab}'", ws.clear)
+        _with_sheet_retry(
+            f"update sheet '{tab}'",
+            lambda: ws.update(values=rows, range_name='A1'),
+        )
         print(f"✅ Open positions pushed ({len(rows)-1} rows).")
     except Exception as e:
         print(f"⚠️ Open positions push failed: {e}")
+
+
+def push_autoscan_debug_to_sheet(entries: List[Dict[str, object]]) -> None:
+    """Publish the latest autoscan decision trail to a dedicated Google Sheet tab."""
+    if not entries:
+        return
+    sheet_id = _clean_env(os.getenv("GOOGLE_SHEET_ID"))
+    if not sheet_id:
+        return
+    tab_name = AUTOSCAN_DEBUG_TAB or "Autoscan Debug"
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    rows = [
+        [
+            "timestamp",
+            "symbol",
+            "stage",
+            "reason",
+            "score",
+            "rsi",
+            "ema_diff_pct",
+            "avg_volume",
+            "volatility_pct",
+            "notes",
+        ]
+    ]
+    for entry in entries[:AUTOSCAN_DEBUG_MAX_ROWS]:
+        metrics = entry.get("metrics") or {}
+        notes_parts = []
+        if entry.get("notes"):
+            notes_parts.append(str(entry["notes"]))
+        if metrics.get("volume_only_penalty"):
+            notes_parts.append("volume-only penalty")
+        rows.append(
+            [
+                timestamp,
+                entry.get("symbol"),
+                entry.get("stage"),
+                entry.get("reason"),
+                metrics.get("score", ""),
+                metrics.get("rsi", ""),
+                metrics.get("ema_diff_pct", ""),
+                metrics.get("avg_volume", ""),
+                metrics.get("volatility_pct", ""),
+                "; ".join(notes_parts),
+            ]
+        )
+    try:
+        client = get_gspread_client()
+        ss = client.open_by_key(sheet_id)
+        try:
+            ws = ss.worksheet(tab_name)
+        except Exception:
+            ws = ss.add_worksheet(title=tab_name, rows=200, cols=12)
+        _with_sheet_retry(f"clear sheet '{tab_name}'", ws.clear)
+        _with_sheet_retry(
+            f"update sheet '{tab_name}'",
+            lambda: ws.update("A1", rows),
+        )
+        print(f"📝 Autoscan debug sheet updated with {len(rows)-1} rows.")
+    except Exception as e:
+        print(f"⚠️ Autoscan debug sheet update failed: {e}")
 
 
 def start_open_positions_pusher():
@@ -4013,6 +4328,14 @@ def start_eod_summary_scheduler():
                         )
                     except Exception:
                         pass
+                    digest_stats = _digest_snapshot(reset=True)
+                    digest_msg = _format_daily_digest_message(metrics['date'], digest_stats)
+                    if digest_msg:
+                        print(digest_msg)
+                        try:
+                            send_telegram_alert(digest_msg)
+                        except Exception:
+                            pass
                     try:
                         with open(last_file, 'w') as f:
                             f.write(now.strftime('%Y-%m-%d'))
