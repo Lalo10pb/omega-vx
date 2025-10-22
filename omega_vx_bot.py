@@ -119,6 +119,8 @@ MAX_OPEN_POSITIONS_HIGH_EQUITY = _int_env("MAX_OPEN_POSITIONS_HIGH_EQUITY", 3)
 DAILY_TRADE_CAP = _int_env("DAILY_TRADE_CAP", 0)
 EQUITY_DRAWDOWN_MAX_PCT = _float_env("EQUITY_DRAWDOWN_MAX_PCT", 0.0) / 100.0
 PDT_GUARD_ENABLED = _bool_env("PDT_GUARD_ENABLED", "1")
+PDT_AUTO_ENABLE_UNDER_THRESHOLD = _bool_env("PDT_AUTO_ENABLE_UNDER_THRESHOLD", "1")
+PDT_LOW_EQUITY_THRESHOLD = _float_env("PDT_LOW_EQUITY_THRESHOLD", 25000.0)
 PDT_MIN_DAY_TRADES_BUFFER = max(0, _int_env("PDT_MIN_DAY_TRADES_BUFFER", 0))
 PDT_GLOBAL_LOCK_SECONDS = max(0, _int_env("PDT_GLOBAL_LOCK_SECONDS", 900))
 PDT_SYMBOL_LOCK_SECONDS = max(0, _int_env("PDT_SYMBOL_LOCK_SECONDS", 600))
@@ -908,6 +910,45 @@ _PDT_RESET_LOCK = threading.Lock()
 _PDT_MISSING_DAY_TRADES_WARNED = False
 _PDT_BYPASS_ACTIVE = False
 _PDT_BYPASS_LOGGED = False
+_PDT_AUTO_FORCED = False
+
+
+def _ensure_pdt_auto_activation(account=None) -> bool:
+    """Auto-enable PDT guard for low-equity accounts when configured."""
+    global _PDT_AUTO_FORCED
+    if PDT_GUARD_ENABLED:
+        if _PDT_AUTO_FORCED:
+            _PDT_AUTO_FORCED = False
+        return False
+    if not PDT_AUTO_ENABLE_UNDER_THRESHOLD:
+        return False
+    if account is None:
+        account = _safe_get_account(timeout=3.0)
+    if account is None:
+        return _PDT_AUTO_FORCED
+    try:
+        equity = float(getattr(account, "equity", 0) or 0)
+    except Exception:
+        equity = 0.0
+    threshold = float(PDT_LOW_EQUITY_THRESHOLD or 0.0)
+    if equity > 0 and threshold > 0 and equity < threshold:
+        if not _PDT_AUTO_FORCED:
+            print(
+                f"🔒 Account equity ${equity:,.2f} under ${threshold:,.0f} — auto-enabling PDT guard."
+            )
+        _PDT_AUTO_FORCED = True
+    else:
+        if _PDT_AUTO_FORCED:
+            print("ℹ️ Equity recovered above PDT threshold — PDT auto-guard released.")
+        _PDT_AUTO_FORCED = False
+    return _PDT_AUTO_FORCED
+
+
+def _is_pdt_guard_enabled() -> bool:
+    """Return True when PDT guard should be considered active."""
+    if PDT_GUARD_ENABLED:
+        return True
+    return _ensure_pdt_auto_activation()
 
 
 def _quantize_to_tick(price):
@@ -939,12 +980,15 @@ def _is_pattern_day_trading_error(err: Exception) -> bool:
 def _should_run_pdt_checks() -> bool:
     """Return True when PDT guard should enforce trading restrictions."""
     global _PDT_BYPASS_ACTIVE, _PDT_BYPASS_LOGGED
-    if not PDT_GUARD_ENABLED:
+    guard_active = _is_pdt_guard_enabled()
+    if not guard_active:
         if not _PDT_BYPASS_LOGGED:
             print("⚙️ PDT guard disabled via environment override.")
         _PDT_BYPASS_ACTIVE = True
         _PDT_BYPASS_LOGGED = True
         return False
+    _PDT_BYPASS_ACTIVE = False
+    _PDT_BYPASS_LOGGED = False
     if not _is_market_open_now():
         return False
     return True
@@ -1095,6 +1139,8 @@ def _update_day_trade_status_from_account(account) -> tuple:
             _DAY_TRADE_STATUS_CACHE.get("remaining"),
             _DAY_TRADE_STATUS_CACHE.get("is_pdt"),
         )
+    forced_active = _ensure_pdt_auto_activation(account)
+    guard_active = PDT_GUARD_ENABLED or forced_active
     try:
         margin_mult = float(getattr(account, "multiplier", 1) or 1)
     except Exception:
@@ -1106,7 +1152,7 @@ def _update_day_trade_status_from_account(account) -> tuple:
 
     is_cash_account = margin_mult <= 1
 
-    if not PDT_GUARD_ENABLED:
+    if not guard_active:
         remaining = 99
         is_pdt = False
         if not _PDT_BYPASS_LOGGED:
@@ -1156,7 +1202,7 @@ def _update_day_trade_status_from_account(account) -> tuple:
 
 
 def _get_day_trade_status() -> tuple:
-    if not PDT_GUARD_ENABLED:
+    if not _is_pdt_guard_enabled():
         return (None, None)
     now = monotonic()
     if now < _DAY_TRADE_STATUS_CACHE.get("expires", 0.0):
@@ -1175,7 +1221,7 @@ def _get_day_trade_status() -> tuple:
 
 
 def _pdt_global_lockout_remaining() -> int:
-    if not PDT_GUARD_ENABLED:
+    if not _is_pdt_guard_enabled():
         return 0
     if _PDT_BYPASS_ACTIVE:
         return 0
@@ -1280,7 +1326,7 @@ def _maybe_reset_pdt_state() -> None:
     """
     Reset PDT lockouts once per day before pre-market to avoid overnight carry-over.
     """
-    if not PDT_GUARD_ENABLED:
+    if not _is_pdt_guard_enabled():
         return
     tz = pytz.timezone("US/Eastern")
     now_et = datetime.now(tz)
@@ -1483,7 +1529,7 @@ def close_position_safely(symbol: str, *, session_type: str = "intraday", close_
         print(f"⚠️ IBKR close failed for {symbol}.")
         return False
 
-    if PDT_GUARD_ENABLED and _pdt_global_lockout_active():
+    if _is_pdt_guard_enabled() and _pdt_global_lockout_active():
         return False
     # Capture pre-close position details
     pre_qty = 0
