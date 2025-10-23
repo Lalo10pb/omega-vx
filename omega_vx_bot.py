@@ -9,7 +9,7 @@ import threading
 import requests
 import subprocess
 import sys
-from typing import Optional, Set, Tuple, Iterable, Dict, List
+from typing import Optional, Set, Tuple, Iterable, Dict, List, Any
 from types import SimpleNamespace
 from datetime import datetime, timedelta, time as dt_time, timezone
 import numpy as np
@@ -88,6 +88,22 @@ def _bool_env(name: str, default: str = "0") -> bool:
 OVERNIGHT_PROTECTION_ENABLED = bool(int(os.getenv("OVERNIGHT_PROTECTION_ENABLED", "1")))
 
 
+def _order_attr_text(value: Any) -> str:
+    """
+    Normalize Alpaca/IBKR order field values (which may be enums) to plain strings.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    raw = getattr(value, "value", None)
+    if isinstance(raw, str):
+        return raw
+    if raw is not None:
+        return str(raw)
+    return str(value)
+
+
 # --- Alpaca Data Feed selection (force IEX to avoid SIP permission errors) ---
 _DATA_FEED = DataFeed.IEX
 _log_boot("Alpaca data feed: iex (forced)")
@@ -134,6 +150,10 @@ ALLOW_PLAIN_BUY_FALLBACK = _bool_env("ALLOW_PLAIN_BUY_FALLBACK", "1")
 CANDIDATE_LOG_PATH = _clean_env(os.getenv("CANDIDATE_LOG_PATH", ""))
 CANDIDATE_LOG_ENABLED = bool(CANDIDATE_LOG_PATH)
 GUARDIAN_REARM_DELAY = max(0, _int_env("GUARDIAN_REARM_DELAY", 5))
+GUARDIAN_LOG_MODE = (_clean_env(os.getenv("GUARDIAN_LOG_MODE", "quiet") or "quiet")).lower()
+if GUARDIAN_LOG_MODE not in {"quiet", "verbose"}:
+    GUARDIAN_LOG_MODE = "quiet"
+GUARDIAN_LOG_VERBOSE = GUARDIAN_LOG_MODE == "verbose"
 CANDIDATE_LOG_FIELDS = [
     "timestamp",
     "symbol",
@@ -599,10 +619,10 @@ def print_protection_status():
                 open_orders = trading_client.get_orders(filter=req)
                 tp = sl = None
                 for o in open_orders:
-                    side = str(getattr(o, "side", "")).lower()
+                    side = _order_attr_text(getattr(o, "side", "")).strip().lower()
                     if side != "sell":
                         continue
-                    otype = str(getattr(o, "order_type", "")).lower()
+                    otype = _order_attr_text(getattr(o, "order_type", getattr(o, "type", ""))).strip().lower()
                     price = None
                     try:
                         price = float(getattr(o, "limit_price") or getattr(o, "stop_price") or 0)
@@ -1721,10 +1741,10 @@ def post_trade_protection_audit(symbol, entry_price, tp_price, sl_price):
         existing_sl = None
 
         for o in open_orders:
-            side = str(getattr(o, "side", "")).lower()
+            side = _order_attr_text(getattr(o, "side", "")).strip().lower()
             if side != "sell":
                 continue
-            otype = str(getattr(o, "order_type", "")).lower()
+            otype = _order_attr_text(getattr(o, "order_type", getattr(o, "type", ""))).strip().lower()
             price = float(getattr(o, "limit_price") or getattr(o, "stop_price") or 0)
             if otype == "limit" and price > 0:
                 existing_tp = price
@@ -4005,11 +4025,11 @@ def _ensure_protection_for_all_open_positions() -> bool:
                 symbol = ""
             if not symbol:
                 continue
-            side = str(getattr(order, "side", "")).lower()
-            if not side.endswith("sell"):
+            side = _order_attr_text(getattr(order, "side", "")).strip().lower()
+            if side != "sell":
                 continue
-            order_class = str(getattr(order, "order_class", "")).lower()
-            order_type = str(getattr(order, "order_type", getattr(order, "type", ""))).lower()
+            order_class = _order_attr_text(getattr(order, "order_class", "")).strip().lower()
+            order_type = _order_attr_text(getattr(order, "order_type", getattr(order, "type", ""))).strip().lower()
             bucket = protection_map.setdefault(symbol, set())
             if order_class in ("oco", "bracket"):
                 bucket.update({"tp", "sl"})
@@ -4020,6 +4040,10 @@ def _ensure_protection_for_all_open_positions() -> bool:
                 bucket.add("sl")
 
         rearmed = False
+        total_positions = 0
+        protected_count = 0
+        rearm_successes = 0
+        rearm_failures = 0
 
         for pos in positions:
             try:
@@ -4034,9 +4058,13 @@ def _ensure_protection_for_all_open_positions() -> bool:
                 qty = 0
             if qty <= 0:
                 continue
+            total_positions += 1
 
             existing = protection_map.get(symbol, set())
             if {"tp", "sl"}.issubset(existing):
+                protected_count += 1
+                if GUARDIAN_LOG_VERBOSE:
+                    print(f"⚠️ Guardian skip re-arm — position already protected ({symbol}).")
                 continue
 
             stored = state_map.get(symbol, {})
@@ -4118,23 +4146,34 @@ def _ensure_protection_for_all_open_positions() -> bool:
                     stop_loss=StopLossRequest(stop_price=sl_price),
                 )
                 trading_client.submit_order(order_data=oco_request)
-                print(f"🛡️ Protection guardian re-armed {symbol}: qty={qty} SL={sl_price:.2f} TP={tp_price:.2f}")
+                print(f"✅ Re-armed {symbol} x{qty} (TP={tp_price:.2f} / SL={sl_price:.2f})")
                 _pdt_rearm_clear(symbol)
                 rearmed = True
+                rearm_successes += 1
+                protected_count += 1
             except APIError as api_err:
                 if "insufficient qty" in str(api_err).lower():
-                    print(f"⚠️ Protection guardian: skip re-arm — position already protected ({symbol}).")
+                    if GUARDIAN_LOG_VERBOSE:
+                        print(f"⚠️ Guardian skip re-arm — position already protected ({symbol}).")
+                    protected_count += 1
                     continue
                 if _is_pattern_day_trading_error(api_err):
                     _pdt_rearm_register_fail(symbol)
-                print(f"⚠️ Protection guardian: re-arm submit failed for {symbol}: {api_err}")
+                print(f"⛔ Re-arm failed for {symbol}: {api_err}")
+                rearm_failures += 1
             except Exception as submit_err:
                 if _is_pattern_day_trading_error(submit_err):
                     _pdt_rearm_register_fail(symbol)
-                print(f"⚠️ Protection guardian: re-arm submit failed for {symbol}: {submit_err}")
+                print(f"⛔ Re-arm failed for {symbol}: {submit_err}")
+                rearm_failures += 1
 
-        if not rearmed:
-            print("🛡️ Protection guardian: all positions already protected.")
+        if total_positions:
+            summary = f"🛡️ Guardian sweep complete — {protected_count} protected / {total_positions} total."
+            if rearm_successes:
+                summary += f" ✅ {rearm_successes} re-armed."
+            if rearm_failures:
+                summary += f" ⛔ {rearm_failures} failed."
+            print(summary)
         return rearmed
     finally:
         _protection_guard_lock.release()
