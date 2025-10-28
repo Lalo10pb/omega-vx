@@ -3553,26 +3553,35 @@ def submit_order_with_retries(
             except Exception:
                 buy_fill_price = None
         except Exception as e:
-            alert_needed = True
             if _is_pattern_day_trading_error(e):
                 if not _is_market_open_now():
                     print(f"⚠️ BUY rejected for {symbol}: market closed (ignoring PDT lockout). Error: {e}")
-                    alert_needed = False
                 else:
                     _set_pdt_global_lockout(f"BUY denied for {symbol}")
                     _log_pdt_status(f"buy-denied:{symbol}")
-                    if ALLOW_PLAIN_BUY_FALLBACK:
-                        buy_order, buy_fill_price = _submit_plain_buy_with_manual_protection(
-                            symbol,
-                            qty,
-                            entry,
-                            abs_sl,
-                            abs_tp,
-                            use_trailing=use_trailing,
-                        )
-                        if buy_order:
-                            plain_fallback_used = True
-                            alert_needed = False
+                    msg = f"🚫 PDT guard active: BUY denied for {symbol}. Skipping trade."
+                    print(msg)
+                    _maybe_alert_pdt(msg)
+                    try:
+                        send_telegram_alert(msg)
+                    except Exception:
+                        pass
+                    _digest_increment("pdt_guard_blocks")
+                return False
+
+            alert_needed = True
+            if ALLOW_PLAIN_BUY_FALLBACK:
+                buy_order, buy_fill_price = _submit_plain_buy_with_manual_protection(
+                    symbol,
+                    qty,
+                    entry,
+                    abs_sl,
+                    abs_tp,
+                    use_trailing=use_trailing,
+                )
+                if buy_order:
+                    plain_fallback_used = True
+                    alert_needed = False
             if plain_fallback_used:
                 print(f"✅ Plain BUY fallback succeeded for {symbol}.")
             else:
@@ -3631,9 +3640,21 @@ def submit_order_with_retries(
 
     _increment_daily_trade_count()
     try:
-        log_trade(symbol, qty, entry, abs_sl, abs_tp, status="executed",
-                  action="BUY", fill_price=buy_fill_price, realized_pnl=None)
-        print("📝 Trade logged to CSV + Google Sheet.")
+        google_logged = log_trade(
+            symbol,
+            qty,
+            entry,
+            abs_sl,
+            abs_tp,
+            status="executed",
+            action="BUY",
+            fill_price=buy_fill_price,
+            realized_pnl=None,
+        )
+        if google_logged:
+            print("📝 Trade logged to CSV + Google Sheet.")
+        else:
+            print("📝 Trade logged to CSV.")
     except Exception as e:
         print(f"⚠️ Trade log failed: {e}")
     return True
@@ -4317,7 +4338,7 @@ def push_autoscan_debug_to_sheet(entries: List[Dict[str, object]]) -> None:
         _with_sheet_retry(f"clear sheet '{tab_name}'", ws.clear)
         _with_sheet_retry(
             f"update sheet '{tab_name}'",
-            lambda: ws.update("A1", rows),
+            lambda: ws.update(range_name="A1", values=rows),
         )
         print(f"📝 Autoscan debug sheet updated with {len(rows)-1} rows.")
     except Exception as e:
@@ -4919,6 +4940,7 @@ def log_trade(
         writer.writerow(row)
 
     # ✅ Google Sheet Logging
+    google_logged = False
     try:
         client = get_gspread_client()
 
@@ -4932,6 +4954,7 @@ def log_trade(
 
         sheet.append_row(row)
         print("✅ Trade logged to Google Sheet.")
+        google_logged = True
 
     except Exception as e:
         print("⚠️ Failed to log trade to Google Sheet:", e)
@@ -4943,6 +4966,7 @@ def log_trade(
             update_google_performance_sheet(metrics)
     except Exception as perf_e:
         print(f"⚠️ Performance update failed: {perf_e}")
+    return google_logged
 
 def _get_available_qty(symbol: str) -> float:
     """Return qty_available for an open position, or 0 if none."""
