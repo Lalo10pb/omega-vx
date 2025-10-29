@@ -19,9 +19,9 @@ __all__ = [
 EMOJI_LEVEL_MAP: Dict[str, str] = {
     "⚠️": "warning",
     "❌": "error",
-    "⛔": "error",
+    "⛔": "info",
     "🛑": "warning",
-    "🚫": "warning",
+    "🚫": "info",
     "❗": "warning",
     "ℹ️": "info",
     "✅": "info",

@@ -1383,6 +1383,23 @@ def get_dynamic_max_open_positions():
         print(f"⚠️ Failed to fetch equity for dynamic position cap: {e}")
         return 3  # fallback default, never less than 3
 
+
+def _adaptive_pdt_governor(open_count: int, base_limit: int) -> int:
+    """
+    Adaptive PDT Governor v1 placeholder.
+    Future phases will adjust the limit using PDT usage and equity trends.
+    """
+    try:
+        threshold = float(os.getenv("PDT_LOW_EQUITY_THRESHOLD", "25000"))
+        account = _safe_get_account()
+        equity = float(getattr(account, "equity", threshold)) if account else threshold
+        if equity < threshold:
+            return min(base_limit, 3)
+        return base_limit
+    except Exception as err:
+        LOGGER.warning(f"[AdaptiveGovernor] fallback to base_limit: {err}")
+        return base_limit
+
 # --- Weekend Improvements Config -------------------------------------------
 # End‑of‑Day (EOD) summary appender
 EOD_SUMMARY = str(os.getenv("EOD_SUMMARY", "1")).strip().lower() in ("1","true","yes","y","on")
@@ -2714,9 +2731,21 @@ def _compute_entry_tp_sl(symbol: str):
 def autoscan_once():
     try:
         # stop if too many positions (dynamic cap)
-        print(f"🧮 Open positions: {_open_positions_count()} / Max allowed: {get_dynamic_max_open_positions()}")
-        if _open_positions_count() >= get_dynamic_max_open_positions():
-            print(f"⛔ Position cap reached ({get_dynamic_max_open_positions()}).")
+        # --- Cached position / cap check (Adaptive PDT Governor v1) ---
+        open_count = _open_positions_count()
+        max_allowed = get_dynamic_max_open_positions()
+
+        # (Future use) Hook adaptive scaling by PDT stats and equity
+        # adaptive_max = _adaptive_pdt_governor(open_count, max_allowed)
+        # if adaptive_max != max_allowed:
+        #     max_allowed = adaptive_max
+
+        print(f"🧮 Open positions: {open_count} / Max allowed: {max_allowed}")
+        if open_count >= max_allowed:
+            print(
+                f"🚫 Position cap reached ({open_count}). [Limit={max_allowed}]",
+                level="info",
+            )
             _digest_increment("position_cap_skips")
             return False
 
