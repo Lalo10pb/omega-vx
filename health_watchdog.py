@@ -1,0 +1,117 @@
+"""
+health_watchdog.py
+
+Checks critical Omega-VX artifacts for staleness and alerts via Telegram/email
+if any files are missing or older than their allowed threshold.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Tuple
+
+from omega_vx import config as omega_config
+from omega_vx.notifications import send_email, send_telegram_alert
+
+
+BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
+omega_config.load_environment(ENV_PATH)
+
+LOG_DIR = Path(omega_config.LOG_DIR)
+
+DEFAULT_TARGETS: List[Tuple[str, Path, int]] = [
+    ("filled_trades.csv", BASE_DIR / "filled_trades.csv", 60 * 60 * 6),  # 6 hours
+    ("portfolio_log.csv", LOG_DIR / "portfolio_log.csv", 60 * 60 * 6),
+    ("omega_vx_bot.log", LOG_DIR / "omega_vx_bot.log", 60 * 15),  # 15 minutes
+    ("equity_curve.log", LOG_DIR / "equity_curve.log", 60 * 60 * 6),
+]
+
+
+def _format_elapsed(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    hours, rem = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def _check_file(path: Path, max_age_seconds: int) -> tuple[bool, str]:
+    if not path.exists():
+        return False, f"❌ {path} missing"
+    try:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime)
+    except Exception as exc:
+        return False, f"⚠️ Could not read {path}: {exc}"
+    age = (datetime.now() - mtime).total_seconds()
+    if age > max_age_seconds:
+        return False, f"⏰ {path} stale — { _format_elapsed(age) } old (limit { _format_elapsed(max_age_seconds) })"
+    return True, f"✅ {path.name} fresh ({_format_elapsed(age)} old)"
+
+
+def run_watchdog(targets: List[Tuple[str, Path, int]], quiet: bool = False, notify: bool = True) -> int:
+    issues = []
+    for label, path, max_age in targets:
+        ok, message = _check_file(path, max_age)
+        if not ok:
+            issues.append((label, message))
+        if not quiet:
+            print(message)
+
+    if not issues:
+        if not quiet:
+            print("🟢 All monitored files are within thresholds.")
+        return 0
+
+    alert_lines = ["⚠️ Omega Watchdog detected stale/missing assets:"]
+    alert_lines.extend(msg for _, msg in issues)
+    alert_text = "\n".join(alert_lines)
+
+    if notify:
+        try:
+            send_telegram_alert(alert_text)
+        except Exception:
+            pass
+        try:
+            send_email("⚠️ Omega Watchdog Alert", alert_text)
+        except Exception:
+            pass
+
+    if not quiet:
+        print(alert_text)
+    return len(issues)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Check Omega-VX artifacts for staleness.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress per-file output; only report issues.")
+    parser.add_argument("--no-notify", action="store_true", help="Do not send Telegram/email notifications.")
+    parser.add_argument("--targets", help="Optional comma-separated overrides in form name:path:seconds")
+    return parser.parse_args()
+
+
+def _parse_targets(raw: str | None) -> List[Tuple[str, Path, int]]:
+    if not raw:
+        return DEFAULT_TARGETS
+    items: List[Tuple[str, Path, int]] = []
+    for part in raw.split(","):
+        try:
+            name, path_str, seconds = part.split(":")
+            items.append((name, Path(path_str).expanduser(), int(seconds)))
+        except ValueError:
+            print(f"⚠️ Invalid target spec '{part}', expected name:path:seconds")
+    return items or DEFAULT_TARGETS
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    targets = _parse_targets(args.targets)
+    run_watchdog(targets, quiet=args.quiet, notify=not args.no_notify)

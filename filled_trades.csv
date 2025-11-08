@@ -1,2 +1,2 @@
-timestamp,symbol,qty,entry_price,exit_price,P/L $,P/L %,exit_reason
-2025-07-28 08:31:01,AAPL,2.0,213.79,213.66,-0.26,-0.06,manual/unknown
+timestamp,symbol,qty,entry_price,exit_price,P/L $,P/L %,exit_reason,activity_id
+2025-07-28 08:31:01,AAPL,2.0,213.79,213.66,-0.26,-0.06,manual/unknown,
