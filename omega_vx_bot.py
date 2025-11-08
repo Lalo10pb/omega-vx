@@ -45,6 +45,7 @@ from omega_vx.logging_utils import configure_logger, install_print_bridge
 from omega_vx.notifications import send_email, send_telegram_alert
 
 from api.ibkr_adapter import IBKRAdapter
+from weekly_email_report import analyze_weekly_trades
 
 LOG_DIR = str(omega_config.LOG_DIR)
 LOGGER = configure_logger()
@@ -62,7 +63,8 @@ _log_boot("Application started.")
 # === Load .env and Set Environment Vars ===
 from pathlib import Path
 
-ENV_PATH = Path(__file__).parent / ".env"
+BASE_DIR = Path(__file__).parent
+ENV_PATH = BASE_DIR / ".env"
 if not omega_config.load_environment(ENV_PATH):
     _log_boot(f"Could not load .env at {ENV_PATH} — using environment vars only.", level="warning")
 
@@ -2981,6 +2983,7 @@ MAX_EQUITY_FILE = os.path.join(LOG_DIR, "max_equity.txt")
 SNAPSHOT_LOG_PATH = os.path.join(LOG_DIR, "last_snapshot.txt")
 PORTFOLIO_LOG_PATH = os.path.join(LOG_DIR, "portfolio_log.csv")
 TRADE_LOG_PATH = os.path.join(LOG_DIR, "trade_log.csv")
+FILLED_TRADES_PATH = str(BASE_DIR / "filled_trades.csv")
 TRADE_LOG_HEADER = [
     "timestamp",
     "symbol",
@@ -3011,6 +3014,18 @@ PROTECTION_STATE_HEADER = [
     "take_profit",
     "order_id",
 ]
+FILLED_TRADES_HEADER = [
+    "timestamp",
+    "symbol",
+    "qty",
+    "entry_price",
+    "exit_price",
+    "P/L $",
+    "P/L %",
+    "exit_reason",
+    "activity_id",
+]
+_FILLED_TRADES_LOCK = threading.Lock()
 
 def calculate_trade_qty(entry_price, stop_loss_price):
     try:
@@ -3734,42 +3749,27 @@ def log_portfolio_snapshot():
         send_telegram_alert(f"⚠️ Snapshot failed: {e}")
 
 def send_weekly_summary():
+    """Send weekly summary based on realized trades stored in filled_trades.csv."""
     try:
-        if not os.path.isfile(TRADE_LOG_PATH):
-            print("No trade log found.")
-            return
-
-        df = pd.read_csv(TRADE_LOG_PATH, parse_dates=["timestamp"])
-
-        # Filter for last 7 days
-        one_week_ago = datetime.now() - pd.Timedelta(days=7)
-        df = df[df["timestamp"] >= one_week_ago.strftime("%Y-%m-%d")]
-
-        if df.empty:
+        stats = analyze_weekly_trades()
+        if stats["total"] == 0:
             send_email("📊 Weekly P&L Summary", "No trades in the last 7 days.")
+            print("ℹ️ Weekly summary skipped (no trades).")
             return
-
-        df["pnl"] = df["take_profit"] - df["entry"]  # Approx P&L (simplified logic)
-        total_trades = len(df)
-        wins = df[df["pnl"] > 0]
-        losses = df[df["pnl"] <= 0]
-        win_rate = (len(wins) / total_trades) * 100
-        total_pnl = df["pnl"].sum()
-        avg_gain = wins["pnl"].mean() if not wins.empty else 0
-        avg_loss = losses["pnl"].mean() if not losses.empty else 0
 
         body = (
-            f"📈 Weekly Trade Summary ({total_trades} trades)\n\n"
-            f"• Total P&L: ${total_pnl:.2f}\n"
-            f"• Win rate: {win_rate:.2f}%\n"
-            f"• Avg gain: ${avg_gain:.2f}\n"
-            f"• Avg loss: ${avg_loss:.2f}\n"
+            f"📈 Weekly Trade Summary ({stats['start']} → {stats['end']})\n\n"
+            f"• Total trades: {stats['total']}\n"
+            f"• Wins / Losses / Flat: {stats['wins']} / {stats['losses']} / {stats['breakeven']}\n"
+            f"• Win rate: {stats['win_rate']:.2f}%\n"
+            f"• Net P&L: ${stats['net_pl']:.2f}\n"
+            f"• Avg return per trade: {stats['avg_return_pct']:.2f}%\n"
         )
 
         send_email("📊 Weekly P&L Summary", body)
         print("✅ Weekly summary sent.")
         send_telegram_alert("📬 Weekly P&L email sent.")
-        
+
     except Exception as e:
         print(f"⚠️ Weekly summary failed: {e}")
         send_telegram_alert(f"⚠️ Weekly summary failed: {e}")
@@ -4873,6 +4873,63 @@ def is_ai_mood_bad():
         print("⚠️ AI Mood check failed:", e)
         return False
 
+
+def _append_filled_trade_entry(
+    *,
+    timestamp: str,
+    symbol: str,
+    qty,
+    entry_price,
+    exit_price,
+    realized_pnl,
+    exit_reason: str = "",
+    activity_id: str = "",
+) -> None:
+    """Persist realized trades for downstream reporting."""
+
+    def _to_float(value) -> Optional[float]:
+        if value in (None, "", "None"):
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    qty_val = _to_float(qty) or 0.0
+    entry_val = _to_float(entry_price)
+    exit_val = _to_float(exit_price)
+    pnl_dollars = _to_float(realized_pnl)
+    if pnl_dollars is None and all(v is not None for v in (entry_val, exit_val)) and qty_val:
+        pnl_dollars = (exit_val - entry_val) * qty_val
+    if pnl_dollars is None:
+        pnl_dollars = 0.0
+
+    pnl_percent = 0.0
+    if qty_val and entry_val and entry_val != 0:
+        pnl_percent = ((exit_val or entry_val) - entry_val) / entry_val * 100
+
+    exit_reason = exit_reason or "SELL"
+    row = [
+        timestamp,
+        symbol,
+        qty_val,
+        "" if entry_val is None else round(entry_val, 4),
+        "" if exit_val is None else round(exit_val, 4),
+        round(pnl_dollars, 2),
+        round(pnl_percent, 2),
+        exit_reason,
+        activity_id or "",
+    ]
+
+    with _FILLED_TRADES_LOCK:
+        file_exists = os.path.isfile(FILLED_TRADES_PATH)
+        with open(FILLED_TRADES_PATH, mode="a", newline="") as handle:
+            writer = csv.writer(handle)
+            if not file_exists:
+                writer.writerow(FILLED_TRADES_HEADER)
+            writer.writerow(row)
+
+
 def log_trade(
     symbol,
     qty,
@@ -4995,6 +5052,22 @@ def log_trade(
             update_google_performance_sheet(metrics)
     except Exception as perf_e:
         print(f"⚠️ Performance update failed: {perf_e}")
+
+    # === Filled trade log for downstream analytics ===
+    if str(action).upper() == "SELL":
+        try:
+            exit_price = fill_price if fill_price is not None else take_profit
+            _append_filled_trade_entry(
+                timestamp=timestamp_str,
+                symbol=symbol,
+                qty=qty,
+                entry_price=entry,
+                exit_price=exit_price,
+                realized_pnl=realized_pnl,
+                exit_reason=close_reason or hold_reason or status,
+            )
+        except Exception as filled_err:
+            print(f"⚠️ Filled trade log failed: {filled_err}")
     return google_logged
 
 def _get_available_qty(symbol: str) -> float:

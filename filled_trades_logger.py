@@ -36,6 +36,7 @@ def log_filled_trade(symbol, qty, entry_price, exit_price, pl_dollars, pl_percen
                 "P/L $",
                 "P/L %",
                 "exit_reason",
+                "activity_id",
             ])
         writer.writerow([
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -46,6 +47,7 @@ def log_filled_trade(symbol, qty, entry_price, exit_price, pl_dollars, pl_percen
             round(pl_dollars, 2),
             round(pl_percent, 2),
             reason,
+            "",
         ])
 
 
