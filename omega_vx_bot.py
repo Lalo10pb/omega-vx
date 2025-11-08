@@ -148,6 +148,8 @@ PDT_LOCAL_LOCK_SECONDS = max(0, _int_env("PDT_LOCAL_LOCK_SECONDS", 120))
 PDT_REARM_MAX_ATTEMPTS = max(1, _int_env("PDT_REARM_MAX_ATTEMPTS", 2))
 PDT_REARM_BLOCK_SECONDS = max(60, _int_env("PDT_REARM_BLOCK_SECONDS", 900))
 PDT_REARM_ALERT_COOLDOWN = max(60, _int_env("PDT_REARM_ALERT_COOLDOWN", 1800))
+MOOD_GUARD_ENABLED = _bool_env("MOOD_GUARD_ENABLED", "1")
+MOOD_GUARD_ALERT_COOLDOWN = max(300, _int_env("MOOD_GUARD_ALERT_COOLDOWN", 900))
 ALLOW_PLAIN_BUY_FALLBACK = _bool_env("ALLOW_PLAIN_BUY_FALLBACK", "1")
 CANDIDATE_LOG_PATH = _clean_env(os.getenv("CANDIDATE_LOG_PATH", ""))
 CANDIDATE_LOG_ENABLED = bool(CANDIDATE_LOG_PATH)
@@ -2785,6 +2787,8 @@ def autoscan_once():
         if should_block_trading_due_to_equity():
             print("🛑 Equity guard active; autoscan skip.")
             return False
+        if _mood_guard_blocks("autoscan"):
+            return False
 
         print(f"🤖 AUTOSCAN candidate {sym}: entry={entry} SL={sl} TP={tp}")
         return submit_order_with_retries(
@@ -2939,6 +2943,10 @@ def webhook():
                 "reason": "dry_run"
             }), 200
         # --- end dry-run guard ---
+
+        if _mood_guard_blocks("webhook"):
+            return jsonify({"status": "failed", "reason": "mood_guard"}), 200
+
         print(f"🔄 Calling submit_order_with_retries for {symbol}", tag="WEBHOOK")
 
         try:
@@ -4872,6 +4880,37 @@ def is_ai_mood_bad():
     except Exception as e:
         print("⚠️ AI Mood check failed:", e)
         return False
+
+
+_MOOD_GUARD_LAST_ALERT: Optional[datetime] = None
+
+
+def _mood_guard_blocks(context: str) -> bool:
+    if not MOOD_GUARD_ENABLED:
+        return False
+    try:
+        bad = is_ai_mood_bad()
+    except Exception as exc:
+        print(f"⚠️ Mood guard check failed ({context}): {exc}")
+        return False
+    if not bad:
+        return False
+
+    global _MOOD_GUARD_LAST_ALERT
+    now = datetime.now()
+    should_alert = (
+        _MOOD_GUARD_LAST_ALERT is None
+        or (now - _MOOD_GUARD_LAST_ALERT).total_seconds() >= MOOD_GUARD_ALERT_COOLDOWN
+    )
+    msg = f"🧠 Mood guard active ({context}) — blocking new trades due to recent losses/drawdown."
+    print(msg)
+    if should_alert:
+        try:
+            send_telegram_alert(msg)
+        except Exception:
+            pass
+        _MOOD_GUARD_LAST_ALERT = now
+    return True
 
 
 def _append_filled_trade_entry(
