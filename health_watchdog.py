@@ -7,7 +7,7 @@ if any files are missing or older than their allowed threshold.
 from __future__ import annotations
 
 import argparse
-import os
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple
@@ -21,6 +21,8 @@ ENV_PATH = BASE_DIR / ".env"
 omega_config.load_environment(ENV_PATH)
 
 LOG_DIR = Path(omega_config.LOG_DIR)
+ALERT_STATE_FILE = LOG_DIR / "watchdog_alert_state.json"
+RENOTIFY_COOLDOWN = timedelta(hours=6)
 
 DEFAULT_TARGETS: List[Tuple[str, Path, int]] = [
     ("filled_trades.csv", BASE_DIR / "filled_trades.csv", 60 * 60 * 6),  # 6 hours
@@ -57,6 +59,28 @@ def _check_file(path: Path, max_age_seconds: int) -> tuple[bool, str]:
     return True, f"✅ {path.name} fresh ({_format_elapsed(age)} old)"
 
 
+def _load_alert_state() -> tuple[list[str], datetime | None]:
+    if not ALERT_STATE_FILE.exists():
+        return [], None
+    try:
+        data = json.loads(ALERT_STATE_FILE.read_text())
+        issues = data.get("issues") or []
+        timestamp = data.get("timestamp")
+        last_alert = datetime.fromisoformat(timestamp) if timestamp else None
+        return list(issues), last_alert
+    except Exception:
+        return [], None
+
+
+def _persist_alert_state(issue_labels: list[str], last_alert: datetime | None) -> None:
+    ALERT_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "issues": issue_labels,
+        "timestamp": last_alert.isoformat() if last_alert else None,
+    }
+    ALERT_STATE_FILE.write_text(json.dumps(payload))
+
+
 def run_watchdog(targets: List[Tuple[str, Path, int]], quiet: bool = False, notify: bool = True) -> int:
     issues = []
     for label, path, max_age in targets:
@@ -69,13 +93,26 @@ def run_watchdog(targets: List[Tuple[str, Path, int]], quiet: bool = False, noti
     if not issues:
         if not quiet:
             print("🟢 All monitored files are within thresholds.")
+        prev_issues, _ = _load_alert_state()
+        if prev_issues:
+            _persist_alert_state([], None)
         return 0
 
     alert_lines = ["⚠️ Omega Watchdog detected stale/missing assets:"]
     alert_lines.extend(msg for _, msg in issues)
     alert_text = "\n".join(alert_lines)
 
-    if notify:
+    issue_labels = sorted(label for label, _ in issues)
+    previous_labels, last_alert_at = _load_alert_state()
+    now = datetime.now()
+
+    should_notify = False
+    if issue_labels != previous_labels:
+        should_notify = True
+    elif not last_alert_at or now - last_alert_at > RENOTIFY_COOLDOWN:
+        should_notify = True
+
+    if notify and should_notify:
         try:
             send_telegram_alert(alert_text)
         except Exception:
@@ -84,6 +121,12 @@ def run_watchdog(targets: List[Tuple[str, Path, int]], quiet: bool = False, noti
             send_email("⚠️ Omega Watchdog Alert", alert_text)
         except Exception:
             pass
+        _persist_alert_state(issue_labels, now)
+    else:
+        # Preserve the fact that issues are still outstanding without
+        # touching the last alert time so we can re-notify after cooldown.
+        if issue_labels != previous_labels:
+            _persist_alert_state(issue_labels, last_alert_at)
 
     if not quiet:
         print(alert_text)
