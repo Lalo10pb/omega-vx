@@ -23,6 +23,8 @@ omega_config.load_environment(ENV_PATH)
 LOG_DIR = Path(omega_config.LOG_DIR)
 ALERT_STATE_FILE = LOG_DIR / "watchdog_alert_state.json"
 RENOTIFY_COOLDOWN = timedelta(hours=6)
+WATCHDOG_EMAIL_ENABLED = omega_config.get_bool("WATCHDOG_EMAIL_ENABLED", "1")
+WATCHDOG_TELEGRAM_ENABLED = omega_config.get_bool("WATCHDOG_TELEGRAM_ENABLED", "1")
 
 DEFAULT_TARGETS: List[Tuple[str, Path, int]] = [
     ("filled_trades.csv", BASE_DIR / "filled_trades.csv", 60 * 60 * 6),  # 6 hours
@@ -113,14 +115,16 @@ def run_watchdog(targets: List[Tuple[str, Path, int]], quiet: bool = False, noti
         should_notify = True
 
     if notify and should_notify:
-        try:
-            send_telegram_alert(alert_text)
-        except Exception:
-            pass
-        try:
-            send_email("⚠️ Omega Watchdog Alert", alert_text)
-        except Exception:
-            pass
+        if WATCHDOG_TELEGRAM_ENABLED:
+            try:
+                send_telegram_alert(alert_text)
+            except Exception:
+                pass
+        if WATCHDOG_EMAIL_ENABLED:
+            try:
+                send_email("⚠️ Omega Watchdog Alert", alert_text)
+            except Exception:
+                pass
         _persist_alert_state(issue_labels, now)
     else:
         # Preserve the fact that issues are still outstanding without
