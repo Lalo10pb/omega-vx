@@ -187,6 +187,11 @@ try:
 except Exception:
     WATCHDOG_TARGETS = WATCHDOG_DEFAULT_TARGETS
 
+TRADING_START_UTC_HOUR = max(0, min(23, _int_env("TRADING_START_UTC_HOUR", 13)))
+TRADING_START_UTC_MINUTE = max(0, min(59, _int_env("TRADING_START_UTC_MINUTE", 30)))
+TRADING_END_UTC_HOUR = max(0, min(23, _int_env("TRADING_END_UTC_HOUR", 21)))
+TRADING_END_UTC_MINUTE = max(0, min(59, _int_env("TRADING_END_UTC_MINUTE", 0)))
+
 DATA_RETRY_MAX_ATTEMPTS = max(1, _int_env("DATA_RETRY_MAX_ATTEMPTS", 3))
 DATA_RETRY_BASE_DELAY = max(0.1, _float_env("DATA_RETRY_BASE_DELAY", 0.75))
 SHEETS_RETRY_MAX_ATTEMPTS = max(1, _int_env("SHEETS_RETRY_MAX_ATTEMPTS", 3))
@@ -2037,13 +2042,28 @@ def get_bars(symbol, interval='15m', lookback=10):
         return None
     return bars
 
-def is_within_trading_hours(start_hour=13, start_minute=30, end_hour=20):
+def is_within_trading_hours(
+    start_hour: int | None = None,
+    start_minute: int | None = None,
+    end_hour: int | None = None,
+    end_minute: int | None = None,
+):
     if FORCE_WEBHOOK_TEST:
         return True
+
+    start_h = TRADING_START_UTC_HOUR if start_hour is None else start_hour
+    start_m = TRADING_START_UTC_MINUTE if start_minute is None else start_minute
+    end_h = TRADING_END_UTC_HOUR if end_hour is None else end_hour
+    end_m = TRADING_END_UTC_MINUTE if end_minute is None else end_minute
+
     now_utc = datetime.now(timezone.utc).time()
-    start = dt_time(hour=start_hour, minute=start_minute)
-    end = dt_time(hour=end_hour, minute=0)
-    return start <= now_utc <= end
+    start = dt_time(hour=start_h, minute=start_m)
+    end = dt_time(hour=end_h, minute=end_m)
+
+    if start <= end:
+        return start <= now_utc <= end
+    # Overnight windows (e.g., 22:00 → 02:00)
+    return now_utc >= start or now_utc <= end
 
 def get_heikin_ashi_trend(symbol, interval='15m', lookback=2):
     """
