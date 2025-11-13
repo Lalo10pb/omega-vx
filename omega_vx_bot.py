@@ -43,6 +43,7 @@ from omega_vx.clients import (
 )
 from omega_vx.logging_utils import configure_logger, install_print_bridge
 from omega_vx.notifications import send_email, send_telegram_alert
+from health_watchdog import DEFAULT_TARGETS as WATCHDOG_DEFAULT_TARGETS, parse_targets as parse_watchdog_targets, run_watchdog
 
 from api.ibkr_adapter import IBKRAdapter
 from weekly_email_report import analyze_weekly_trades
@@ -177,6 +178,14 @@ _CANDIDATE_LOG_LOCK = threading.Lock()
 MIN_TRADE_QTY = 1
 AUTOSCAN_DEBUG_TAB = _clean_env(os.getenv("AUTOSCAN_DEBUG_TAB", "Autoscan Debug"))
 AUTOSCAN_DEBUG_MAX_ROWS = max(5, _int_env("AUTOSCAN_DEBUG_MAX_ROWS", 25))
+
+WATCHDOG_THREAD_ENABLED = _bool_env("WATCHDOG_THREAD_ENABLED", "1")
+WATCHDOG_INTERVAL_SECONDS = max(300, _int_env("WATCHDOG_INTERVAL_SECONDS", 600))
+_WATCHDOG_TARGET_SPEC = omega_config.get_env("WATCHDOG_TARGETS", "")
+try:
+    WATCHDOG_TARGETS = parse_watchdog_targets(_WATCHDOG_TARGET_SPEC)
+except Exception:
+    WATCHDOG_TARGETS = WATCHDOG_DEFAULT_TARGETS
 
 DATA_RETRY_MAX_ATTEMPTS = max(1, _int_env("DATA_RETRY_MAX_ATTEMPTS", 3))
 DATA_RETRY_BASE_DELAY = max(0.1, _float_env("DATA_RETRY_BASE_DELAY", 0.75))
@@ -2838,6 +2847,40 @@ def start_autoscan_thread():
     t = threading.Thread(target=_loop, daemon=True, name="Autoscan")
     t.start()
 
+
+def start_watchdog_thread():
+    if not WATCHDOG_THREAD_ENABLED:
+        print("🛡️ Watchdog thread disabled (WATCHDOG_THREAD_ENABLED=0).")
+        return
+
+    target_labels = ", ".join(label for label, _, _ in WATCHDOG_TARGETS) or "default targets"
+
+    def _loop():
+        print(
+            f"🛡️ Watchdog monitoring {target_labels} every {WATCHDOG_INTERVAL_SECONDS}s",
+            tag="WATCHDOG",
+        )
+        while True:
+            try:
+                issue_count = run_watchdog(WATCHDOG_TARGETS, quiet=True, notify=True)
+                if issue_count:
+                    print(
+                        f"⚠️ Watchdog detected {issue_count} issue(s) — see alerts for details.",
+                        tag="WATCHDOG",
+                    )
+                else:
+                    print("🟢 Watchdog check passed.", tag="WATCHDOG")
+            except Exception as exc:
+                msg = f"Watchdog loop error: {exc}"
+                print(f"⚠️ {msg}", tag="WATCHDOG")
+                try:
+                    send_telegram_alert(f"⚠️ {msg}")
+                except Exception:
+                    pass
+            time.sleep(WATCHDOG_INTERVAL_SECONDS)
+
+    threading.Thread(target=_loop, daemon=True, name="Watchdog").start()
+
 def log_equity_curve():
     try:
         equity = get_account_equity()
@@ -5257,7 +5300,7 @@ if __name__ == "__main__":
         if not _BACKGROUND_WORKERS_STARTED:
             _BACKGROUND_WORKERS_STARTED = True
             start_autoscan_thread()
-            # Add other background workers here (e.g., watchdog, monitors)
+            start_watchdog_thread()
             start_eod_close_thread()
             start_weekly_flush_scheduler()
             start_protection_guardian_scheduler()

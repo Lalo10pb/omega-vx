@@ -15,6 +15,13 @@ from typing import List, Tuple
 from omega_vx import config as omega_config
 from omega_vx.notifications import send_email, send_telegram_alert
 
+__all__ = [
+    "DEFAULT_TARGETS",
+    "RENOTIFY_COOLDOWN",
+    "parse_targets",
+    "run_watchdog",
+]
+
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
@@ -145,7 +152,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _parse_targets(raw: str | None) -> List[Tuple[str, Path, int]]:
+def parse_targets(raw: str | None) -> List[Tuple[str, Path, int]]:
+    """Parse CLI/env target overrides in the form name:path:seconds."""
     if not raw:
         return DEFAULT_TARGETS
     items: List[Tuple[str, Path, int]] = []
@@ -160,5 +168,5 @@ def _parse_targets(raw: str | None) -> List[Tuple[str, Path, int]]:
 
 if __name__ == "__main__":
     args = parse_args()
-    targets = _parse_targets(args.targets)
+    targets = parse_targets(args.targets)
     run_watchdog(targets, quiet=args.quiet, notify=not args.no_notify)
