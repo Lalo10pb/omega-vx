@@ -187,6 +187,9 @@ try:
 except Exception:
     WATCHDOG_TARGETS = WATCHDOG_DEFAULT_TARGETS
 
+ACCOUNT_LOG_THREAD_ENABLED = _bool_env("ACCOUNT_LOG_THREAD_ENABLED", "1")
+ACCOUNT_LOG_INTERVAL_SECONDS = max(300, _int_env("ACCOUNT_LOG_INTERVAL_SECONDS", 900))
+
 TRADING_START_UTC_HOUR = max(0, min(23, _int_env("TRADING_START_UTC_HOUR", 13)))
 TRADING_START_UTC_MINUTE = max(0, min(59, _int_env("TRADING_START_UTC_MINUTE", 30)))
 TRADING_END_UTC_HOUR = max(0, min(23, _int_env("TRADING_END_UTC_HOUR", 21)))
@@ -2901,6 +2904,86 @@ def start_watchdog_thread():
 
     threading.Thread(target=_loop, daemon=True, name="Watchdog").start()
 
+
+def _repair_portfolio_log_header_if_needed() -> None:
+    """Ensure portfolio_log.csv begins with a header row."""
+    path = Path(PORTFOLIO_LOG_PATH)
+    if not path.exists():
+        return
+    try:
+        with path.open("r", newline="") as src:
+            first_line = src.readline().strip().lower()
+            if first_line.startswith("timestamp"):
+                return
+        with path.open("r", newline="") as src:
+            rows = [row for row in csv.reader(src) if row]
+    except Exception as err:
+        print(f"⚠️ Portfolio log header inspect failed: {err}", tag="ACCTLOG")
+        return
+    try:
+        with path.open("w", newline="") as dest:
+            writer = csv.writer(dest)
+            writer.writerow(PORTFOLIO_LOG_HEADER)
+            writer.writerows(rows)
+        print("🩹 Portfolio log header repaired (legacy rows preserved).", tag="ACCTLOG")
+    except Exception as err:
+        print(f"⚠️ Portfolio log header repair failed: {err}", tag="ACCTLOG")
+
+
+def _append_portfolio_snapshot() -> None:
+    """Fetch account balances and append them to portfolio_log.csv."""
+    try:
+        account = trading_client.get_account()
+        snapshot = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            round(float(account.equity), 2),
+            round(float(account.cash), 2),
+            round(float(account.portfolio_value), 2),
+        ]
+    except Exception as err:
+        print(f"⚠️ Failed to fetch account snapshot: {err}", tag="ACCTLOG")
+        return
+
+    path = Path(PORTFOLIO_LOG_PATH)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    _repair_portfolio_log_header_if_needed()
+    needs_header = not path.exists() or path.stat().st_size == 0
+    try:
+        with path.open("a", newline="") as handle:
+            writer = csv.writer(handle)
+            if needs_header:
+                writer.writerow(PORTFOLIO_LOG_HEADER)
+            writer.writerow(snapshot)
+        print("💾 Portfolio snapshot logged.", tag="ACCTLOG")
+    except Exception as err:
+        print(f"⚠️ Failed to append portfolio snapshot: {err}", tag="ACCTLOG")
+
+
+def start_account_logger_thread():
+    if not ACCOUNT_LOG_THREAD_ENABLED:
+        print("📊 Account snapshot thread disabled (ACCOUNT_LOG_THREAD_ENABLED=0).", tag="ACCTLOG")
+        return
+
+    def _loop():
+        print(
+            f"📊 Account snapshots every {ACCOUNT_LOG_INTERVAL_SECONDS}s",
+            tag="ACCTLOG",
+        )
+        while True:
+            try:
+                log_equity_curve()
+            except Exception as exc:
+                print(f"⚠️ Equity log error: {exc}", tag="ACCTLOG")
+            _append_portfolio_snapshot()
+            time.sleep(ACCOUNT_LOG_INTERVAL_SECONDS)
+
+    threading.Thread(target=_loop, daemon=True, name="AccountLogger").start()
+
+
 def log_equity_curve():
     try:
         equity = get_account_equity()
@@ -3055,6 +3138,7 @@ SNAPSHOT_LOG_PATH = os.path.join(LOG_DIR, "last_snapshot.txt")
 PORTFOLIO_LOG_PATH = os.path.join(LOG_DIR, "portfolio_log.csv")
 TRADE_LOG_PATH = os.path.join(LOG_DIR, "trade_log.csv")
 FILLED_TRADES_PATH = str(BASE_DIR / "filled_trades.csv")
+PORTFOLIO_LOG_HEADER = ["timestamp", "equity", "cash", "portfolio_value"]
 TRADE_LOG_HEADER = [
     "timestamp",
     "symbol",
@@ -5321,6 +5405,7 @@ if __name__ == "__main__":
             _BACKGROUND_WORKERS_STARTED = True
             start_autoscan_thread()
             start_watchdog_thread()
+            start_account_logger_thread()
             start_eod_close_thread()
             start_weekly_flush_scheduler()
             start_protection_guardian_scheduler()
