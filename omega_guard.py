@@ -22,6 +22,15 @@ BACKOFF_BASE = max(15, int(os.getenv("OMEGA_GUARD_BACKOFF_SECONDS", "45")))
 BACKOFF_MAX = max(BACKOFF_BASE, int(os.getenv("OMEGA_GUARD_BACKOFF_MAX_SECONDS", "600")))
 CMD_OVERRIDE = os.getenv("OMEGA_GUARD_COMMAND")
 
+ACCOUNT_LOGGER_ENABLED = os.getenv("ACCOUNT_LOGGER_ENABLED", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+ACCOUNT_LOGGER_INTERVAL = max(300, int(os.getenv("ACCOUNT_LOGGER_INTERVAL_SECONDS", "900")))
+ACCOUNT_LOGGER_COMMAND = os.getenv(
+    "ACCOUNT_LOGGER_COMMAND",
+    f"{shlex.quote(sys.executable)} {shlex.quote(str(REPO_ROOT / 'account_logger.py'))} --interval {ACCOUNT_LOGGER_INTERVAL}",
+)
+
+_ACCOUNT_LOGGER_PROCESS: subprocess.Popen | None = None
+
 
 def _ensure_log_dir() -> None:
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -80,12 +89,28 @@ def start_bot() -> bool:
         return False
 
 
+def _ensure_account_logger() -> None:
+    global _ACCOUNT_LOGGER_PROCESS
+    if not ACCOUNT_LOGGER_ENABLED:
+        return
+    if _ACCOUNT_LOGGER_PROCESS and _ACCOUNT_LOGGER_PROCESS.poll() is None:
+        return
+    try:
+        cmd = shlex.split(ACCOUNT_LOGGER_COMMAND)
+        LOGGER.info("📊 Starting account logger via %s", cmd)
+        _ACCOUNT_LOGGER_PROCESS = subprocess.Popen(cmd, cwd=str(REPO_ROOT))
+    except Exception as exc:
+        LOGGER.error("⚠️ Failed to launch account logger: %s", exc)
+
+
 def main() -> None:
     consecutive_failures = 0
     LOGGER.info("🛡️ Omega Guard monitoring %s (interval=%ss)", BOT_PATH, CHECK_INTERVAL)
+    _ensure_account_logger()
 
     while True:
         try:
+            _ensure_account_logger()
             if is_bot_running():
                 if consecutive_failures:
                     LOGGER.info("✅ omega_vx_bot.py recovered.")
@@ -108,6 +133,9 @@ def main() -> None:
                 consecutive_failures += 1
         except KeyboardInterrupt:
             LOGGER.info("🛑 Omega Guard interrupted by user; exiting.")
+            if _ACCOUNT_LOGGER_PROCESS and _ACCOUNT_LOGGER_PROCESS.poll() is None:
+                LOGGER.info("🛑 Stopping managed account logger (pid=%s).", _ACCOUNT_LOGGER_PROCESS.pid)
+                _ACCOUNT_LOGGER_PROCESS.terminate()
             break
         except Exception as exc:
             LOGGER.exception("❌ Guard loop error: %s", exc)

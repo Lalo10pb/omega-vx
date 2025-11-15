@@ -43,7 +43,12 @@ from omega_vx.clients import (
 )
 from omega_vx.logging_utils import configure_logger, install_print_bridge
 from omega_vx.notifications import send_email, send_telegram_alert
-from health_watchdog import DEFAULT_TARGETS as WATCHDOG_DEFAULT_TARGETS, parse_targets as parse_watchdog_targets, run_watchdog
+from health_watchdog import (
+    DEFAULT_TARGETS as WATCHDOG_DEFAULT_TARGETS,
+    collect_statuses,
+    parse_targets as parse_watchdog_targets,
+    run_watchdog,
+)
 from account_logging import (
     AccountSnapshot,
     append_equity_curve,
@@ -2912,6 +2917,25 @@ def start_watchdog_thread():
     threading.Thread(target=_loop, daemon=True, name="Watchdog").start()
 
 
+def _watchdog_snapshot() -> dict:
+    statuses = collect_statuses(WATCHDOG_TARGETS)
+    return {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "issues": [status.label for status in statuses if not status.ok],
+        "targets": [
+            {
+                "label": status.label,
+                "path": str(status.path),
+                "ok": status.ok,
+                "detail": status.detail,
+                "max_age_seconds": status.max_age_seconds,
+                "age_seconds": status.age_seconds,
+            }
+            for status in statuses
+        ],
+    }
+
+
 def start_account_logger_thread():
     if not ACCOUNT_LOG_THREAD_ENABLED:
         print("📊 Account snapshot thread disabled (ACCOUNT_LOG_THREAD_ENABLED=0).", tag="ACCTLOG")
@@ -3081,6 +3105,20 @@ def webhook():
 @app.route("/ping", methods=["GET"])
 def ping():
     return "pong", 200
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    snapshot = _watchdog_snapshot()
+    snapshot.update({
+        "status": "ok" if not snapshot["issues"] else "degraded",
+        "bot": {
+            "watchdog_thread": bool(WATCHDOG_THREAD_ENABLED),
+            "account_logger": bool(ACCOUNT_LOG_THREAD_ENABLED),
+        },
+    })
+    code = 200 if not snapshot["issues"] else 503
+    return jsonify(snapshot), code
 
 MAX_EQUITY_FILE = os.path.join(LOG_DIR, "max_equity.txt")
 SNAPSHOT_LOG_PATH = os.path.join(LOG_DIR, "last_snapshot.txt")

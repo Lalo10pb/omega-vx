@@ -19,6 +19,7 @@ from omega_vx.notifications import send_email, send_telegram_alert
 __all__ = [
     "DEFAULT_TARGETS",
     "RENOTIFY_COOLDOWN",
+    "collect_statuses",
     "parse_targets",
     "run_watchdog",
 ]
@@ -34,12 +35,16 @@ RENOTIFY_COOLDOWN = timedelta(hours=6)
 WATCHDOG_EMAIL_ENABLED = omega_config.get_bool("WATCHDOG_EMAIL_ENABLED", "1")
 WATCHDOG_TELEGRAM_ENABLED = omega_config.get_bool("WATCHDOG_TELEGRAM_ENABLED", "1")
 
+WATCH_TRADE_LOG = omega_config.get_bool("WATCHDOG_INCLUDE_TRADE_LOG", "0")
+
 DEFAULT_TARGETS: List[Tuple[str, Path, int]] = [
-    ("trade_log.csv", LOG_DIR / "trade_log.csv", 60 * 60 * 2),  # 2 hours
     ("portfolio_log.csv", LOG_DIR / "portfolio_log.csv", 60 * 60 * 6),
     ("equity_curve.log", LOG_DIR / "equity_curve.log", 60 * 60 * 6),
     ("omega_vx_bot.log", LOG_DIR / "omega_vx_bot.log", 60 * 15),  # 15 minutes
 ]
+
+if WATCH_TRADE_LOG:
+    DEFAULT_TARGETS.insert(0, ("trade_log.csv", LOG_DIR / "trade_log.csv", 60 * 60 * 2))  # 2 hours
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -109,33 +114,38 @@ def _persist_alert_state(issue_labels: list[str], last_alert: datetime | None) -
     ALERT_STATE_FILE.write_text(json.dumps(payload))
 
 
-def run_watchdog(targets: List[Tuple[str, Path, int]], quiet: bool = False, notify: bool = True) -> int:
-    statuses: list[TargetStatus] = []
-    for label, path, max_age in targets:
-        status = _check_target(label, path, max_age)
-        statuses.append(status)
-        if not quiet:
-            icon = "✅" if status.ok else "⏰"
-            detail = status.detail
-            if status.age_seconds is not None and status.ok:
-                detail = f"{detail}"
-            print(f"{icon} {label}: {detail}")
+def collect_statuses(targets: List[Tuple[str, Path, int]]) -> list[TargetStatus]:
+    return [_check_target(label, path, max_age) for label, path, max_age in targets]
 
+
+def _summarize_statuses(statuses: list[TargetStatus]) -> tuple[list[str], str]:
     issues = [status for status in statuses if not status.ok]
     if not issues:
+        return [], "🟢 All monitored files are within thresholds."
+
+    alert_lines = [f"⚠️ Omega Watchdog detected {len(issues)} issue(s):"]
+    for status in issues:
+        alert_lines.append(f"• {status.label}: {status.detail}")
+    return [status.label for status in issues], "\n".join(alert_lines)
+
+
+def run_watchdog(targets: List[Tuple[str, Path, int]], quiet: bool = False, notify: bool = True) -> int:
+    statuses = collect_statuses(targets)
+    for status in statuses:
         if not quiet:
-            print("🟢 All monitored files are within thresholds.")
+            icon = "✅" if status.ok else "⏰"
+            print(f"{icon} {status.label}: {status.detail}")
+
+    issue_labels, alert_text = _summarize_statuses(statuses)
+    if not issue_labels:
+        if not quiet:
+            print(alert_text)
         prev_issues, _ = _load_alert_state()
         if prev_issues:
             _persist_alert_state([], None)
         return 0
 
-    alert_lines = [f"⚠️ Omega Watchdog detected {len(issues)} issue(s):"]
-    for status in issues:
-        alert_lines.append(f"• {status.label}: {status.detail}")
-    alert_text = "\n".join(alert_lines)
-
-    issue_labels = sorted(status.label for status in issues)
+    issue_labels = sorted(issue_labels)
     previous_labels, last_alert_at = _load_alert_state()
     now = datetime.now()
 
@@ -165,7 +175,7 @@ def run_watchdog(targets: List[Tuple[str, Path, int]], quiet: bool = False, noti
 
     if not quiet:
         print(alert_text)
-    return len(issues)
+    return len(issue_labels)
 
 
 def parse_args() -> argparse.Namespace:
