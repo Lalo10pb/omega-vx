@@ -44,6 +44,13 @@ from omega_vx.clients import (
 from omega_vx.logging_utils import configure_logger, install_print_bridge
 from omega_vx.notifications import send_email, send_telegram_alert
 from health_watchdog import DEFAULT_TARGETS as WATCHDOG_DEFAULT_TARGETS, parse_targets as parse_watchdog_targets, run_watchdog
+from account_logging import (
+    AccountSnapshot,
+    append_equity_curve,
+    record_account_snapshot,
+    PORTFOLIO_LOG_PATH,
+    EQUITY_CURVE_LOG_PATH,
+)
 
 from api.ibkr_adapter import IBKRAdapter
 from weekly_email_report import analyze_weekly_trades
@@ -2905,64 +2912,6 @@ def start_watchdog_thread():
     threading.Thread(target=_loop, daemon=True, name="Watchdog").start()
 
 
-def _repair_portfolio_log_header_if_needed() -> None:
-    """Ensure portfolio_log.csv begins with a header row."""
-    path = Path(PORTFOLIO_LOG_PATH)
-    if not path.exists():
-        return
-    try:
-        with path.open("r", newline="") as src:
-            first_line = src.readline().strip().lower()
-            if first_line.startswith("timestamp"):
-                return
-        with path.open("r", newline="") as src:
-            rows = [row for row in csv.reader(src) if row]
-    except Exception as err:
-        print(f"⚠️ Portfolio log header inspect failed: {err}", tag="ACCTLOG")
-        return
-    try:
-        with path.open("w", newline="") as dest:
-            writer = csv.writer(dest)
-            writer.writerow(PORTFOLIO_LOG_HEADER)
-            writer.writerows(rows)
-        print("🩹 Portfolio log header repaired (legacy rows preserved).", tag="ACCTLOG")
-    except Exception as err:
-        print(f"⚠️ Portfolio log header repair failed: {err}", tag="ACCTLOG")
-
-
-def _append_portfolio_snapshot() -> None:
-    """Fetch account balances and append them to portfolio_log.csv."""
-    try:
-        account = trading_client.get_account()
-        snapshot = [
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            round(float(account.equity), 2),
-            round(float(account.cash), 2),
-            round(float(account.portfolio_value), 2),
-        ]
-    except Exception as err:
-        print(f"⚠️ Failed to fetch account snapshot: {err}", tag="ACCTLOG")
-        return
-
-    path = Path(PORTFOLIO_LOG_PATH)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
-
-    _repair_portfolio_log_header_if_needed()
-    needs_header = not path.exists() or path.stat().st_size == 0
-    try:
-        with path.open("a", newline="") as handle:
-            writer = csv.writer(handle)
-            if needs_header:
-                writer.writerow(PORTFOLIO_LOG_HEADER)
-            writer.writerow(snapshot)
-        print("💾 Portfolio snapshot logged.", tag="ACCTLOG")
-    except Exception as err:
-        print(f"⚠️ Failed to append portfolio snapshot: {err}", tag="ACCTLOG")
-
-
 def start_account_logger_thread():
     if not ACCOUNT_LOG_THREAD_ENABLED:
         print("📊 Account snapshot thread disabled (ACCOUNT_LOG_THREAD_ENABLED=0).", tag="ACCTLOG")
@@ -2975,10 +2924,13 @@ def start_account_logger_thread():
         )
         while True:
             try:
-                log_equity_curve()
+                snapshot = record_account_snapshot()
+                print(
+                    f"💾 Snapshot logged — Equity ${snapshot.equity:.2f}, Cash ${snapshot.cash:.2f}",
+                    tag="ACCTLOG",
+                )
             except Exception as exc:
-                print(f"⚠️ Equity log error: {exc}", tag="ACCTLOG")
-            _append_portfolio_snapshot()
+                print(f"⚠️ Account snapshot error: {exc}", tag="ACCTLOG")
             time.sleep(ACCOUNT_LOG_INTERVAL_SECONDS)
 
     threading.Thread(target=_loop, daemon=True, name="AccountLogger").start()
@@ -2987,10 +2939,7 @@ def start_account_logger_thread():
 def log_equity_curve():
     try:
         equity = get_account_equity()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        with open(EQUITY_CURVE_LOG_PATH, "a") as f:
-            f.write(f"[{now}] EQUITY: ${equity:.2f}\n")
+        append_equity_curve(equity=equity)
 
         print(f"📈 Equity logged: ${equity:.2f}")
     except Exception as e:
@@ -3135,10 +3084,8 @@ def ping():
 
 MAX_EQUITY_FILE = os.path.join(LOG_DIR, "max_equity.txt")
 SNAPSHOT_LOG_PATH = os.path.join(LOG_DIR, "last_snapshot.txt")
-PORTFOLIO_LOG_PATH = os.path.join(LOG_DIR, "portfolio_log.csv")
 TRADE_LOG_PATH = os.path.join(LOG_DIR, "trade_log.csv")
 FILLED_TRADES_PATH = str(BASE_DIR / "filled_trades.csv")
-PORTFOLIO_LOG_HEADER = ["timestamp", "equity", "cash", "portfolio_value"]
 TRADE_LOG_HEADER = [
     "timestamp",
     "symbol",
@@ -3860,24 +3807,11 @@ def submit_order_with_retries(
 
 def log_portfolio_snapshot():
     try:
-        account = trading_client.get_account()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        equity = float(account.equity)
-        cash = float(account.cash)
-        portfolio_value = float(account.portfolio_value)
-
-        row = [timestamp, equity, cash, portfolio_value, "intraday", "", ""]
-
-        # ✅ Log to local CSV file
-        file_exists = os.path.exists(PORTFOLIO_LOG_PATH)
-        with open(PORTFOLIO_LOG_PATH, mode='a', newline='') as file:
-            writer = csv.writer(file)
-            if not file_exists:
-                writer.writerow(["timestamp", "equity", "cash", "portfolio_value", "session_type", "hold_reason", "close_reason"])
-            writer.writerow(row)
+        snapshot = record_account_snapshot()
+        row = snapshot.as_row() + ["intraday", "", ""]
 
         print("✅ Daily snapshot logged (CSV):", row)
-        send_telegram_alert(f"📸 Snapshot logged: Equity ${equity:.2f}, Cash ${cash:.2f}")
+        send_telegram_alert(f"📸 Snapshot logged: Equity ${snapshot.equity:.2f}, Cash ${snapshot.cash:.2f}")
 
         # ✅ Also log to Google Sheet
         try:

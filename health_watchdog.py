@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple
@@ -34,10 +35,10 @@ WATCHDOG_EMAIL_ENABLED = omega_config.get_bool("WATCHDOG_EMAIL_ENABLED", "1")
 WATCHDOG_TELEGRAM_ENABLED = omega_config.get_bool("WATCHDOG_TELEGRAM_ENABLED", "1")
 
 DEFAULT_TARGETS: List[Tuple[str, Path, int]] = [
-    ("filled_trades.csv", BASE_DIR / "filled_trades.csv", 60 * 60 * 6),  # 6 hours
+    ("trade_log.csv", LOG_DIR / "trade_log.csv", 60 * 60 * 2),  # 2 hours
     ("portfolio_log.csv", LOG_DIR / "portfolio_log.csv", 60 * 60 * 6),
-    ("omega_vx_bot.log", LOG_DIR / "omega_vx_bot.log", 60 * 15),  # 15 minutes
     ("equity_curve.log", LOG_DIR / "equity_curve.log", 60 * 60 * 6),
+    ("omega_vx_bot.log", LOG_DIR / "omega_vx_bot.log", 60 * 15),  # 15 minutes
 ]
 
 
@@ -55,17 +56,35 @@ def _format_elapsed(seconds: float) -> str:
     return " ".join(parts)
 
 
-def _check_file(path: Path, max_age_seconds: int) -> tuple[bool, str]:
+@dataclass
+class TargetStatus:
+    label: str
+    path: Path
+    max_age_seconds: int
+    ok: bool
+    detail: str
+    age_seconds: float | None = None
+
+
+def _check_target(label: str, path: Path, max_age_seconds: int) -> TargetStatus:
     if not path.exists():
-        return False, f"❌ {path} missing"
+        return TargetStatus(label, path, max_age_seconds, False, f"{path} missing")
     try:
         mtime = datetime.fromtimestamp(path.stat().st_mtime)
     except Exception as exc:
-        return False, f"⚠️ Could not read {path}: {exc}"
+        return TargetStatus(label, path, max_age_seconds, False, f"Could not read {path}: {exc}")
     age = (datetime.now() - mtime).total_seconds()
     if age > max_age_seconds:
-        return False, f"⏰ {path} stale — { _format_elapsed(age) } old (limit { _format_elapsed(max_age_seconds) })"
-    return True, f"✅ {path.name} fresh ({_format_elapsed(age)} old)"
+        detail = f"{_format_elapsed(age)} old (limit {_format_elapsed(max_age_seconds)})"
+        return TargetStatus(label, path, max_age_seconds, False, detail, age)
+    return TargetStatus(
+        label,
+        path,
+        max_age_seconds,
+        True,
+        f"{_format_elapsed(age)} old",
+        age,
+    )
 
 
 def _load_alert_state() -> tuple[list[str], datetime | None]:
@@ -91,14 +110,18 @@ def _persist_alert_state(issue_labels: list[str], last_alert: datetime | None) -
 
 
 def run_watchdog(targets: List[Tuple[str, Path, int]], quiet: bool = False, notify: bool = True) -> int:
-    issues = []
+    statuses: list[TargetStatus] = []
     for label, path, max_age in targets:
-        ok, message = _check_file(path, max_age)
-        if not ok:
-            issues.append((label, message))
+        status = _check_target(label, path, max_age)
+        statuses.append(status)
         if not quiet:
-            print(message)
+            icon = "✅" if status.ok else "⏰"
+            detail = status.detail
+            if status.age_seconds is not None and status.ok:
+                detail = f"{detail}"
+            print(f"{icon} {label}: {detail}")
 
+    issues = [status for status in statuses if not status.ok]
     if not issues:
         if not quiet:
             print("🟢 All monitored files are within thresholds.")
@@ -107,11 +130,12 @@ def run_watchdog(targets: List[Tuple[str, Path, int]], quiet: bool = False, noti
             _persist_alert_state([], None)
         return 0
 
-    alert_lines = ["⚠️ Omega Watchdog detected stale/missing assets:"]
-    alert_lines.extend(msg for _, msg in issues)
+    alert_lines = [f"⚠️ Omega Watchdog detected {len(issues)} issue(s):"]
+    for status in issues:
+        alert_lines.append(f"• {status.label}: {status.detail}")
     alert_text = "\n".join(alert_lines)
 
-    issue_labels = sorted(label for label, _ in issues)
+    issue_labels = sorted(status.label for status in issues)
     previous_labels, last_alert_at = _load_alert_state()
     now = datetime.now()
 
