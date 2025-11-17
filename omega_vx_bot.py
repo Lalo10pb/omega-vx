@@ -5379,6 +5379,7 @@ if __name__ == "__main__":
             start_watchdog_thread()
             start_account_logger_thread()
             start_eod_close_thread()
+            start_auto_sell_monitor()
             start_weekly_flush_scheduler()
             start_protection_guardian_scheduler()
     app.run(host="0.0.0.0", port=port, debug=False)
