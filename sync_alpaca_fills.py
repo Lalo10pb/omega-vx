@@ -39,6 +39,19 @@ HEADERS = {
     "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY or "",
 }
 
+DEFAULT_APCA_BASE_URL = "https://paper-api.alpaca.markets"
+
+
+def _normalize_base_url(base_url: str | None) -> str:
+    """Remove a trailing /v2 if present so endpoints don't double the version."""
+    base = (base_url or DEFAULT_APCA_BASE_URL).rstrip("/")
+    if base.endswith("/v2"):
+        base = base[: -len("/v2")]
+    return base
+
+
+APCA_API_BASE_URL = _normalize_base_url(omega_config.get_env("APCA_API_BASE_URL"))
+
 FILLED_HEADER = [
     "timestamp",
     "symbol",
@@ -118,14 +131,14 @@ def _determine_after(state: Dict, lookback_days: int) -> datetime:
             return dt - timedelta(seconds=1)
         except Exception:
             pass
-    return datetime.utcnow() - timedelta(days=lookback_days)
+    return datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
 
 def _fetch_fill_activities(after: datetime) -> List[dict]:
     if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
         raise RuntimeError("Missing Alpaca API credentials.")
 
-    url = f"{APCA_API_BASE_URL.rstrip('/')}/v2/account/activities/FILL"
+    url = f"{APCA_API_BASE_URL}/v2/account/activities/FILL"
     params = {
         "direction": "asc",
         "page_size": 100,
@@ -134,6 +147,12 @@ def _fetch_fill_activities(after: datetime) -> List[dict]:
     activities: List[dict] = []
     while True:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        if resp.status_code == 401:
+            raise RuntimeError(
+                f"Alpaca API returned 401 (Unauthorized). "
+                f"Verify APCA_API_KEY_ID/APCA_API_SECRET_KEY and that APCA_API_BASE_URL omits '/v2' "
+                f"(current base: {APCA_API_BASE_URL})."
+            )
         resp.raise_for_status()
         batch = resp.json()
         if not batch:
