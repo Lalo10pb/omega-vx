@@ -14,6 +14,7 @@ import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import time
 from typing import Dict, List, Tuple
 
 import requests
@@ -65,6 +66,23 @@ FILLED_HEADER = [
 ]
 
 EPS = 1e-6
+HTTP_RETRIES = 3
+HTTP_BACKOFF = 2.0
+
+
+def _http_get_with_retry(url: str, params: dict) -> requests.Response:
+    """GET with small retry/backoff to withstand transient API hiccups."""
+    attempt = 1
+    while True:
+        try:
+            return requests.get(url, headers=HEADERS, params=params, timeout=20)
+        except Exception as exc:
+            if attempt >= HTTP_RETRIES:
+                raise
+            wait = HTTP_BACKOFF * attempt
+            print(f"⚠️ HTTP retry {attempt}/{HTTP_RETRIES} for fills: {exc} — sleeping {wait:.1f}s")
+            time.sleep(wait)
+            attempt += 1
 
 
 def _isoformat(dt: datetime) -> str:
@@ -146,7 +164,7 @@ def _fetch_fill_activities(after: datetime) -> List[dict]:
     }
     activities: List[dict] = []
     while True:
-        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        resp = _http_get_with_retry(url, params=params)
         if resp.status_code == 401:
             raise RuntimeError(
                 f"Alpaca API returned 401 (Unauthorized). "
