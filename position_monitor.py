@@ -13,9 +13,18 @@ API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 PAPER_MODE = str(os.getenv("ALPACA_PAPER", "true")).strip().lower() in ("1", "true", "yes")
 
 client = TradingClient(API_KEY, API_SECRET, paper=PAPER_MODE)
-# ✅ Thresholds
-TAKE_PROFIT_THRESHOLD = 5.0  # +5%
-STOP_LOSS_THRESHOLD = -1.5   # -1.5%
+
+
+def _pct_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except Exception:
+        return default
+
+
+# ✅ Thresholds (align with watchdog/fallback envs from omega_vx_bot)
+TAKE_PROFIT_THRESHOLD = _pct_env("WATCHDOG_TAKE_PROFIT_PCT", _pct_env("FALLBACK_TAKE_PROFIT_PCT", 5.0))
+STOP_LOSS_THRESHOLD = -abs(_pct_env("WATCHDOG_HARD_STOP_PCT", _pct_env("FALLBACK_STOP_LOSS_PCT", 3.0)))
 
 def send_telegram_alert(message):
     import requests
@@ -40,20 +49,14 @@ def monitor_positions():
             print(f"{symbol}: {qty} shares at ${entry_price:.2f} → {percent_change:.2f}%")
 
             # 📈 Take Profit if gain >= +5%
-            if percent_change >= 5.0:
+            if percent_change >= TAKE_PROFIT_THRESHOLD:
                 print(f"🏆 Closing {symbol} — Profit target hit ({percent_change:.2f}%)")
                 client.close_position(symbol)
                 send_telegram_alert(f"🏆 {symbol} closed at +{percent_change:.2f}% profit")
 
-            # 📉 Stop Loss if loss <= -3%
-            elif percent_change <= -3.0:
-                print(f"❌ Closing {symbol} — Stop loss hit ({percent_change:.2f}%)")
-                client.close_position(symbol)
-                send_telegram_alert(f"❌ {symbol} closed at {percent_change:.2f}% loss")
-
             # 📉 Auto-close if loss exceeds threshold
-            if percent_change <= STOP_LOSS_THRESHOLD:
-                print(f"❌ Closing {symbol} due to loss ({percent_change:.2f}%)")
+            elif percent_change <= STOP_LOSS_THRESHOLD:
+                print(f"❌ Closing {symbol} — Stop loss hit ({percent_change:.2f}%)")
                 client.close_position(symbol)
                 send_telegram_alert(f"❌ Auto-closed {symbol} due to loss ({percent_change:.2f}%)")
 

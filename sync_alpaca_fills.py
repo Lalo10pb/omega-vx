@@ -205,20 +205,33 @@ def _serialize_inventory(inventory: Dict[str, List[dict]]) -> Dict[str, List[dic
 
 
 def _is_duplicate(candidate: dict, existing_ids: set[str], existing_rows: List[dict]) -> bool:
+    """
+    Check for duplicates. Prioritize the unique activity_id from Alpaca.
+    As a fallback for older records without an ID, check for a close match on symbol, timestamp, and price.
+    """
     activity_id = candidate.get("activity_id")
     if activity_id and activity_id in existing_ids:
         return True
-    symbol = candidate["symbol"]
+    if activity_id:
+        return False  # unique id, not seen before
+
+    symbol = candidate.get("symbol")
     exit_price = candidate.get("exit_price")
-    timestamp = datetime.strptime(candidate["timestamp"], "%Y-%m-%d %H:%M:%S")
+    try:
+        ts = datetime.strptime(candidate.get("timestamp"), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        ts = None
+
     for row in existing_rows:
-        if row["symbol"] != symbol:
+        if row.get("symbol") != symbol:
             continue
-        if row["timestamp"] and abs((timestamp - row["timestamp"]).total_seconds()) > 180:
-            continue
-        if row["exit_price"] is not None and exit_price is not None:
-            if abs(row["exit_price"] - exit_price) > 0.01:
+        row_ts = row.get("timestamp")
+        if ts and row_ts:
+            if abs((ts - row_ts).total_seconds()) > 180:
                 continue
+        row_px = row.get("exit_price")
+        if exit_price is not None and row_px is not None and abs(exit_price - row_px) > 0.02:
+            continue
         return True
     return False
 

@@ -1,3 +1,4 @@
+from __future__ import annotations
 # === Flask and Webhook Handling ===
 from flask import Flask, request, jsonify
 
@@ -143,6 +144,7 @@ MAX_RISK_AUTO_MIN = _float_env("MAX_RISK_AUTO_MIN_PCT", MAX_RISK_BASE_PERCENT)
 MAX_RISK_AUTO_MAX = _float_env("MAX_RISK_AUTO_MAX_PCT", MAX_RISK_BASE_PERCENT)
 MAX_RISK_AUTO_UP_STEP = _float_env("MAX_RISK_AUTO_UP_STEP", 0.0)
 MAX_RISK_AUTO_DOWN_STEP = _float_env("MAX_RISK_AUTO_DOWN_STEP", 0.0)
+PORTFOLIO_HEAT_LIMIT_PCT = _float_env("PORTFOLIO_HEAT_LIMIT_PCT", 12.0)
 EQUITY_GUARD_MIN_DRAWDOWN = _float_env("EQUITY_GUARD_MIN_DRAWDOWN_PCT", 0.10)
 EQUITY_GUARD_STALE_RATIO = _float_env("EQUITY_GUARD_STALE_RATIO", 5.0)
 EQUITY_GUARD_MAX_EQUITY_FLOOR = _float_env("EQUITY_GUARD_MAX_EQUITY_FLOOR", 0.0)
@@ -168,6 +170,7 @@ CANDIDATE_LOG_PATH = _clean_env(os.getenv("CANDIDATE_LOG_PATH", ""))
 CANDIDATE_LOG_ENABLED = bool(CANDIDATE_LOG_PATH)
 GUARDIAN_REARM_DELAY = max(0, _int_env("GUARDIAN_REARM_DELAY", 5))
 GUARDIAN_LOG_MODE = (_clean_env(os.getenv("GUARDIAN_LOG_MODE", "quiet") or "quiet")).lower()
+TRADE_LOG_PATH = os.path.join(LOG_DIR, "trade_log.csv")
 if GUARDIAN_LOG_MODE not in {"quiet", "verbose"}:
     GUARDIAN_LOG_MODE = "quiet"
 GUARDIAN_LOG_VERBOSE = GUARDIAN_LOG_MODE == "verbose"
@@ -612,6 +615,45 @@ def _fetch_data_with_fallback(request_function, symbol, feed=_DATA_FEED):
 CRASH_LOG_FILE = os.path.join(LOG_DIR, "last_boot.txt")
 LAST_BLOCK_FILE = os.path.join(LOG_DIR, "last_block.txt")
 LAST_TRADE_FILE = os.path.join(LOG_DIR, "last_trade_time.txt")
+
+
+def _record_trade_timestamp(ts: Optional[datetime] = None) -> None:
+    """Persist the last successful trade timestamp for cooldown checks."""
+    ts = ts or datetime.now(timezone.utc)
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(LAST_TRADE_FILE, "w") as handle:
+            handle.write(ts.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception as err:
+        print(f"⚠️ Could not persist last trade time: {err}")
+
+
+def is_cooldown_active(now: Optional[datetime] = None) -> bool:
+    """Global trade cooldown to avoid rapid-fire entries."""
+    if TRADE_COOLDOWN_SECONDS <= 0:
+        return False
+    now = now or datetime.now(timezone.utc)
+    try:
+        with open(LAST_TRADE_FILE) as handle:
+            raw = handle.read().strip()
+    except FileNotFoundError:
+        return False
+    except Exception as err:
+        print(f"⚠️ Error reading last trade time: {err}")
+        return False
+    if not raw:
+        return False
+    try:
+        last = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except Exception:
+        try:
+            last = datetime.fromisoformat(raw)
+            if last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+        except Exception:
+            return False
+    elapsed = (now - last).total_seconds()
+    return elapsed < TRADE_COOLDOWN_SECONDS
 
 # === Broker Clients ===
 if IS_IBKR:
@@ -1100,6 +1142,52 @@ def _broker_get_all_positions():
             return []
         return [broker.build_position_namespace(p) for p in broker.positions()]
     return trading_client.get_all_positions()
+
+
+def _estimate_open_risk_dollars() -> float:
+    """
+    Best-effort estimate of total open risk using persisted SLs.
+    If no SL is known, assume a fallback SL at FALLBACK_STOP_LOSS_PCT below entry.
+    """
+    try:
+        positions = _broker_get_all_positions()
+    except Exception as err:
+        print(f"⚠️ Heat guard: position fetch failed: {err}")
+        return 0.0
+    if not positions:
+        return 0.0
+
+    state_map = _load_protection_state_map()
+    total_risk = 0.0
+    for pos in positions:
+        try:
+            symbol = str(getattr(pos, "symbol", "")).upper()
+        except Exception:
+            symbol = ""
+        if not symbol:
+            continue
+        try:
+            qty = abs(int(float(getattr(pos, "qty", 0) or 0)))
+        except Exception:
+            qty = 0
+        if qty <= 0:
+            continue
+        try:
+            entry = float(getattr(pos, "avg_entry_price", 0) or getattr(pos, "current_price", 0) or 0)
+        except Exception:
+            entry = 0.0
+        if entry <= 0:
+            continue
+        stored = state_map.get(symbol, {})
+        try:
+            sl = float(stored.get("stop_loss") or 0)
+        except Exception:
+            sl = 0.0
+        if sl <= 0 or sl >= entry:
+            sl = entry * (1 - FALLBACK_STOP_LOSS_PCT / 100.0)
+        risk_per_share = max(0.0, entry - sl)
+        total_risk += risk_per_share * qty
+    return total_risk
 
 # === Dev flags ===
 
@@ -3484,6 +3572,16 @@ def submit_order_with_retries(
     """
     print("📌 About to calculate quantity...")
 
+    if not dry_run and is_cooldown_active():
+        remaining = max(0, TRADE_COOLDOWN_SECONDS)
+        msg = f"⏳ Global cooldown active ({remaining}s window); skipping BUY {symbol}."
+        print(msg)
+        try:
+            send_telegram_alert(msg)
+        except Exception:
+            pass
+        return False
+
     if not dry_run and _pdt_global_lockout_active():
         remaining = _pdt_global_lockout_remaining()
         msg = f"⏳ PDT lockout active ({remaining}s) — skipping BUY {symbol}."
@@ -3703,6 +3801,25 @@ def submit_order_with_retries(
     abs_sl = _quantize_to_tick(abs_sl)
     print(f"🧭 TP/SL sanity → last={last_px:.2f} | TP={abs_tp} | SL={abs_sl}")
 
+    if PORTFOLIO_HEAT_LIMIT_PCT > 0 and not dry_run:
+        equity = get_account_equity()
+        if equity > 0:
+            open_risk = _estimate_open_risk_dollars()
+            new_risk = max(0.0, float(entry) - abs_sl) * qty
+            heat_pct = ((open_risk + new_risk) / equity) * 100.0
+            if heat_pct > PORTFOLIO_HEAT_LIMIT_PCT:
+                msg = (
+                    f"🛑 Heat guard: open risk ${(open_risk + new_risk):.2f} "
+                    f"would be {heat_pct:.1f}% of equity (limit {PORTFOLIO_HEAT_LIMIT_PCT}%). "
+                    f"Skipping BUY {symbol}."
+                )
+                print(msg)
+                try:
+                    send_telegram_alert(msg)
+                except Exception:
+                    pass
+                return False
+
     # ---- BUY leg (bracket on Alpaca, manual on IBKR) ----
     plain_fallback_used = False
     buy_order = None
@@ -3841,6 +3958,11 @@ def submit_order_with_retries(
             print("📝 Trade logged to CSV.")
     except Exception as e:
         print(f"⚠️ Trade log failed: {e}")
+
+    try:
+        _record_trade_timestamp()
+    except Exception as ts_err:
+        print(f"⚠️ Could not record trade timestamp: {ts_err}")
     return True
 
 def log_portfolio_snapshot():
@@ -4954,21 +5076,6 @@ def start_auto_sell_monitor():
     t = threading.Thread(target=monitor, daemon=True, name="Watchdog")
     t.start()
 
-def is_cooldown_active():
-    if not os.path.exists(LAST_TRADE_FILE):
-        return False
-    with open(LAST_TRADE_FILE, 'r') as f:
-        last_trade_time_str = f.read().strip()
-    if not last_trade_time_str:
-        return False
-    try:
-        last_trade_time = datetime.strptime(last_trade_time_str, "%Y-%m-%d %H:%M:%S")
-        elapsed = (datetime.now() - last_trade_time).total_seconds()
-        return elapsed < TRADE_COOLDOWN_SECONDS
-    except Exception as e:
-        print("⚠️ Error reading last trade time:", e)
-        return False
-
 def is_ai_mood_bad():
     """Evaluate trade mood based on recent outcomes and equity drawdown."""
     try:
@@ -5145,10 +5252,6 @@ def log_trade(
 
     if str(action).upper() == "SELL":
         _log_day_trade_if_applicable(symbol, timestamp_str)
-
-    if status == "executed":
-        with open(LAST_TRADE_FILE, 'w') as f:
-            f.write(timestamp_str)
 
     # 🧠 Compile and log trade data
     trade_data = {
