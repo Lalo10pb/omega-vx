@@ -5,6 +5,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 import os
 from dateutil.parser import isoparse
+import csv
+from pathlib import Path
 
 load_dotenv()
 
@@ -26,6 +28,33 @@ def _pct_env(name: str, default: float) -> float:
 TAKE_PROFIT_THRESHOLD = _pct_env("WATCHDOG_TAKE_PROFIT_PCT", _pct_env("FALLBACK_TAKE_PROFIT_PCT", 5.0))
 STOP_LOSS_THRESHOLD = -abs(_pct_env("WATCHDOG_HARD_STOP_PCT", _pct_env("FALLBACK_STOP_LOSS_PCT", 3.0)))
 
+DECISION_LOG_PATH = Path(os.getenv("POSITION_MONITOR_LOG", "logs/decision_log.csv"))
+DECISION_FIELDS = [
+    "timestamp",
+    "symbol",
+    "action",
+    "qty",
+    "entry_price",
+    "current_price",
+    "percent_change",
+    "profit_usd",
+    "take_profit_threshold",
+    "stop_loss_threshold",
+    "paper_mode",
+]
+
+
+def _append_decision_log(row: dict) -> None:
+    """Append a single decision/outcome row for offline analysis."""
+    DECISION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = DECISION_LOG_PATH.exists() and DECISION_LOG_PATH.stat().st_size > 0
+    with DECISION_LOG_PATH.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=DECISION_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def send_telegram_alert(message):
     import requests
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -44,23 +73,41 @@ def monitor_positions():
             qty = float(pos.qty)
             current_price = float(pos.current_price)
             entry_price = float(pos.avg_entry_price)
+            profit_usd = (current_price - entry_price) * qty
 
             percent_change = ((current_price - entry_price) / entry_price) * 100
             print(f"{symbol}: {qty} shares at ${entry_price:.2f} → {percent_change:.2f}%")
 
+            action = "hold"
             # 📈 Take Profit if gain >= +5%
             if percent_change >= TAKE_PROFIT_THRESHOLD:
                 print(f"🏆 Closing {symbol} — Profit target hit ({percent_change:.2f}%)")
                 client.close_position(symbol)
                 send_telegram_alert(f"🏆 {symbol} closed at +{percent_change:.2f}% profit")
+                action = "take_profit"
 
             # 📉 Auto-close if loss exceeds threshold
             elif percent_change <= STOP_LOSS_THRESHOLD:
                 print(f"❌ Closing {symbol} — Stop loss hit ({percent_change:.2f}%)")
                 client.close_position(symbol)
                 send_telegram_alert(f"❌ Auto-closed {symbol} due to loss ({percent_change:.2f}%)")
+                action = "stop_loss"
 
-            # ✅ Optional: add take-profit logic here if you want
+            _append_decision_log(
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "symbol": symbol,
+                    "action": action,
+                    "qty": qty,
+                    "entry_price": entry_price,
+                    "current_price": current_price,
+                    "percent_change": percent_change,
+                    "profit_usd": profit_usd,
+                    "take_profit_threshold": TAKE_PROFIT_THRESHOLD,
+                    "stop_loss_threshold": STOP_LOSS_THRESHOLD,
+                    "paper_mode": PAPER_MODE,
+                }
+            )
 
     except Exception as e:
         print("⚠️ Error in monitor_positions:", e)
