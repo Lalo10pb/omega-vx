@@ -8,10 +8,11 @@ Offline threshold tuner and dataset builder for paper trades.
 import argparse
 import csv
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from statistics import median
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 
 DEFAULT_LOG = Path("logs/decision_log.csv")
@@ -100,6 +101,60 @@ def build_dataset(rows: List[Dict[str, Any]], path: Path) -> None:
             )
 
 
+def evaluate_policy(rows: List[Dict[str, Any]], tp: float, sl: float) -> Dict[str, Any]:
+    """
+    Approximate policy eval: use closed trades and ask whether the recorded P/L
+    would be classified as TP/SL given the candidate thresholds.
+    """
+    closed = [r for r in rows if r["action"] in ("take_profit", "stop_loss")]
+    if not closed:
+        return {"trades": 0}
+    considered = []
+    for r in closed:
+        pct = r["percent_change"]
+        action = "hold"
+        if pct >= tp:
+            action = "take_profit"
+        elif pct <= sl:
+            action = "stop_loss"
+        considered.append((action, r))
+
+    realized = [r for action, r in considered if action in ("take_profit", "stop_loss")]
+    if not realized:
+        return {"trades": 0}
+
+    profits = [r["profit_usd"] for r in realized]
+    pct_changes = [r["percent_change"] for r in realized]
+    wins = sum(1 for p in profits if p > 0)
+    avg_profit = sum(profits) / len(profits)
+    avg_pct = sum(pct_changes) / len(pct_changes)
+    return {
+        "trades": len(realized),
+        "wins": wins,
+        "win_rate": round(wins / len(realized), 4),
+        "avg_profit_usd": round(avg_profit, 4),
+        "avg_profit_pct": round(avg_pct, 4),
+        "tp": tp,
+        "sl": sl,
+    }
+
+
+def candidate_grid(positives: List[float], negatives: List[float]) -> List[Tuple[float, float]]:
+    base_tp = [2, 3, 4, 5, 6, 8, 10]
+    base_sl = [-1, -2, -3, -4, -5, -7]
+    if positives:
+        base_tp.append(round(_quantile(positives, 0.7), 3))
+        base_tp.append(round(_quantile(positives, 0.85), 3))
+    if negatives:
+        base_sl.append(round(_quantile(negatives, 0.3), 3))
+        base_sl.append(round(_quantile(negatives, 0.15), 3))
+    grid = []
+    for tp in sorted({v for v in base_tp if v}):
+        for sl in sorted({v for v in base_sl if v}):
+            grid.append((tp, sl))
+    return grid
+
+
 def suggest_thresholds(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     closed = [r for r in rows if r["action"] in ("take_profit", "stop_loss")]
     if not closed:
@@ -122,12 +177,39 @@ def suggest_thresholds(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "min_profit_pct": round(min(pct_changes), 4),
     }
 
+    leaderboard = []
+    for tp, sl in candidate_grid(positives, negatives):
+        res = evaluate_policy(closed, tp, sl)
+        if res.get("trades", 0) == 0:
+            continue
+        leaderboard.append(res)
+    leaderboard = sorted(leaderboard, key=lambda r: (r.get("avg_profit_usd", 0), r.get("win_rate", 0)), reverse=True)
+
+    best = leaderboard[0] if leaderboard else None
+
+    drift_alert = None
+    min_trades = 5
+    min_win = float(os.getenv("TUNER_MIN_WIN_RATE", 0.45))
+    if stats["trades_considered"] >= min_trades and stats["win_rate"] < min_win:
+        drift_alert = f"Win rate {stats['win_rate']} below guard {min_win}; pause promotions."
+
     suggestion = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "suggested_take_profit_pct": round(suggested_take_profit, 3) if suggested_take_profit else None,
         "suggested_stop_loss_pct": round(suggested_stop_loss, 3) if suggested_stop_loss else None,
         "reference_trades": stats,
+        "leaderboard": leaderboard[:10],
+        "best_candidate": best,
+        "drift_alert": drift_alert,
         "note": "These are based on observed exits; validate with backtests before applying.",
+    }
+
+    # Canary recommendation: start with smaller size and limited symbols if provided
+    canary_symbols = os.getenv("CANARY_SYMBOLS")
+    suggestion["canary_recommendation"] = {
+        "size_multiplier": 0.5,
+        "symbols": [s.strip() for s in canary_symbols.split(",")] if canary_symbols else [],
+        "comment": "Run candidate thresholds on reduced size first; compare vs control before full rollout.",
     }
     return suggestion
 

@@ -7,6 +7,7 @@ import os
 from dateutil.parser import isoparse
 import csv
 from pathlib import Path
+from typing import Optional
 
 load_dotenv()
 
@@ -31,8 +32,11 @@ STOP_LOSS_THRESHOLD = -abs(_pct_env("WATCHDOG_HARD_STOP_PCT", _pct_env("FALLBACK
 DECISION_LOG_PATH = Path(os.getenv("POSITION_MONITOR_LOG", "logs/decision_log.csv"))
 DECISION_FIELDS = [
     "timestamp",
+    "weekday_utc",
+    "hour_utc",
     "symbol",
     "action",
+    "exit_reason",
     "qty",
     "entry_price",
     "current_price",
@@ -41,6 +45,8 @@ DECISION_FIELDS = [
     "take_profit_threshold",
     "stop_loss_threshold",
     "paper_mode",
+    "risk_off",
+    "risk_tag",
 ]
 
 
@@ -53,6 +59,29 @@ def _append_decision_log(row: dict) -> None:
         if not file_exists:
             writer.writeheader()
         writer.writerow(row)
+
+
+def _risk_off_active() -> bool:
+    """
+    Simple risk-off switch controlled via env or a flag file.
+    - RISK_OFF=1 forces risk-off
+    - RISK_OFF_FILE=/path sets risk-off if the file exists
+    """
+    if str(os.getenv("RISK_OFF", "0")).strip().lower() in ("1", "true", "yes"):
+        return True
+    flag_file = os.getenv("RISK_OFF_FILE")
+    if flag_file and Path(flag_file).exists():
+        return True
+    return False
+
+
+def _risk_tag() -> Optional[str]:
+    """
+    Optional marker (e.g., 'high_vol', 'event_day') set via env RISK_TAG
+    to trace performance by regime.
+    """
+    tag = os.getenv("RISK_TAG")
+    return tag.strip() if tag else None
 
 
 def send_telegram_alert(message):
@@ -68,6 +97,9 @@ def monitor_positions():
         positions = client.get_all_positions()
         print("🔍 Monitoring open positions...")
 
+        risk_off = _risk_off_active()
+        risk_tag = _risk_tag()
+
         for pos in positions:
             symbol = pos.symbol
             qty = float(pos.qty)
@@ -79,12 +111,15 @@ def monitor_positions():
             print(f"{symbol}: {qty} shares at ${entry_price:.2f} → {percent_change:.2f}%")
 
             action = "hold"
+            exit_reason = "hold"
             # 📈 Take Profit if gain >= +5%
-            if percent_change >= TAKE_PROFIT_THRESHOLD:
+            tp_enabled = not risk_off or str(os.getenv("RISK_OFF_ALLOW_TP", "1")).lower() in ("1", "true", "yes")
+            if percent_change >= TAKE_PROFIT_THRESHOLD and tp_enabled:
                 print(f"🏆 Closing {symbol} — Profit target hit ({percent_change:.2f}%)")
                 client.close_position(symbol)
                 send_telegram_alert(f"🏆 {symbol} closed at +{percent_change:.2f}% profit")
                 action = "take_profit"
+                exit_reason = "tp_threshold"
 
             # 📉 Auto-close if loss exceeds threshold
             elif percent_change <= STOP_LOSS_THRESHOLD:
@@ -92,12 +127,18 @@ def monitor_positions():
                 client.close_position(symbol)
                 send_telegram_alert(f"❌ Auto-closed {symbol} due to loss ({percent_change:.2f}%)")
                 action = "stop_loss"
+                exit_reason = "sl_threshold"
+
+            now = datetime.utcnow()
 
             _append_decision_log(
                 {
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": now.isoformat(),
+                    "weekday_utc": now.weekday(),
+                    "hour_utc": now.hour,
                     "symbol": symbol,
                     "action": action,
+                    "exit_reason": exit_reason,
                     "qty": qty,
                     "entry_price": entry_price,
                     "current_price": current_price,
@@ -106,6 +147,8 @@ def monitor_positions():
                     "take_profit_threshold": TAKE_PROFIT_THRESHOLD,
                     "stop_loss_threshold": STOP_LOSS_THRESHOLD,
                     "paper_mode": PAPER_MODE,
+                    "risk_off": risk_off,
+                    "risk_tag": risk_tag or "",
                 }
             )
 
