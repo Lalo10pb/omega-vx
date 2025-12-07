@@ -1,3 +1,4 @@
+import random
 import time
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import ActivityType
@@ -7,7 +8,7 @@ import os
 from dateutil.parser import isoparse
 import csv
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 load_dotenv()
 
@@ -30,6 +31,7 @@ TAKE_PROFIT_THRESHOLD = _pct_env("WATCHDOG_TAKE_PROFIT_PCT", _pct_env("FALLBACK_
 STOP_LOSS_THRESHOLD = -abs(_pct_env("WATCHDOG_HARD_STOP_PCT", _pct_env("FALLBACK_STOP_LOSS_PCT", 3.0)))
 
 DECISION_LOG_PATH = Path(os.getenv("POSITION_MONITOR_LOG", "logs/decision_log.csv"))
+ACTIVITY_CACHE_PATH = Path(os.getenv("POSITION_MONITOR_ACTIVITY_CACHE", "logs/last_fill_activity.txt"))
 DECISION_FIELDS = [
     "timestamp",
     "weekday_utc",
@@ -47,6 +49,7 @@ DECISION_FIELDS = [
     "paper_mode",
     "risk_off",
     "risk_tag",
+    "max_hold_minutes",
 ]
 
 
@@ -84,13 +87,87 @@ def _risk_tag() -> Optional[str]:
     return tag.strip() if tag else None
 
 
-def send_telegram_alert(message):
-    import requests
+def _safe_send_telegram(message: str) -> None:
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    data = {"chat_id": chat_id, "text": message}
-    requests.post(url, data=data)
+    if not bot_token or not chat_id:
+        return
+    try:
+        import requests
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data = {"chat_id": chat_id, "text": message}
+        requests.post(url, data=data, timeout=10)
+    except Exception as exc:
+        print("⚠️ Telegram send skipped:", exc)
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except Exception:
+        return int(default)
+
+
+def _max_hold_minutes() -> int:
+    minutes = max(0, _int_env("MAX_HOLD_MINUTES", 0))
+    hours = max(0, _int_env("MAX_HOLD_HOURS", 0))
+    if hours:
+        minutes = max(minutes, hours * 60)
+    return minutes
+
+
+def _activity_timestamp(activity) -> Optional[datetime]:
+    txn = getattr(activity, "transaction_time", None)
+    if isinstance(txn, datetime):
+        return txn.replace(tzinfo=None)
+    if txn is None:
+        return None
+    try:
+        return isoparse(str(txn)).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _last_entry_times(activities) -> dict:
+    entries = {}
+    for activity in activities:
+        if getattr(activity, "side", "").lower() != "buy":
+            continue
+        ts = _activity_timestamp(activity)
+        if ts is None:
+            continue
+        symbol = getattr(activity, "symbol", None)
+        if not symbol:
+            continue
+        prev = entries.get(symbol)
+        if prev is None or ts > prev:
+            entries[symbol] = ts
+    return entries
+
+
+def _load_activity_cache() -> Tuple[Optional[str], Optional[datetime]]:
+    try:
+        if not ACTIVITY_CACHE_PATH.exists():
+            return None, None
+        raw = ACTIVITY_CACHE_PATH.read_text().strip()
+        if not raw:
+            return None, None
+        parts = raw.split(",", 1)
+        aid = parts[0] or None
+        ts = isoparse(parts[1]).replace(tzinfo=None) if len(parts) > 1 and parts[1] else None
+        return aid, ts
+    except Exception:
+        return None, None
+
+
+def _save_activity_cache(activity_id: Optional[str], ts: datetime) -> None:
+    try:
+        ACTIVITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        aid = activity_id or ""
+        ACTIVITY_CACHE_PATH.write_text(f"{aid},{ts.isoformat()}")
+    except Exception as exc:
+        print("⚠️ Could not write activity cache:", exc)
 
 def monitor_positions():
     try:
@@ -99,58 +176,79 @@ def monitor_positions():
 
         risk_off = _risk_off_active()
         risk_tag = _risk_tag()
+        max_hold_minutes = _max_hold_minutes()
+        try:
+            activities = client.get_activities(activity_type=ActivityType.FILL) if max_hold_minutes else []
+        except Exception as exc:
+            print("⚠️ Could not load fill history for hold timer:", exc)
+            activities = []
+        last_entry_map = _last_entry_times(activities) if max_hold_minutes else {}
 
         for pos in positions:
-            symbol = pos.symbol
-            qty = float(pos.qty)
-            current_price = float(pos.current_price)
-            entry_price = float(pos.avg_entry_price)
-            profit_usd = (current_price - entry_price) * qty
+            try:
+                symbol = pos.symbol
+                qty = float(pos.qty)
+                current_price = float(pos.current_price)
+                entry_price = float(pos.avg_entry_price)
+                profit_usd = (current_price - entry_price) * qty
 
-            percent_change = ((current_price - entry_price) / entry_price) * 100
-            print(f"{symbol}: {qty} shares at ${entry_price:.2f} → {percent_change:.2f}%")
+                percent_change = ((current_price - entry_price) / entry_price) * 100
+                print(f"{symbol}: {qty} shares at ${entry_price:.2f} → {percent_change:.2f}%")
 
-            action = "hold"
-            exit_reason = "hold"
-            # 📈 Take Profit if gain >= +5%
-            tp_enabled = not risk_off or str(os.getenv("RISK_OFF_ALLOW_TP", "1")).lower() in ("1", "true", "yes")
-            if percent_change >= TAKE_PROFIT_THRESHOLD and tp_enabled:
-                print(f"🏆 Closing {symbol} — Profit target hit ({percent_change:.2f}%)")
-                client.close_position(symbol)
-                send_telegram_alert(f"🏆 {symbol} closed at +{percent_change:.2f}% profit")
-                action = "take_profit"
-                exit_reason = "tp_threshold"
+                action = "hold"
+                exit_reason = "hold"
+                # 📈 Take Profit if gain >= +5%
+                tp_enabled = not risk_off or str(os.getenv("RISK_OFF_ALLOW_TP", "1")).lower() in ("1", "true", "yes")
+                if percent_change >= TAKE_PROFIT_THRESHOLD and tp_enabled:
+                    print(f"🏆 Closing {symbol} — Profit target hit ({percent_change:.2f}%)")
+                    client.close_position(symbol)
+                    _safe_send_telegram(f"🏆 {symbol} closed at +{percent_change:.2f}% profit")
+                    action = "take_profit"
+                    exit_reason = "tp_threshold"
 
-            # 📉 Auto-close if loss exceeds threshold
-            elif percent_change <= STOP_LOSS_THRESHOLD:
-                print(f"❌ Closing {symbol} — Stop loss hit ({percent_change:.2f}%)")
-                client.close_position(symbol)
-                send_telegram_alert(f"❌ Auto-closed {symbol} due to loss ({percent_change:.2f}%)")
-                action = "stop_loss"
-                exit_reason = "sl_threshold"
+                # 📉 Auto-close if loss exceeds threshold
+                elif percent_change <= STOP_LOSS_THRESHOLD:
+                    print(f"❌ Closing {symbol} — Stop loss hit ({percent_change:.2f}%)")
+                    client.close_position(symbol)
+                    _safe_send_telegram(f"❌ Auto-closed {symbol} due to loss ({percent_change:.2f}%)")
+                    action = "stop_loss"
+                    exit_reason = "sl_threshold"
 
-            now = datetime.utcnow()
+                # ⏳ Max hold enforcement (intraday stale positions)
+                elif max_hold_minutes and symbol in last_entry_map:
+                    held_minutes = (datetime.utcnow() - last_entry_map[symbol]).total_seconds() / 60.0
+                    if held_minutes >= max_hold_minutes:
+                        print(f"⏳ Closing {symbol} — Max hold {held_minutes:.1f}m exceeded")
+                        client.close_position(symbol)
+                        _safe_send_telegram(f"⏳ Auto-closed {symbol} after {held_minutes:.1f} minutes (max hold)")
+                        action = "max_hold"
+                        exit_reason = "max_hold_minutes"
 
-            _append_decision_log(
-                {
-                    "timestamp": now.isoformat(),
-                    "weekday_utc": now.weekday(),
-                    "hour_utc": now.hour,
-                    "symbol": symbol,
-                    "action": action,
-                    "exit_reason": exit_reason,
-                    "qty": qty,
-                    "entry_price": entry_price,
-                    "current_price": current_price,
-                    "percent_change": percent_change,
-                    "profit_usd": profit_usd,
-                    "take_profit_threshold": TAKE_PROFIT_THRESHOLD,
-                    "stop_loss_threshold": STOP_LOSS_THRESHOLD,
-                    "paper_mode": PAPER_MODE,
-                    "risk_off": risk_off,
-                    "risk_tag": risk_tag or "",
-                }
-            )
+                now = datetime.utcnow()
+
+                _append_decision_log(
+                    {
+                        "timestamp": now.isoformat(),
+                        "weekday_utc": now.weekday(),
+                        "hour_utc": now.hour,
+                        "symbol": symbol,
+                        "action": action,
+                        "exit_reason": exit_reason,
+                        "qty": qty,
+                        "entry_price": entry_price,
+                        "current_price": current_price,
+                        "percent_change": percent_change,
+                        "profit_usd": profit_usd,
+                        "take_profit_threshold": TAKE_PROFIT_THRESHOLD,
+                        "stop_loss_threshold": STOP_LOSS_THRESHOLD,
+                        "paper_mode": PAPER_MODE,
+                        "risk_off": risk_off,
+                        "risk_tag": risk_tag or "",
+                        "max_hold_minutes": max_hold_minutes,
+                    }
+                )
+            except Exception as exc:
+                print(f"⚠️ Skipping {getattr(pos, 'symbol', '?')} due to error:", exc)
 
     except Exception as e:
         print("⚠️ Error in monitor_positions:", e)
@@ -159,31 +257,42 @@ def log_closed_trades():
     try:
         activities = client.get_activities(activity_type=ActivityType.FILL)
         now = datetime.utcnow()
-        for activity in activities:
-            if activity.side == 'sell' and getattr(activity, 'transaction_time', None):
-                txn = activity.transaction_time
-                sell_time = None
-                if isinstance(txn, datetime):
-                    sell_time = txn.replace(tzinfo=None)
-                else:
-                    try:
-                        sell_time = isoparse(str(txn)).replace(tzinfo=None)
-                    except Exception:
-                        sell_time = None
-                if sell_time is None:
-                    continue
-                time_diff = (now - sell_time).total_seconds()
-                if time_diff < 70:  # trade closed in the last cycle
-                    symbol = activity.symbol
-                    qty = activity.qty
-                    price = activity.price
-                    profit = activity.net_amount
-                    print(f"📉 Closed {symbol} — Qty: {qty} at ${price} → P/L: ${profit}")
-                    send_telegram_alert(f"📉 Closed {symbol} — {qty} @ ${price} → P/L: ${profit}")
+        last_id, last_ts = _load_activity_cache()
+        newest_ts = last_ts
+        newest_id = last_id
+
+        for activity in sorted(activities, key=_activity_timestamp):
+            if getattr(activity, "side", "").lower() != "sell":
+                continue
+            sell_time = _activity_timestamp(activity)
+            if sell_time is None:
+                continue
+            if last_ts and sell_time <= last_ts:
+                continue
+            symbol = getattr(activity, "symbol", None)
+            qty = getattr(activity, "qty", None)
+            price = getattr(activity, "price", None)
+            profit = getattr(activity, "net_amount", None)
+            time_diff = (now - sell_time).total_seconds()
+            if time_diff < 70:  # trade closed in the last cycle
+                print(f"📉 Closed {symbol} — Qty: {qty} at ${price} → P/L: ${profit}")
+                _safe_send_telegram(f"📉 Closed {symbol} — {qty} @ ${price} → P/L: ${profit}")
+                if newest_ts is None or sell_time > newest_ts:
+                    newest_ts = sell_time
+                    newest_id = getattr(activity, "id", newest_id)
+
+        if newest_ts:
+            _save_activity_cache(newest_id, newest_ts)
     except Exception as e:
         print("⚠️ Error logging closed trades:", e)
 
-while True:
-    monitor_positions()
-    log_closed_trades()
-    time.sleep(60)
+def _main_loop():
+    while True:
+        monitor_positions()
+        log_closed_trades()
+        jitter = random.uniform(0, 5)
+        time.sleep(60 + jitter)
+
+
+if __name__ == "__main__":
+    _main_loop()

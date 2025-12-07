@@ -41,3 +41,16 @@ Schedule it (Render cron / systemd timer / cron) every 10–15 minutes to get ne
 | `WATCHDOG_TARGETS` | (empty) | Optional override matching the `name:path:seconds` format used by `--targets`. |
 
 When using the embedded worker, disable any external cron job to avoid duplicate alerts.
+
+### Position monitor helper (`position_monitor.py`)
+
+- `MAX_HOLD_MINUTES` / `MAX_HOLD_HOURS` – force-close intraday positions that linger without hitting TP/SL. Logged to `logs/decision_log.csv` with `exit_reason=max_hold_minutes`.
+- `POSITION_MONITOR_ACTIVITY_CACHE` – disk cache for last processed fill; prevents repeat Telegram alerts for the same sell.
+- `POSITION_MONITOR_LOG` – path to decision log (defaults to `logs/decision_log.csv`).
+- Telegram alerts are skipped automatically if `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are unset.
+
+Sample cron (every minute, with slight jitter baked in):
+
+```bash
+* * * * * /usr/bin/python /path/to/omega-vx/position_monitor.py >> /var/log/omega-vx/position_monitor.log 2>&1
+```
