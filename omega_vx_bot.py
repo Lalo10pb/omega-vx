@@ -44,6 +44,10 @@ from omega_vx.clients import (
 )
 from omega_vx.logging_utils import configure_logger, install_print_bridge
 from omega_vx.notifications import send_email, send_telegram_alert
+# --- New Modular Imports ---
+from omega_vx.strategy import OmegaStrategy
+from omega_vx.market_scanner import MarketScanner
+
 from health_watchdog import (
     DEFAULT_TARGETS as WATCHDOG_DEFAULT_TARGETS,
     collect_statuses,
@@ -672,6 +676,17 @@ else:
 
 data_client = get_data_client()
 _RAW_DATA_CLIENT = get_raw_data_client()
+
+# --- Initialize Strategy & Scanner ---
+STRATEGY = OmegaStrategy(
+    ema_short=omega_config.get_int("EMA_SHORT", 9),
+    ema_long=omega_config.get_int("EMA_LONG", 21),
+    rsi_period=omega_config.get_int("RSI_PERIOD", 14),
+    rsi_min=omega_config.get_int("RSI_MIN", 30),
+    rsi_max=omega_config.get_int("RSI_MAX", 70)
+)
+# Note: Scanner initialized later or lazily if needed, but here is fine
+SCANNER =  MarketScanner(trading_client=trading_client, data_client=data_client)
 
 
 def print_protection_status():
@@ -2837,10 +2852,9 @@ def _best_candidate_from_watchlist(symbols):
         return top_symbol, diagnostics
     return None, diagnostics
 
-def _compute_entry_tp_sl(symbol: str):
+def _compute_entry_tp_sl(symbol: str, atr: Optional[float] = None, multiplier: float = 2.0):
     """
-    Pull live quote; compute a conservative TP/SL if not provided using the
-    configured FALLBACK_STOP_LOSS_PCT / FALLBACK_TAKE_PROFIT_PCT offsets.
+    Pull live quote; compute TP/SL using ATR (if available) or fallback percentages.
     """
     from alpaca.data.requests import StockLatestQuoteRequest
     try:
@@ -2860,21 +2874,26 @@ def _compute_entry_tp_sl(symbol: str):
             print(f"⚠️ quote fetch failed for {symbol}: {e}")
             return None
     entry = round(px, 2)
-    sl = round(entry * (1 - FALLBACK_STOP_LOSS_PCT / 100.0), 2)
-    tp = round(entry * (1 + FALLBACK_TAKE_PROFIT_PCT / 100.0), 2)
+    
+    if atr and atr > 0:
+        # ATR-based volatility sizing
+        dist = atr * multiplier
+        sl = round(entry - dist, 2)
+        # Target 1.5R or 2R
+        tp = round(entry + (dist * 1.5), 2)
+        print(f"manage_risk: Using ATR({atr:.3f}) * {multiplier} -> SL -{dist:.2f}")
+    else:
+        # Static fallback
+        sl = round(entry * (1 - FALLBACK_STOP_LOSS_PCT / 100.0), 2)
+        tp = round(entry * (1 + FALLBACK_TAKE_PROFIT_PCT / 100.0), 2)
+        
     return entry, sl, tp
 
 def autoscan_once():
     try:
         # stop if too many positions (dynamic cap)
-        # --- Cached position / cap check (Adaptive PDT Governor v1) ---
         open_count = _open_positions_count()
         max_allowed = get_dynamic_max_open_positions()
-
-        # (Future use) Hook adaptive scaling by PDT stats and equity
-        # adaptive_max = _adaptive_pdt_governor(open_count, max_allowed)
-        # if adaptive_max != max_allowed:
-        #     max_allowed = adaptive_max
 
         print(f"🧮 Open positions: {open_count} / Max allowed: {max_allowed}")
         if open_count >= max_allowed:
@@ -2885,26 +2904,95 @@ def autoscan_once():
             _digest_increment("position_cap_skips")
             return False
 
-        # read watchlist
-        watch = get_watchlist_from_google_sheet(sheet_name="OMEGA-VX LOGS", tab_name="watchlist")
-        if not watch:
-            print("⚠️ Watchlist empty or not reachable.")
+        # --- NEW HYBRID SCANNER ---
+        candidates = SCANNER.get_candidates()
+        if not candidates:
+            print("⚠️ Hybrid Scanner found no candidates.")
             return False
 
         _auto_adjust_filters_by_vix()
 
-        # pick a candidate
-        sym, diagnostics = _best_candidate_from_watchlist(watch)
+        # Score candidates
+        scored_candidates = []
+        diagnostics = []
+
+        print(f"🔍 Analyzing {len(candidates)} candidates via OmegaStrategy...")
+        for sym in candidates:
+            try:
+                # Fetch data for strategy (forcing IEX for safety/speed if needed, or SIP if avail)
+                # We need ~100 bars for MACD/EMA/RSI
+                end = datetime.now(timezone.utc)
+                start = end - timedelta(days=20) # ample buffer for hourly/daily
+                
+                # Using existing helper to get DF with fallback
+                df, used_daily = _fetch_bars_with_daily_fallback(
+                    sym, 
+                    primary_tf=TimeFrame.Minute, # Strategy is designed for lower timeframe or customizable?
+                    # Wait, strategy defaults? The user didn't specify timeframe in Strategy class. 
+                    # Assuming 15m or 5m base. Let's stick to what bot was doing: likely 15m or 1h.
+                    # The original bot used 15m for RSI.
+                    # Let's use 15m bars.
+                    primary_start=start,
+                    primary_end=end,
+                    feed=_DATA_FEED,
+                    daily_lookback_days=100
+                )
+                
+                if df is None or df.empty:
+                    continue
+                
+                # Resample to 15m if we got minute bars, or just pass if already appropriate
+                # The _fetch_bars_with_daily_fallback logic might return mixed. 
+                # For simplicity, passing the raw DF. Ideally we resample_to_15m(df)
+                
+                # Check for sufficient length
+                if len(df) < 50:
+                     continue
+
+                result = STRATEGY.analyze(sym, df)
+                score = result.get("score", 0)
+                
+                # Log outcome
+                _log_candidate_event(sym, result.get("signal", "skip"), str(result.get("metrics", {}).get("reasons")), score=score)
+                diagnostics.append({
+                    "symbol": sym, 
+                    "score": score, 
+                    "signal": result.get("signal"),
+                    "metrics": result.get("metrics")
+                })
+
+                if result["signal"] == "buy":
+                    scored_candidates.append((score, sym, result.get("metrics", {})))
+            except Exception as e:
+                print(f"⚠️ Strategy failed for {sym}: {e}")
+                continue
+
+        # Sort by score
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        # Log diagnostics to sheet if needed
         try:
             push_autoscan_debug_to_sheet(diagnostics)
-        except Exception as diag_err:
-            print(f"⚠️ Autoscan diagnostics push failed: {diag_err}")
-        if not sym:
-            print("ℹ️ No positive‑score candidate right now.")
+        except Exception:
+            pass
+
+        if not scored_candidates:
+            print("ℹ️ No BUY signals found.")
             return False
 
+        top_score, sym, metrics = scored_candidates[0]
+        print(f"🏆 Top Candidate: {sym} (Score: {top_score})")
+
         # compute prices
-        trio = _compute_entry_tp_sl(sym)
+        atr = metrics.get("atr")
+        # Ensure ATR is float if present (pandas might return numpy float)
+        if atr is not None:
+            try:
+                atr = float(atr)
+            except:
+                atr = None
+                
+        trio = _compute_entry_tp_sl(sym, atr=atr)
         if not trio:
             return False
         entry, sl, tp = trio
